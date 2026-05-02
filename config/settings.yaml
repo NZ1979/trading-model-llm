@@ -66,7 +66,7 @@ signals:
   gap_and_go_sentiment_min_buy: 3
   gap_and_go_sentiment_min_sell: -3
   require_walls_for_pullback: false                # confirming-only since Databento canceled (VPS canonical)
-  sentiment_max_age_sec: 3600                      # how stale before sentiment is treated as None
+  sentiment_max_age_sec: 86400                     # 24h: catches overnight earnings news (e.g. AAPL announcing after Thursday close survives until Friday's signal eval). Was 3600 (1h), which silently expired all overnight news.
   min_rth_bars_warmup: 50                          # require N RTH bars before signals can fire
 
 storage:
