@@ -1,0 +1,94 @@
+# Trading platform configuration.
+# Secrets (API keys) are read from environment variables, NOT this file.
+# Required env vars:
+#   ALPACA_API_KEY, ALPACA_API_SECRET
+#   ANTHROPIC_API_KEY
+#   POLYGON_API_KEY
+#   DATABENTO_API_KEY  (optional; if missing, futures wall scanning is disabled)
+
+broker:
+  mode: paper                                      # paper | live
+  alpaca_base_url: https://paper-api.alpaca.markets
+  alpaca_data_feed: sip                            # sip (Algo Trader Plus) | iex (free, IEX-only)
+
+market_data:
+  polygon_baseline_days: 20                        # days of pre-market history for RVOL denominator
+  polygon_daily_lookback: 300                      # days of daily bars for SMA200 + ATR
+
+futures:
+  enabled: true                                    # set false to skip Databento (no walls)
+  symbol: ES.c.0
+  dataset: GLBX.MDP3
+  scan_interval_sec: 3.0
+  persistence_window: 10
+  persistence_min: 7
+  wall_distance_pct: 1.0
+  wall_min_size_multiple: 2.0
+
+# Watchlist. Start small for paper validation. Scale up after a week of clean
+# operation. Full S&P 500 = 503 names, all of which can fit in one Alpaca SIP
+# WebSocket subscription. Tuning this is just an "expand the list" exercise.
+watchlist:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - NVDA
+  - META
+  - TSLA
+  - AVGO
+  - JPM
+  - V
+  - WMT
+  - XOM
+  - UNH
+  - MA
+  - PG
+  - HD
+  - LLY
+  - ORCL
+  - COST
+  - JNJ
+  - BAC
+  - ABBV
+  - NFLX
+  - CRM
+  - CVX
+  - AMD
+  - KO
+  - PEP
+  - TMO
+  - ADBE
+
+signals:
+  pullback_sentiment_min_buy: 5
+  pullback_sentiment_min_sell: -5
+  gap_and_go_sentiment_min_buy: 3
+  gap_and_go_sentiment_min_sell: -3
+  require_walls_for_pullback: false                # confirming-only since Databento canceled (VPS canonical)
+  sentiment_max_age_sec: 3600                      # how stale before sentiment is treated as None
+  min_rth_bars_warmup: 50                          # require N RTH bars before signals can fire
+
+storage:
+  db_path: trading.db
+  journal_dir: journals                            # daily EOD reports written here
+
+schedule:
+  # All times are America/New_York (ET). The orchestrator handles DST.
+  baseline_backfill_time: "08:30"                  # Polygon REST: daily bars + PM baselines
+  market_data_start: "09:00"                       # Alpaca SIP + Databento Live connect
+  premarket_context_time: "09:30"                  # compute PremarketContext per ticker
+  signal_start_time: "09:35"                       # signal engine begins evaluating
+  flatten_time: "15:55"                            # Phase 6: close all positions
+  journal_time: "16:30"                            # Phase 6: write EOD report
+
+# Risk parameters (consumed by Phase 6's validate_order)
+risk:
+  max_position_pct: 20                             # single position cap as % of equity
+  max_total_exposure_pct: 90                       # total exposure cap
+  stop_loss_pct: 2                                 # auto stop on every entry
+  risk_per_trade_pct: 0.5                          # max loss per trade as % of equity (used by size_from_risk)
+
+logging:
+  level: INFO                                      # DEBUG | INFO | WARNING | ERROR
+  decisions_to_db: true                            # log every TradeDecision to SQLite

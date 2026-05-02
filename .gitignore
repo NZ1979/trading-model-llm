@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tools
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local secrets / env
+.env
+*.bak
+*.bak_*
+
+# Local SQLite (regenerated on the VPS, not committed)
+trading.db
+*.db-journal
+
+# Daily journals (generated at runtime)
+journals/
