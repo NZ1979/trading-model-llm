@@ -361,6 +361,16 @@ class AlpacaOrderClient:
                 logger.error("Cancel orders failed: %s", e)
                 result["errors"].append(f"cancel_orders: {e}")
 
+            # Race fix 2026-05-02: Alpaca's DELETE /v2/orders accepts the cancel
+            # request and returns immediately, but the cancellation propagates
+            # through the order book over ~100-500ms. If DELETE /v2/positions
+            # fires before that's done, Alpaca reports held_for_orders=qty and
+            # rejects the close with HTTP 422. Wait briefly so the cancellation
+            # settles before we ask Alpaca to close the position. Only sleep
+            # if we actually canceled something.
+            if result["cancelled_orders"]:
+                await asyncio.sleep(0.5)
+
         try:
             closed = await self._delete("/v2/positions")
             ok, bad = _split_multistatus(closed, key="symbol")

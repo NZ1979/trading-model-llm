@@ -163,6 +163,77 @@ async def test_close_all_positions_empty():
     return "empty multi-status (nothing to do) handled"
 
 
+# -------------------- Race fix: sleep between cancel and close --------------------
+
+async def test_close_all_positions_sleeps_after_cancel():
+    """Race fix 2026-05-02: after canceling orders we must sleep ~0.5s so the
+    cancellation propagates at Alpaca before DELETE /v2/positions fires.
+    Without the sleep, the close hits held_for_orders and 422s."""
+    from unittest.mock import AsyncMock, patch
+    from execution.alpaca_orders import AlpacaOrderClient
+    client = AlpacaOrderClient(api_key="fake", api_secret="fake", paper=True)
+    sequence = []
+    async def fake_delete(path):
+        sequence.append(("delete", path))
+        if path == "/v2/orders":
+            return [{"id": "o1", "status": 200, "body": {}}]
+        return [{"symbol": "AAPL", "status": 200, "body": {}}]
+    async def fake_sleep(n):
+        sequence.append(("sleep", n))
+    client._delete = fake_delete
+    with patch("asyncio.sleep", fake_sleep):
+        result = await client.close_all_positions(cancel_orders=True)
+    # Verify ordering: cancel orders, then sleep, then close positions
+    assert sequence[0] == ("delete", "/v2/orders"), f"first call should be DELETE /v2/orders, got {sequence[0]}"
+    assert sequence[1][0] == "sleep" and sequence[1][1] >= 0.1, f"second call should be sleep, got {sequence[1]}"
+    assert sequence[2] == ("delete", "/v2/positions"), f"third call should be DELETE /v2/positions, got {sequence[2]}"
+    assert len(result["closed_positions"]) == 1
+    assert len(result["errors"]) == 0
+    return f"sleep ordering correct: {[s[0] for s in sequence]}"
+
+
+async def test_close_all_positions_no_sleep_when_nothing_to_cancel():
+    """If cancel returned no successes, skip the sleep (no need to wait
+    for nothing to propagate)."""
+    from unittest.mock import patch
+    from execution.alpaca_orders import AlpacaOrderClient
+    client = AlpacaOrderClient(api_key="fake", api_secret="fake", paper=True)
+    sequence = []
+    async def fake_delete(path):
+        sequence.append(("delete", path))
+        return []  # nothing to cancel/close
+    async def fake_sleep(n):
+        sequence.append(("sleep", n))
+    client._delete = fake_delete
+    with patch("asyncio.sleep", fake_sleep):
+        result = await client.close_all_positions(cancel_orders=True)
+    # Should be: cancel, [no sleep], close. No "sleep" entry.
+    sleep_events = [s for s in sequence if s[0] == "sleep"]
+    assert len(sleep_events) == 0, f"shouldn't sleep when cancel returned nothing: {sequence}"
+    return "no sleep when there's nothing to cancel"
+
+
+async def test_close_all_positions_no_sleep_when_cancel_disabled():
+    """When cancel_orders=False, no cancel call is made; no sleep needed."""
+    from unittest.mock import patch
+    from execution.alpaca_orders import AlpacaOrderClient
+    client = AlpacaOrderClient(api_key="fake", api_secret="fake", paper=True)
+    sequence = []
+    async def fake_delete(path):
+        sequence.append(("delete", path))
+        return [{"symbol": "AAPL", "status": 200, "body": {}}]
+    async def fake_sleep(n):
+        sequence.append(("sleep", n))
+    client._delete = fake_delete
+    with patch("asyncio.sleep", fake_sleep):
+        result = await client.close_all_positions(cancel_orders=False)
+    sleep_events = [s for s in sequence if s[0] == "sleep"]
+    cancel_events = [s for s in sequence if s == ("delete", "/v2/orders")]
+    assert len(cancel_events) == 0
+    assert len(sleep_events) == 0
+    return "no sleep when cancel_orders=False"
+
+
 def main():
     tests_sync = [
         test_alpaca_api_error_parses_json_body,
@@ -179,6 +250,9 @@ def main():
         test_close_all_positions_with_partial_failure,
         test_close_all_positions_full_success,
         test_close_all_positions_empty,
+        test_close_all_positions_sleeps_after_cancel,
+        test_close_all_positions_no_sleep_when_nothing_to_cancel,
+        test_close_all_positions_no_sleep_when_cancel_disabled,
     ]
     results = []
     for t in tests_sync:
@@ -242,3 +316,5 @@ except AssertionError as e:
     print(f"FAIL  {e}")
 except Exception as e:
     print(f"ERROR  {type(e).__name__}: {e}")
+
+
