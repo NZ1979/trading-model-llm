@@ -326,18 +326,24 @@ class AlpacaOrderClient:
     async def close_all_positions(self, cancel_orders: bool = True) -> dict[str, Any]:
         """Close every open position and cancel all open orders.
 
-        Used by the 15:55 ET flatten routine. Alpaca exposes DELETE /v2/positions
-        which closes everything in a single call - simpler and lower-latency
-        than iterating positions ourselves.
+        Used by the 15:55 ET flatten routine. Two-phase robustness against
+        Alpaca's held_for_orders race:
+
+          1. Cancel all pending orders, then poll /v2/positions until every
+             position reports qty_available == qty (released from prior
+             stop-leg holds). Timeout at 10s.
+          2. Per-position close via DELETE /v2/positions/{symbol} with retry
+             on HTTP 403 + Alpaca code 40310000 ("insufficient qty
+             available"). Up to 5 retries with 1s backoff.
 
         Args:
-            cancel_orders: if True, also cancels all open orders before closing
-                positions. Important to avoid bracket-order children firing
+            cancel_orders: if True, cancels all open orders before closing
+                positions. Required to avoid bracket-order children firing
                 after the parent is gone.
 
         Returns:
-            Dict summarizing the operation: keys "cancelled_orders",
-            "closed_positions", "errors". Each is a list.
+            Dict with keys "cancelled_orders", "closed_positions", "errors".
+            Each is a list.
         """
         result: dict[str, Any] = {
             "cancelled_orders": [],
@@ -361,31 +367,144 @@ class AlpacaOrderClient:
                 logger.error("Cancel orders failed: %s", e)
                 result["errors"].append(f"cancel_orders: {e}")
 
-            # Race fix 2026-05-02: Alpaca's DELETE /v2/orders accepts the cancel
-            # request and returns immediately, but the cancellation propagates
-            # through the order book over ~100-500ms. If DELETE /v2/positions
-            # fires before that's done, Alpaca reports held_for_orders=qty and
-            # rejects the close with HTTP 422. Wait briefly so the cancellation
-            # settles before we ask Alpaca to close the position. Only sleep
-            # if we actually canceled something.
+            # Bug F fix 2026-05-05: replaces the prior 0.5s fixed sleep
+            # (Bug E race fix) which was insufficient for OTO bracket-stop
+            # children. After /v2/orders cancel, the held_for_orders side of
+            # the position state can take several seconds to release on
+            # Alpaca's side. Polling until released or timeout.
             if result["cancelled_orders"]:
-                await asyncio.sleep(0.5)
+                wait_result = await self._wait_for_release(max_wait_sec=10.0)
+                logger.info(
+                    "Wait for release: %d ready, %d still held, %.2fs elapsed",
+                    len(wait_result["released"]),
+                    len(wait_result["still_held"]),
+                    wait_result["wait_sec"],
+                )
+                for p in wait_result["still_held"]:
+                    logger.warning(
+                        "Position still held after %ss wait: symbol=%s "
+                        "qty=%s qty_available=%s (per-position retry will "
+                        "attempt anyway)",
+                        wait_result["wait_sec"], p.get("symbol"),
+                        p.get("qty"), p.get("qty_available"),
+                    )
 
         try:
-            closed = await self._delete("/v2/positions")
-            ok, bad = _split_multistatus(closed, key="symbol")
-            result["closed_positions"] = ok
-            for f in bad:
-                msg = (f"position close failed: symbol={f.get('symbol')} "
-                       f"status={f.get('status')} body={f.get('body')}")
-                logger.error(msg)
-                result["errors"].append(msg)
-            logger.info("Closed %d positions (failures=%d)", len(ok), len(bad))
+            positions = await self._get("/v2/positions")
+            if not positions:
+                logger.info("No positions to close.")
+                return result
+
+            close_tasks = [
+                self._close_position_with_retry(p["symbol"])
+                for p in positions
+            ]
+            close_results = await asyncio.gather(
+                *close_tasks, return_exceptions=False
+            )
+
+            for cr in close_results:
+                if cr["ok"]:
+                    result["closed_positions"].append(cr)
+                else:
+                    msg = (f"position close failed after {cr['retries']} "
+                           f"retries: symbol={cr['symbol']} "
+                           f"error={cr['error']}")
+                    logger.error(msg)
+                    result["errors"].append(msg)
+
+            ok_count = sum(1 for cr in close_results if cr["ok"])
+            logger.info("Closed %d positions (failures=%d)",
+                        ok_count, len(close_results) - ok_count)
         except Exception as e:
             logger.error("Close positions failed: %s", e)
             result["errors"].append(f"close_positions: {e}")
 
         return result
+
+    async def _wait_for_release(
+        self, max_wait_sec: float = 10.0, poll_interval_sec: float = 0.5,
+    ) -> dict[str, Any]:
+        """Poll /v2/positions until qty_available equals qty for all positions.
+
+        After canceling orders that hold position quantities, Alpaca takes
+        100ms - several seconds to update the held_for_orders accounting.
+        Without waiting for this, immediate close attempts return HTTP 403
+        with code 40310000 ("insufficient qty available"). This is Bug F
+        (2026-05-05), root cause of an end-of-day flatten failure.
+
+        Args:
+            max_wait_sec: total seconds to wait before giving up.
+            poll_interval_sec: seconds between polls.
+
+        Returns:
+            Dict with keys "released" (positions where qty_available == qty),
+            "still_held" (positions where qty_available < qty), and
+            "wait_sec" (actual elapsed time).
+        """
+        start = time.monotonic()
+        while True:
+            try:
+                positions = await self._get("/v2/positions")
+            except Exception as e:
+                logger.error("_wait_for_release poll failed: %s", e)
+                return {"released": [], "still_held": [],
+                        "wait_sec": time.monotonic() - start}
+
+            still_held = [
+                p for p in positions
+                if int(float(p.get("qty_available", "0")))
+                < int(float(p.get("qty", "0")))
+            ]
+            elapsed = time.monotonic() - start
+            if not still_held:
+                return {"released": positions, "still_held": [],
+                        "wait_sec": elapsed}
+            if elapsed >= max_wait_sec:
+                return {"released": [p for p in positions if p not in still_held],
+                        "still_held": still_held, "wait_sec": elapsed}
+            await asyncio.sleep(poll_interval_sec)
+
+    async def _close_position_with_retry(
+        self, symbol: str, max_retries: int = 5, backoff_sec: float = 1.0,
+    ) -> dict[str, Any]:
+        """Close one position with retry on insufficient_qty errors.
+
+        DELETE /v2/positions/{symbol} can return HTTP 403 + Alpaca code
+        40310000 if held_for_orders is non-zero (Bug F race). Retry on
+        that specific error class with a backoff. Other errors are
+        non-retriable (e.g. 404 unknown symbol, 400 bad request).
+
+        Args:
+            symbol: equity symbol to close.
+            max_retries: total attempts including the first. Default 5.
+            backoff_sec: seconds between attempts. Default 1.0.
+
+        Returns:
+            Dict with keys "symbol", "ok" (bool), "retries" (int),
+            "error" (str or None).
+        """
+        last_error: str | None = None
+        for attempt in range(max_retries):
+            try:
+                await self._delete(f"/v2/positions/{symbol}")
+                return {"symbol": symbol, "ok": True,
+                        "retries": attempt, "error": None}
+            except AlpacaAPIError as e:
+                last_error = str(e)
+                # Code 40310000 = "insufficient qty available", caused by
+                # held_for_orders not yet released. This is the retriable case.
+                is_retriable = (e.status == 403 and e.code == 40310000)
+                if not is_retriable:
+                    return {"symbol": symbol, "ok": False,
+                            "retries": attempt, "error": last_error}
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(backoff_sec)
+            except Exception as e:
+                return {"symbol": symbol, "ok": False,
+                        "retries": attempt, "error": str(e)}
+        return {"symbol": symbol, "ok": False,
+                "retries": max_retries, "error": last_error}
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel one order by ID. Returns True on success."""
