@@ -4,6 +4,7 @@ numpy>=1.24.0
 pyyaml>=6.0
 websockets>=12.0
 aiohttp>=3.9.0
+lxml>=5.0.0            # required by pandas.read_html in watchlist_builder.py (Phase B)
 
 # API SDKs
 anthropic>=0.39.0      # claude-haiku-4-5 sentiment scoring

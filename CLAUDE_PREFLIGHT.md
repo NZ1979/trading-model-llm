@@ -196,3 +196,194 @@ Operational complement to Rule 3 (test scripts before pasting) and Rule 4 (know 
 **Specific trap already fallen into:** Repeatedly handed the user shell snippets that broke on paste — first a PowerShell heredoc with nested quoting, then a base64 single-liner that exceeded what the terminal would paste atomically and got line-broken into two separate commands. Each broken paste cost the user a round-trip to send back the failure. The cumulative friction is what ended the diagnostic session, not the underlying bug.
 
 **How to apply:** When the next-step action is "run this on the VPS," default to the file-based path. Write the script. Test it. Then tell the user `nano /tmp/foo.py`, paste, save, run. Don't try to be clever with one-liners on the second attempt; switch tools immediately.
+
+## Rule 16: Always state where a command/script is to be run
+
+Operational tightening of Rule 4. Every command block must declare its execution context explicitly, before the code, with no ambiguity.
+
+**The rule:**
+Every command or script Claude hands the user must be prefixed by one of the following labels (or an equivalent equally-explicit phrase). No naked code blocks.
+
+- **"In a normal PowerShell window on your Windows machine:"** — for local PowerShell (Windows file paths, `curl.exe`, `scp`, etc.)
+- **"In the in-browser console connected to `root@trader-prod`:"** — for the Hetzner web/noVNC console session into the VPS (Linux commands, no SSH layer in between, paste mangles shifted symbols)
+- **"In an SSH session to the VPS (run from PowerShell):"** — when the user has opened SSH from PowerShell and is at the `root@trader-prod:~#` prompt over SSH (paste works normally, no noVNC quirks)
+- **"In Python sandbox (Claude-side, not the user):"** — for code Claude is running on its own, not asking the user to execute
+- **"In a file editor:"** — for content that goes into a file, not run as a command
+
+If switching contexts within a single response, label EACH block — never assume the previous label still applies.
+
+**Specific trap already fallen into:** During the 2026-05-02 deploy, Claude alternated between PowerShell commands and in-browser console commands without consistent labeling. The user repeatedly had to ask "where do I type this?" — once explicitly: "do i type those prompts into the in-browser console?" Each ambiguity cost a round-trip and compounded hours of frustration.
+
+**How to apply:** Before sending any code block, ask: "If the user reads only the next message — no scrollback — will they know exactly which terminal window to type this into?" If not, add the label.
+
+## Rule 17: User cannot create PDF files
+
+The user has no PDF creation capability on their machine.
+
+**The rule:**
+Never ask the user to produce, export, or save anything as a `.pdf` file. When suggesting a destination format for user-authored content (notes, references, screenshots, exports), pick from formats they CAN create:
+
+- `.docx` — Word documents (their preferred format for compiled screenshots/notes)
+- `.md` — Markdown
+- `.txt` — plain text
+- `.png` / `.jpg` — individual images
+
+When in doubt, default to `.docx`. Claude (with the docx skill) can read and reason about Word documents directly, so there's no functional cost vs PDF.
+
+**Specific trap already fallen into:** Suggested the user save Finnhub API documentation screenshots as a `.pdf` for review on 2026-05-03. They corrected: "I can't create a .pdf file." Forced them to repeat themselves and broke the flow.
+
+**How to apply:** When a future suggestion is "save this as X for me to review," verify X is in the user-creatable list above before sending. If you need a multi-page screenshot bundle, say `.docx`. Never say `.pdf`.
+
+## Rule 18: Error handling philosophy — fail loud, never fake
+
+Prefer a visible failure over a silent fallback. This applies to every piece of code, script, monitoring, or operational output Claude produces or recommends.
+
+**The rule:**
+
+Priority order, top to bottom:
+
+1. **Works correctly with real data.**
+2. **Falls back visibly** — clearly signals degraded mode (banner, log warning, annotated output, status field).
+3. **Fails with a clear error message** — exception, non-zero exit code, explicit "FAILED" log line that's easy to grep.
+4. **Silently degrades to look "fine"** — NEVER do this.
+
+Specific applications to this project:
+
+- Never silently swallow exceptions to "keep the loop running" without an `ERROR` log entry that names what swallowed and why.
+- Never substitute placeholder data (zeros, last-known values, mocked responses) in production code paths without an explicit `WARN` or `DEGRADED` log line that the user can see in `journalctl`.
+- Fallbacks are acceptable ONLY when disclosed. If a backfill misses 4/503 tickers, the EOD journal must say "499/503 backfilled, 4 missing: X, Y, Z" — not "Backfill complete."
+- Tests that pass against mocked I/O are not proof of production readiness; label them `unit-tested` (per Rule 11) and disclose what was NOT tested (per Rule 12).
+- Status outputs that hide failures behind aggregated success counts are anti-patterns. Show denominators and lists of failures.
+
+**Specific traps already fallen into in this project:**
+- The original `_run_baseline_backfill` looped sequentially fetching minute bars over 450 days per ticker, then resampled to daily. Most of the 503 tickers silently failed (only ~26 loaded). No log surfaced the failure rate; the user had to dig through SQLite to discover the gap.
+- `_evaluate_and_execute` short-circuited on RTH<50 bars before checking the gap-and-go path, hiding the structural unreachability of gap-and-go entirely. The system "ran cleanly" but couldn't fire one of its two strategies. (Bug A.)
+- The `SymbolState` defaults (`last_decision_action="Hold"`, `last_decision_setup="none"`) caused the dedup gate to suppress the first-decision-per-ticker log write. The decisions table looked empty for days; the user assumed bars weren't flowing. The pipeline was actually working — the silent dedup hid the activity. (Bug B.)
+- The original `submit_bracket_order` raised on HTTP error without capturing the response body, so 422-level rejections looked like generic exceptions. The user couldn't tell which tickers Alpaca rejected and why. (Bug D.)
+
+**How to apply:**
+- Every `except Exception:` must end with `logger.exception(...)` or `logger.error(...)` that includes context (which ticker, which API, which iteration).
+- Every counter that "skipped" something needs a paired log line listing what got skipped and why, OR a terse summary at the end of the run.
+- Every fallback path needs a log entry that distinguishes it from the primary path, ideally with a `DEGRADED:` prefix.
+- When showing a "summary" of N items processed, show the failure count and at least 3 example failures alongside, never just the success count.
+- When recommending production deploys, list the failure modes that are still silent (per Rule 12).
+
+## Rule 19: Stop on incomplete input — never compile a deliverable from partial data
+
+When the input to a task is corrupted, partially missing, or fails an integrity check (OCR returns blank pages, a file is truncated, a fetch is partial, a parse drops fields, an upload list is short, etc.), Claude must STOP, surface the gap explicitly, and wait for the user's instruction. Never proceed to produce the deliverable with hedge phrases like "verify in live docs" or "assumes shape similar to..." or "this section was unparseable but the surrounding context covers it."
+
+**The rule, hard:**
+1. Before starting to compile/synthesize/write the deliverable, run an integrity check on the input. State the result explicitly: "Input integrity: complete" or "Input integrity: incomplete — N gaps in items A, B, C."
+2. If integrity is incomplete, STOP. Do not write the deliverable. Output a short message that lists exactly what's missing, why it's likely missing, and present a small set of options for what to do (re-process with different settings, ask the user to re-supply, accept a reduced scope explicitly, etc.).
+3. Wait for the user's choice. Do not proceed on inference about what they probably want.
+4. Hedge phrases inside a delivered document do not satisfy this rule. "Verify in live docs," "appears similar to," "assumes shape of..." in a reference document mean the reference is contaminated. The bar for a saved reference file is *every claim is solid*, not "mostly solid with footnotes."
+
+**Specific trap already fallen into (2026-05-03):** OCR'd 84 screenshots of Finnhub API documentation. Found that ~16 pages returned blank (image-heavy sections: pages 8, 27-34, 49, 53-58, 75-82). I noted the gaps inside the deliverable as hedged comments ("verify in live docs," "assumes similar shape to...") and pressed on to produce a "compiled" reference that the user explicitly named as the canonical reference for this and future projects. This silently embedded uncertainty into a long-lived artifact. The user — correctly — rejected the file as unfit because a reference document with footnoted gaps is not a reference document; it is a reference document plus a debugging task that future Claude or future user has to remember to do. The right move was: stop after seeing 16 blanks, list them, and ask whether to (a) re-OCR with higher DPI or different engine, (b) request re-capture of those pages, (c) supplement from live docs via WebSearch, (d) accept reduced scope and flag the file as "partial — sections X missing" up top with a TODO, or (e) something else.
+
+**How to apply:**
+- After any extract/fetch/parse step, the next action is an integrity check, not synthesis.
+- For OCR/extraction tasks: count expected items vs returned items. If they disagree, stop.
+- For multi-source fetches: confirm each source returned non-empty content before merging.
+- For long-lived deliverables (reference docs, audit reports, plans): the integrity bar is higher than for ephemeral conversation. A hedge in chat is fine; a hedge in a saved file is contamination.
+- The phrase "verify in live docs" in a reference document is a smell. If something needs to be verified before use, it does not yet belong in the reference.
+
+## Rule 20: Audit your output for placeholders and unstated assumptions before sending
+
+When generating a command, script, or instruction for the user to run, do a final pass that identifies every placeholder and every unstated assumption baked into the output. Either resolve them with concrete values (asking the user first if needed), or call them out explicitly so the user knows they need to substitute. Never ship an output that assumes the user will silently do the right thing with a placeholder.
+
+**The rule, hard:**
+
+Before sending a command/script to the user, scan the output for these failure modes:
+
+1. **Literal placeholder strings** — e.g., `paste_your_key_here`, `<your_value>`, `REPLACE_ME`, `your_path_here`. If present, the command does NOT work as-pasted; the user must edit it. Either ask the user for the value first and bake it into the command, or call out the placeholder explicitly with a "you need to replace X with Y" line BEFORE the code block. A placeholder buried inside a quoted string is invisible; the user may run it as-is and get a confusing literal-string failure.
+2. **Unstated input assumptions** — when you tell the user "save it locally" or "put it somewhere," you don't yet know HOW or WHERE they did. Different storage formats (plain text file, password manager, env var, .env file, sticky note) need different retrieval commands. Ask before writing the command.
+3. **Path assumptions** — does the command assume a specific directory layout, file existence, or shell working directory? If so, either prefix with `cd "<absolute path>"` or state the assumption explicitly.
+4. **Tool-availability assumptions** — does the command assume `python`, `git`, `curl`, etc. is on PATH? If you haven't verified, say so.
+5. **State assumptions** — does the command assume a service is running, an env var is exported in the current shell, a previous step completed? If so, either include the prerequisite step or call it out.
+
+**Specific trap already fallen into (2026-05-03):** After the user said "saved locally" about their Finnhub API key, I generated a PowerShell command containing the literal string `$env:FINNHUB_API_KEY = "paste_your_key_here_no_quotes_in_chat"` and instructed them to run it. The placeholder string was meant to be replaced, but the instruction didn't say so explicitly, and the user — reasonably — asked "how can this command work, we haven't told it where the api key is yet locally saved on my computer? is this an error you made?" The command does work IF you understand to substitute the placeholder, but I never confirmed where the key was actually saved (file path? password manager? in their head?), so I couldn't write a command that auto-reads it. The right move was to ask "where exactly did you save it?" before writing any command — different storage = different retrieval.
+
+**How to apply:**
+
+- Before ANY command/script with user-specific values goes out, ask: "Have I been told the actual value, or am I assuming the user will substitute it?" If assuming → ask first.
+- If a placeholder must remain in the output (e.g., a key the user shouldn't paste in chat), wrap it in an explicit callout: "**REPLACE `<placeholder>` with your actual key value before running**" on the line immediately above the code block. Bare placeholders inside quoted strings are too easy to miss.
+- For commands that depend on file paths or environment state, name the assumption: "This assumes you saved the key to `C:\Users\kings\...\finnhub_key.txt`. If it's elsewhere, tell me the path."
+- When the user gives a vague status update ("done", "saved", "set up"), the next move is a clarifying question, not a command that depends on you guessing what they did.
+
+## Rule 21: Never request command output that would expose credentials
+
+When generating a verification or diagnostic command, audit the *output shape* of that command for credential exposure before sending. If the output would include any API key, password, token, secret, or other credential — even partially — never request the user paste it back. Always provide a redacted-equivalent command instead.
+
+**The rule, hard:**
+
+Before asking the user to paste back the output of any command, ask: "Could the output of this command contain a secret?" If yes, redesign the command to extract only the non-secret information needed for verification.
+
+Specific patterns that ALWAYS need redaction before requesting output:
+
+1. **`cat`, `tail`, `head`, `less`, `more`** on any file that holds credentials — env files (`/etc/*-platform/env`, `.env`), config files with embedded keys, `~/.ssh/`, `~/.aws/credentials`, `~/.kube/config`, password files, browser-saved-credentials exports
+2. **`env`, `printenv`, `Get-ChildItem env:`, `set` (cmd.exe)** — these dump all env vars including credential ones
+3. **`grep` matches on credential lines without redaction** — e.g., `grep "API_KEY" file` returns the full line
+4. **Process listings** with credentials in args (`ps aux | grep ...` may include `--api-key=...`)
+5. **Service unit files** with `Environment=KEY=value` lines (`systemctl cat`, `systemctl show -p Environment`)
+6. **Application logs** that may include credentials in URLs, headers, error messages, or debug output
+7. **HTTP request/response dumps** with `Authorization` headers or token query params
+8. **Database dumps** of tables that store user secrets
+
+Safe substitution patterns to verify credential setup without exposing:
+
+- **Length-only**: `awk -F= '$1=="KEY_NAME" {print length($2)}' file` → returns `40` instead of the value
+- **Existence-only**: `grep -c "^KEY_NAME=" file` → returns `1` or `0`
+- **Last-N-chars only**: `awk -F= '$1=="KEY_NAME" {print substr($2, length($2)-3)}' file` → returns `bf40` (last 4 chars; useful as a fingerprint without exposing the secret)
+- **Hash-only**: `awk -F= '$1=="KEY_NAME" {print $2}' file | sha256sum | cut -c1-16` → returns a hash prefix (constant for the same key, leaks nothing about the value)
+- **Type-check only**: `awk -F= '$1=="KEY_NAME" {print ($2 ~ /^[a-z0-9]+$/) ? "lowercase-alphanumeric" : "OTHER"}' file` → confirms format without exposing value
+
+**Specific trap already fallen into (2026-05-03):** Asked the user to paste back the output of `tail -3 /etc/trading-platform/env` to verify the new `FINNHUB_API_KEY=` line landed. The user correctly refused: "tail -3 shows Databento api key...I shouldn't paste that here, correct?" That env file contains FIVE credentials (Alpaca key + secret, Anthropic, Polygon, Databento, plus the new Finnhub) and `tail -3` would have exposed three of them in chat. The contradiction with my own earlier guidance ("treat the API key like a password — don't paste it in chat") makes this worse: I gave correct security advice and then asked the user to violate it 30 minutes later because I didn't audit the output shape.
+
+**How to apply:**
+
+- Before every `cat`/`tail`/`head` / `grep`-without-redaction / `env` listing / log dump request, check: would this command output include any credential? If yes, replace with a redacted alternative.
+- When verifying that a new env-file line was added correctly, default to `awk` length checks and `grep -c` existence checks instead of pasting the line.
+- When the user has multiple credentials in one file, the bar is even higher — adding one new credential should never require exposing the others to verify.
+- When debugging service issues, prefer command outputs that show structure/counts/error categories rather than full content. If full content is genuinely needed, ask the user to redact secrets before sending.
+- When reviewing logs with the user, suggest grep patterns that exclude credential-bearing log lines (e.g., grep -v 'token\|password\|key' or specific known-noisy patterns).
+
+## Rule 22: Audit logging behavior for credential leaks before any deploy
+
+When code makes outbound HTTP requests to vendor APIs, the logging behavior of every HTTP client library involved must be explicitly audited for credential exposure before the code is deployed. This is non-negotiable for any vendor whose API auth is keyed via URL query parameters, cookies, or any non-Authorization-header mechanism.
+
+**The rule, hard:**
+
+Before any deploy that touches outbound HTTP requests:
+
+1. **Identify every HTTP client library used in the request path.** Common ones in this project: `httpx`, `aiohttp`, `urllib.request`, `urllib3`, plus any vendor SDKs (Anthropic, Polygon, Alpaca, Databento, Finnhub).
+
+2. **Audit each library's default logging behavior.** Specifically check whether they log full URLs at INFO level. Known offenders:
+   - **`httpx`** — logs full URLs (including query params) at INFO by default. **HIGH RISK** when paired with vendors that use URL-based auth.
+   - **`anthropic` SDK** — uses `httpx` internally. Inherits the same risk.
+   - **`aiohttp`** — does NOT log URLs at INFO by default. Lower risk.
+   - **`urllib3`** (used by `requests`) — does NOT log URLs at INFO by default. Lower risk.
+   - **`urllib.request`** — does NOT log URLs by default. Lower risk.
+
+3. **Audit each vendor's auth scheme.** If the vendor passes credentials via URL query parameters (Polygon's `?apiKey=...`, some legacy APIs' `?token=...`), the risk is HIGH regardless of HTTP client. Switch to header-based auth if the vendor SDK supports it; if not, suppress URL logging in the offending library.
+
+4. **Suppress URL logging at the application level.** Add this to `setup_logging` (or equivalent) for any outbound HTTP library used in the codebase:
+
+   ```python
+   for noisy_logger in ("httpx", "httpcore", "aiohttp", "anthropic", "urllib3"):
+       logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+   ```
+
+   This is a one-line audit — do it once and don't remove it. WARNING level keeps real errors visible while hiding routine request URLs.
+
+5. **Verify in production logs after deploy.** Within 5 minutes of any deploy involving outbound HTTP requests, grep journalctl / log files for vendor URL patterns. Specifically search for `apiKey=`, `?token=`, `Authorization:` in log content. If you see any, the leak is live and the deploy should be rolled back, the credential rotated, AND the journalctl history vacuumed (`journalctl --vacuum-time=10s` to clear the leak from disk before any third party with read access to system logs grabs it).
+
+**Specific trap already fallen into (2026-05-04):** Polygon Stocks Starter passes the API key as a URL query parameter (`?apiKey=...`). The platform's daily-routine backfill runs hundreds of Polygon REST calls per session. The Anthropic SDK (used by sentiment scoring) uses `httpx` internally, which by default logs full request URLs at INFO level. When the daily backfill ran post-restart, every Polygon REST call's URL was written to journalctl with the API key embedded. The leak was discovered when the user pasted a journalctl screenshot into chat for diagnostic purposes — exposing the credential to a third-party logging path. The leaked Polygon key required immediate rotation; the rotation hit a separate Polygon dashboard error that delayed the cutover; and the bug fix for the in-flight Wave 1A AttributeError compounded the deploy chaos. Direct cost: ~45 minutes of remediation, plus key rotation overhead, plus credential exposure in three places (journalctl history, screenshots, chat history).
+
+**How to apply:**
+
+- Before any deploy that adds new outbound HTTP requests to the codebase, run a code review with one specific question: "Will the URL of this request contain a secret?" If yes, ensure the relevant logger is suppressed.
+- Whenever a new vendor SDK or HTTP library is added (even transitively as a dependency), audit its logging defaults.
+- Treat URL-based auth as a default red flag; prefer Authorization headers when given the choice.
+- Add the logger-suppression block to `setup_logging` once and don't remove it.
+- For credentials that are already exposed in logs: rotate the credential AND vacuum journalctl history (the leak persists on disk until vacuumed).
+- When working with user on log diagnostics, before asking them to paste any log lines, predict which vendors' calls would have triggered logging in the time window. If any of those vendors use URL-based auth and logger suppression isn't in place, redirect to a redacted query (per Rule 21) instead of asking for raw log paste.

@@ -67,6 +67,9 @@ from data.bar_aggregator import BarAggregator
 from data.bar_types import FiveMinBar, MinuteBar
 from data.news_pipeline import NewsSentimentPipeline, latest_sentiment
 from data.polygon_feed import PolygonRESTClient, backfill_premarket_baselines, backfill_daily_bars
+from data.polygon_news import PolygonNewsPipeline
+from data.finnhub_feed import FinnhubClient, refresh_earnings_calendar, is_earnings_day
+from data.watchlist_builder import read_watchlist_file, refresh_dynamic_watchlist
 from execution.alpaca_orders import AlpacaOrderClient, OrderResult
 from strategy.risk import size_from_risk, validate_order
 from strategy.signal_engine import evaluate_trade, TradeDecision
@@ -126,6 +129,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
         "alpaca_secret": _require_env("ALPACA_API_SECRET"),
         "anthropic_key": _require_env("ANTHROPIC_API_KEY"),
         "polygon_key": _require_env("POLYGON_API_KEY"),
+        "finnhub_key": _require_env("FINNHUB_API_KEY"),
         "databento_key": os.environ.get("DATABENTO_API_KEY"),  # optional
     }
     return cfg
@@ -147,7 +151,25 @@ class TradingPlatform:
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
-        self.watchlist: set[str] = {s.upper() for s in config["watchlist"]}
+        # Phase B: prefer dynamic watchlist if recent (<7 days); else fall
+        # back to settings.yaml's static list. Dynamic file is rebuilt
+        # daily at 08:30 ET by `_run_dynamic_watchlist_refresh`. SIP
+        # subscriptions are set at boot from self.watchlist; the new file
+        # only takes effect on next restart (no hot re-sub in Phase B).
+        dynamic_path = Path("config/watchlist_dynamic.json")
+        dynamic_list = read_watchlist_file(dynamic_path, max_age_days=7)
+        if dynamic_list:
+            self.watchlist: set[str] = {s.upper() for s in dynamic_list}
+            logger.info(
+                "Watchlist: %d symbols (dynamic, from %s)",
+                len(self.watchlist), dynamic_path,
+            )
+        else:
+            self.watchlist = {s.upper() for s in config["watchlist"]}
+            logger.info(
+                "Watchlist: %d symbols (static fallback, from settings.yaml)",
+                len(self.watchlist),
+            )
         self.db_path = Path(config["storage"]["db_path"])
         self.symbols: dict[str, SymbolState] = {
             t: SymbolState(ticker=t) for t in self.watchlist
@@ -158,10 +180,12 @@ class TradingPlatform:
 
         # Components instantiated in boot()
         self.news_pipeline: NewsSentimentPipeline | None = None
+        self.polygon_news_pipeline: PolygonNewsPipeline | None = None
         self.bar_aggregator: BarAggregator | None = None
         self.bar_stream: AlpacaBarStream | None = None
         self.wall_monitor: FuturesWallMonitor | None = None
         self.order_client: AlpacaOrderClient | None = None
+        self.finnhub_client: FinnhubClient | None = None
         # Track flatten/journal completion per day so they don't run twice
         self._flatten_done_for: str | None = None
         self._journal_done_for: str | None = None
@@ -232,6 +256,13 @@ class TradingPlatform:
             f"{starting_equity:,.2f}",
         )
 
+        # 0b. Finnhub HTTP client (Wave 1A: earnings calendar veto for gap-and-go).
+        # No background task — used on-demand by the daily backfill at 8:30 ET
+        # to populate the catalysts table.
+        self.finnhub_client = FinnhubClient(api_key=secrets["finnhub_key"])
+        await self.finnhub_client.__aenter__()
+        logger.info("Finnhub client initialized (earnings calendar veto enabled)")
+
         # 1. News pipeline runs 24/7 (sentiment is computed even pre-session).
         self.news_pipeline = NewsSentimentPipeline(
             alpaca_key=secrets["alpaca_key"],
@@ -242,6 +273,18 @@ class TradingPlatform:
         )
         self._tasks.append(asyncio.create_task(
             self.news_pipeline.start(), name="NewsPipeline"
+        ))
+
+        # 1b. Polygon News pipeline (supplementary; pre-scored sentiment).
+        # Polls every 5 min and writes to the same `sentiment` table. See
+        # data/polygon_news.py for the rationale (covers Benzinga gaps).
+        self.polygon_news_pipeline = PolygonNewsPipeline(
+            polygon_key=secrets["polygon_key"],
+            watchlist=self.watchlist,
+            db_path=self.db_path,
+        )
+        self._tasks.append(asyncio.create_task(
+            self.polygon_news_pipeline.start(), name="PolygonNewsPipeline"
         ))
 
         # 2. Bar aggregator + Alpaca SIP bars stream.
@@ -359,6 +402,13 @@ class TradingPlatform:
                             self.news_pipeline.start(), name="NewsPipeline"
                         )
                         self._tasks[i] = new_task
+                    elif name == "PolygonNewsPipeline" and self.polygon_news_pipeline is not None:
+                        logger.warning("Restarting PolygonNewsPipeline task")
+                        new_task = asyncio.create_task(
+                            self.polygon_news_pipeline.start(),
+                            name="PolygonNewsPipeline",
+                        )
+                        self._tasks[i] = new_task
                     elif name == "DailyRoutine":
                         logger.warning("Restarting DailyRoutine task")
                         new_task = asyncio.create_task(
@@ -381,6 +431,8 @@ class TradingPlatform:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         if self.order_client:
             await self.order_client.__aexit__(None, None, None)
+        if self.finnhub_client:
+            await self.finnhub_client.__aexit__(None, None, None)
 
     # ------------------------------------------------------------------
     # Daily routine
@@ -390,6 +442,8 @@ class TradingPlatform:
         """Wakes every 30s; runs scheduled steps as their times arrive."""
         backfill_done_for: str | None = None
         pm_done_for: str | None = None
+        earnings_done_for: str | None = None  # Wave 1A: not weekday-gated
+        watchlist_done_for: str | None = None  # Phase B: not weekday-gated
 
         backfill_time = _parse_time(self.config["schedule"]["baseline_backfill_time"])
         pm_time = _parse_time(self.config["schedule"]["premarket_context_time"])
@@ -402,13 +456,33 @@ class TradingPlatform:
             now_t = now_et.time()
             is_weekday = now_et.weekday() < 5  # Mon-Fri
 
-            # Backfill (08:30 ET)
+            # Backfill (08:30 ET, weekdays only — needs market data)
             if is_weekday and backfill_done_for != today and now_t >= backfill_time:
                 try:
                     await self._run_baseline_backfill()
                     backfill_done_for = today
                 except Exception:
                     logger.exception("Baseline backfill failed; will retry")
+
+            # Finnhub earnings calendar refresh (08:30 ET, every day including
+            # weekends). The calendar is forward-looking so weekend refreshes
+            # keep catalysts table current ahead of Monday's first signal eval.
+            if earnings_done_for != today and now_t >= backfill_time:
+                try:
+                    await self._run_finnhub_earnings_refresh()
+                    earnings_done_for = today
+                except Exception:
+                    logger.exception("Finnhub earnings refresh failed; will retry")
+
+            # Dynamic watchlist refresh (08:30 ET, every day including weekends).
+            # Writes config/watchlist_dynamic.json which the next service boot
+            # will use. Phase B; SIP subscriptions only update on restart.
+            if watchlist_done_for != today and now_t >= backfill_time:
+                try:
+                    await self._run_dynamic_watchlist_refresh()
+                    watchlist_done_for = today
+                except Exception:
+                    logger.exception("Dynamic watchlist refresh failed; will retry")
 
             # Pre-market context (09:30 ET)
             if (
@@ -493,6 +567,40 @@ class TradingPlatform:
         n_pm = len(self.pm_baselines)
         logger.info("Backfill complete: %d daily contexts, %d PM baselines",
                     n_daily, n_pm)
+
+    async def _run_finnhub_earnings_refresh(self) -> None:
+        """Refresh the Finnhub earnings calendar (14-day forward window).
+
+        Independent of the weekday-gated `_run_baseline_backfill` so this
+        runs on weekends too. The calendar is forward-looking, so weekend
+        refreshes keep the catalysts table current ahead of Monday's first
+        signal evaluation. One API call (no symbol filter), filtered
+        in-memory to watchlist. Idempotent on replay (INSERT OR IGNORE).
+        """
+        if self.finnhub_client is None:
+            return
+        await refresh_earnings_calendar(
+            self.finnhub_client,
+            self.watchlist,
+            self.db_path,
+            days_forward=14,
+        )
+
+    async def _run_dynamic_watchlist_refresh(self) -> None:
+        """Refresh the dynamic watchlist (Phase B).
+
+        Builds top-500-by-30D-ADV from the union of S&P 500 + NASDAQ-100 +
+        DJIA constituents (sourced from Wikipedia) and writes
+        `config/watchlist_dynamic.json`. Runs daily at 08:30 ET including
+        weekends — no weekday gating. Membership rarely changes, but ADV
+        ranking does shift slightly day-to-day.
+
+        Does NOT update self.watchlist mid-run. The new list is picked up
+        on next service restart, when __init__ reads watchlist_dynamic.json.
+        """
+        polygon_key = self.config["_secrets"]["polygon_key"]
+        output_path = Path("config/watchlist_dynamic.json")
+        await refresh_dynamic_watchlist(polygon_key, output_path, top_n=500)
 
     def _compute_premarket_contexts(self) -> None:
         """At 9:30 ET, compute PM context per symbol from buffered PM bars."""
@@ -582,6 +690,25 @@ class TradingPlatform:
         # we no longer short-circuit on RTH<50 here. Fix for 2026-04-29
         # audit finding that gap-and-go was structurally unreachable.
         tech = generate_signal(df_ind, state.daily_ctx, state.premarket_ctx)
+
+        # Wave 1A: gap-and-go earnings-day veto. Trading gap-and-go on a stock
+        # with earnings before/during/after the bar is binary-bet exposure
+        # the strategy isn't designed for. Pullback path is unaffected
+        # (mean-reversion can be valid signal even on earnings days).
+        # NOTE: TechnicalSignal's field is `.signal` (Buy/Sell/Hold), not
+        # `.action` — TradeDecision uses `.action` but TechnicalSignal does
+        # not. Bug fix 2026-05-04 after AttributeError storm in production.
+        if tech.signal != "Hold" and tech.setup == "gap_and_go":
+            today_et = datetime.now(ET).date().isoformat()
+            if is_earnings_day(self.db_path, ticker, today_et):
+                if state.last_decision_action != "EarningsVeto":
+                    logger.info(
+                        "%s [gap_and_go] VETO: earnings on %s; skipping",
+                        ticker, today_et,
+                    )
+                    state.last_decision_action = "EarningsVeto"
+                    state.last_decision_setup = "gap_and_go"
+                return
 
         # 3. Latest sentiment
         max_age = self.config["signals"]["sentiment_max_age_sec"]
@@ -829,6 +956,15 @@ def setup_logging(level: str) -> None:
         format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # Suppress HTTP-client URL logging at INFO level. Polygon (and some
+    # other vendors) put the API key in URL query parameters rather than
+    # a header, so logging full URLs at INFO would leak credentials into
+    # journalctl / log files. Each library below logs at INFO by default;
+    # WARNING keeps real errors visible while hiding routine request URLs.
+    # Bug fix 2026-05-04 after a Polygon key leaked via httpx INFO logs.
+    for noisy_logger in ("httpx", "httpcore", "aiohttp", "anthropic",
+                         "urllib3"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 
 async def amain(config_path: str) -> None:
