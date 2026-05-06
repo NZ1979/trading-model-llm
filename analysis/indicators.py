@@ -453,113 +453,6 @@ RSI_OVERBOUGHT = 65
 ADX_TREND_MIN = 20
 
 
-def _check_gap_and_go(
-    intraday_df: pd.DataFrame,
-    daily_ctx: DailyContext | None,
-    premarket_ctx: PremarketContext,
-) -> TechnicalSignal | None:
-    """Gap-and-go on unusual pre-market volume.
-
-    This is a momentum signal that fires INDEPENDENTLY of the daily regime
-    filter. News-driven volume gaps override technical regime — that's the
-    whole point of trading them. A bear-regime stock that gets bought out
-    at +30% on 50x normal pre-market volume is still a buy.
-
-    Triggers when ALL are true:
-      - is_unusual_volume (premarket RVOL > 5x)
-      - |gap_pct| >= 1.0 (meaningful gap, not noise)
-      - within 9:35-10:00 ET window (after opening volatility, before
-        gap-and-go momentum has typically faded)
-      - For Buy: gap up AND price holding above pre-market low
-      - For Sell: gap down AND price holding below pre-market high
-
-    Returns None if not fired (caller falls through to pullback logic).
-    """
-    if not premarket_ctx.is_unusual_volume:
-        return None
-    if abs(premarket_ctx.gap_pct) < 1.0:
-        return None
-
-    last = intraday_df.iloc[-1]
-    last_ts = intraday_df.index[-1].tz_convert("America/New_York")
-
-    # Time window: 9:35-10:00 ET. After this, the gap-and-go has either
-    # worked (price extended) or failed (faded back to gap fill).
-    in_window = (
-        (last_ts.hour == 9 and last_ts.minute >= 35)
-        or (last_ts.hour == 10 and last_ts.minute == 0)
-    )
-    if not in_window:
-        return None
-
-    close = float(last["close"])
-
-    # ---- Buy path: gap up + holding ----
-    if premarket_ctx.gap_pct >= 1.0:
-        if pd.isna(premarket_ctx.premarket_low):
-            return None
-        # Gap is "holding" if price is at or above 99.8% of pre-market low.
-        # Tighter than this and we miss valid setups; looser and we catch
-        # gaps that have already failed.
-        if close < premarket_ctx.premarket_low * 0.998:
-            return None
-
-        confidence = 70
-        reasons = [
-            f"gap_up_{premarket_ctx.gap_pct:.2f}%",
-            f"premarket_rvol={premarket_ctx.premarket_rvol:.1f}x",
-            f"close>=pm_low*0.998({premarket_ctx.premarket_low:.2f})",
-        ]
-        if premarket_ctx.premarket_rvol >= EXTREME_RVOL_THRESHOLD:
-            confidence += 10
-            reasons.append(f"extreme_rvol>{EXTREME_RVOL_THRESHOLD}x")
-        # Breakout of pre-market high in the trigger bar = momentum confirmed
-        if (
-            not pd.isna(premarket_ctx.premarket_high)
-            and close > premarket_ctx.premarket_high
-        ):
-            confidence += 10
-            reasons.append(f"broke_pm_high({premarket_ctx.premarket_high:.2f})")
-        # Daily regime alignment is a bonus, not a requirement
-        if daily_ctx is not None and daily_ctx.regime == "bull":
-            confidence += 10
-            reasons.append("daily_regime_aligned")
-        return TechnicalSignal(
-            "Buy", min(confidence, 100), "gap_and_go", tuple(reasons),
-        )
-
-    # ---- Sell path: gap down + holding ----
-    if premarket_ctx.gap_pct <= -1.0:
-        if pd.isna(premarket_ctx.premarket_high):
-            return None
-        if close > premarket_ctx.premarket_high * 1.002:
-            return None
-
-        confidence = 70
-        reasons = [
-            f"gap_down_{premarket_ctx.gap_pct:.2f}%",
-            f"premarket_rvol={premarket_ctx.premarket_rvol:.1f}x",
-            f"close<=pm_high*1.002({premarket_ctx.premarket_high:.2f})",
-        ]
-        if premarket_ctx.premarket_rvol >= EXTREME_RVOL_THRESHOLD:
-            confidence += 10
-            reasons.append(f"extreme_rvol>{EXTREME_RVOL_THRESHOLD}x")
-        if (
-            not pd.isna(premarket_ctx.premarket_low)
-            and close < premarket_ctx.premarket_low
-        ):
-            confidence += 10
-            reasons.append(f"broke_pm_low({premarket_ctx.premarket_low:.2f})")
-        if daily_ctx is not None and daily_ctx.regime == "bear":
-            confidence += 10
-            reasons.append("daily_regime_aligned")
-        return TechnicalSignal(
-            "Sell", min(confidence, 100), "gap_and_go", tuple(reasons),
-        )
-
-    return None
-
-
 def generate_signal(
     intraday_df: pd.DataFrame,
     daily_ctx: DailyContext | None,
@@ -567,27 +460,27 @@ def generate_signal(
 ) -> TechnicalSignal:
     """Decide Buy/Sell/Hold from the latest intraday bar.
 
-    Two setup paths, checked in order:
+    Thin dispatcher across the registered signal modules in
+    strategy.signals. Two setup paths, checked in order:
 
-    1) GAP-AND-GO (momentum): Unusual pre-market volume + meaningful gap +
-       price holding the gap, in the 9:35-10:00 ET window. Fires regardless
-       of daily regime. See _check_gap_and_go for details.
+    1) GAP-AND-GO (momentum): see strategy/signals/gap_and_go.py.
+       No warmup required; needs only premarket_ctx.
+    2) PULLBACK (mean-reversion-in-trend): see strategy/signals/pullback.py.
+       Requires daily_ctx + 50 RTH bars + indicator warmup.
 
-    2) PULLBACK (mean reversion in trend): The classic setup. Daily regime
-       is bull AND daily ADX > 20 AND intraday RSI oversold AND MACD turning
-       up AND price > VWAP - 0.3%. Symmetric for sells.
+    Hard blocks applied here at the dispatcher level:
+      - First 5 min of RTH (9:30-9:35 ET): too volatile, don't even try.
+      - Empty intraday_df.
 
-    Pre-market overlay on the pullback path:
-      - HARD BLOCK on counter-trend gaps (gap down >0.5*ATR while attempting
-        a Buy, or gap up >0.5*ATR while attempting a Sell). News-driven gaps
-        override technical setups.
-      - CONFIDENCE BOOST (+15) for trend-aligned gaps holding direction.
-
-    Hard blocks that apply to both paths:
-      - First 5 min of RTH (9:30-9:35 ET): too volatile.
-      - Insufficient data or warming-up indicators.
+    Refactor 2026-05-06: signal logic was extracted from this file into
+    strategy/signals/* so model-specific forks can plug in alternative
+    signal implementations without touching the indicator math here.
     """
-    # ---- Hard blocks that apply regardless of warmup ----
+    # Lazy import to avoid module-load-time circular dependency:
+    # strategy.signals.* imports from analysis.indicators for DailyContext,
+    # PremarketContext, TechnicalSignal, and the threshold constants.
+    from strategy.signals import check_gap_and_go, check_pullback
+
     if len(intraday_df) == 0:
         return TechnicalSignal("Hold", 0, "none", ("no_bars",))
 
@@ -597,132 +490,14 @@ def generate_signal(
         return TechnicalSignal("Hold", 0, "none", ("opening_volatility_window",))
 
     # ---- Path 1: gap-and-go (priority, NO warmup required) ----
-    # Gap-and-go only needs PM context + the last bar's close + the time
-    # window. It does NOT need 50 bars of intraday indicator warmup, so we
-    # check it before the indicator-warmup gates. This is the fix for the
-    # 2026-04-29 audit finding that gap-and-go was structurally unreachable
-    # because the warmup gate (~1:40 PM ET) closed after the gap-and-go
-    # window (9:35-10:00 ET).
     if premarket_ctx is not None:
-        gng = _check_gap_and_go(intraday_df, daily_ctx, premarket_ctx)
+        gng = check_gap_and_go(intraday_df, daily_ctx, premarket_ctx)
         if gng is not None:
             return gng
 
-    # ---- Pullback path requires full indicator warmup ----
-    if daily_ctx is None or len(intraday_df) < 50:
-        return TechnicalSignal("Hold", 0, "none", ("insufficient_data",))
-
-    last = intraday_df.iloc[-1]
-    if last[INTRADAY_COLUMNS].isna().any():
-        return TechnicalSignal("Hold", 0, "none", ("indicators_warming_up",))
-
-    # ---- Path 2: pullback in trend ----
-    close = last["close"]
-    rsi_v = last["rsi_14"]
-    sma20 = last["sma_20"]
-    adx_v = last["adx_14"]
-    plus_di = last["plus_di"]
-    minus_di = last["minus_di"]
-    vwap_v = last["vwap"]
-
-    recent_hist = intraday_df["macd_hist"].iloc[-3:]
-    macd_turned_up = (recent_hist.iloc[0] < 0) and (recent_hist.iloc[-1] > 0)
-    macd_turned_down = (recent_hist.iloc[0] > 0) and (recent_hist.iloc[-1] < 0)
-
-    # ----- BUY pullback -----
-    buy_setup = (
-        daily_ctx.regime == "bull"
-        and daily_ctx.is_trending
-        and close > sma20
-        and rsi_v < RSI_OVERSOLD
-        and macd_turned_up
-        and close > vwap_v * 0.997
-    )
-    if buy_setup:
-        if premarket_ctx is not None:
-            if premarket_ctx.gap_pct < 0 and premarket_ctx.gap_atr_ratio > 0.5:
-                return TechnicalSignal(
-                    "Hold", 0, "none",
-                    (f"counter_trend_gap_down({premarket_ctx.gap_pct:.2f}%)",),
-                )
-
-        reasons = [
-            f"daily_regime=bull(SMA200={daily_ctx.sma_200:.2f})",
-            f"daily_adx={daily_ctx.adx_14:.1f}",
-            f"close>SMA20({sma20:.2f})",
-            f"rsi={rsi_v:.1f}<{RSI_OVERSOLD}",
-            "macd_hist_cross_up",
-            f"close>vwap({vwap_v:.2f})",
-        ]
-        confidence = 60
-        if adx_v > ADX_TREND_MIN:
-            confidence += 15
-            reasons.append(f"intraday_adx={adx_v:.1f}>{ADX_TREND_MIN}")
-        if plus_di > minus_di:
-            confidence += 15
-            reasons.append("plus_di>minus_di")
-        if last["volume"] > intraday_df["volume"].iloc[-20:].mean() * 1.2:
-            confidence += 10
-            reasons.append("volume_spike")
-        if premarket_ctx is not None and premarket_ctx.gap_pct > 0.3:
-            if (
-                not pd.isna(premarket_ctx.premarket_low)
-                and close > premarket_ctx.premarket_low
-            ):
-                confidence += 15
-                reasons.append(
-                    f"gap_up_{premarket_ctx.gap_pct:.2f}%_holding_pm_low"
-                )
-        return TechnicalSignal(
-            "Buy", min(confidence, 100), "pullback", tuple(reasons),
-        )
-
-    # ----- SELL pullback -----
-    sell_setup = (
-        daily_ctx.regime == "bear"
-        and daily_ctx.is_trending
-        and close < sma20
-        and rsi_v > RSI_OVERBOUGHT
-        and macd_turned_down
-        and close < vwap_v * 1.003
-    )
-    if sell_setup:
-        if premarket_ctx is not None:
-            if premarket_ctx.gap_pct > 0 and premarket_ctx.gap_atr_ratio > 0.5:
-                return TechnicalSignal(
-                    "Hold", 0, "none",
-                    (f"counter_trend_gap_up({premarket_ctx.gap_pct:.2f}%)",),
-                )
-
-        reasons = [
-            f"daily_regime=bear(SMA200={daily_ctx.sma_200:.2f})",
-            f"daily_adx={daily_ctx.adx_14:.1f}",
-            f"close<SMA20({sma20:.2f})",
-            f"rsi={rsi_v:.1f}>{RSI_OVERBOUGHT}",
-            "macd_hist_cross_down",
-            f"close<vwap({vwap_v:.2f})",
-        ]
-        confidence = 60
-        if adx_v > ADX_TREND_MIN:
-            confidence += 15
-            reasons.append(f"intraday_adx={adx_v:.1f}>{ADX_TREND_MIN}")
-        if minus_di > plus_di:
-            confidence += 15
-            reasons.append("minus_di>plus_di")
-        if last["volume"] > intraday_df["volume"].iloc[-20:].mean() * 1.2:
-            confidence += 10
-            reasons.append("volume_spike")
-        if premarket_ctx is not None and premarket_ctx.gap_pct < -0.3:
-            if (
-                not pd.isna(premarket_ctx.premarket_high)
-                and close < premarket_ctx.premarket_high
-            ):
-                confidence += 15
-                reasons.append(
-                    f"gap_down_{premarket_ctx.gap_pct:.2f}%_holding_pm_high"
-                )
-        return TechnicalSignal(
-            "Sell", min(confidence, 100), "pullback", tuple(reasons),
-        )
+    # ---- Path 2: pullback in trend (with warmup gates inside) ----
+    pb = check_pullback(intraday_df, daily_ctx, premarket_ctx)
+    if pb is not None:
+        return pb
 
     return TechnicalSignal("Hold", 0, "none", ("no_setup",))
