@@ -553,20 +553,33 @@ class TradingPlatform:
             lookback_days=daily_lookback,
         )
 
-        # Build DailyContext per symbol from the fetched DataFrames
+        # Build DailyContext per symbol from the fetched DataFrames.
+        # Bug G fix 2026-05-05: ALWAYS store daily_df, even when
+        # compute_daily_context returns None (tickers with <200 daily bars,
+        # e.g. recent spinoffs like SNDK). The DataFrame is still useful for
+        # premarket ATR computation, and gap-and-go doesn't need daily_ctx
+        # — only the pullback path does.
+        n_daily_short_history = 0
         for ticker, daily in daily_dfs.items():
             try:
                 ctx = compute_daily_context(daily, ticker)
                 if ctx is not None:
                     self.symbols[ticker].daily_ctx = ctx
-                    self.symbols[ticker].daily_df = daily
+                else:
+                    n_daily_short_history += 1
+                # Store daily_df regardless so premarket_ctx (gap-and-go
+                # only) can still build for short-history tickers.
+                self.symbols[ticker].daily_df = daily
             except Exception:
                 logger.exception("Daily context build failed for %s", ticker)
 
         n_daily = sum(1 for s in self.symbols.values() if s.daily_ctx is not None)
         n_pm = len(self.pm_baselines)
-        logger.info("Backfill complete: %d daily contexts, %d PM baselines",
-                    n_daily, n_pm)
+        logger.info(
+            "Backfill complete: %d daily contexts, %d short-history "
+            "(gap-and-go only), %d PM baselines",
+            n_daily, n_daily_short_history, n_pm,
+        )
 
     async def _run_finnhub_earnings_refresh(self) -> None:
         """Refresh the Finnhub earnings calendar (14-day forward window).
@@ -603,20 +616,21 @@ class TradingPlatform:
         await refresh_dynamic_watchlist(polygon_key, output_path, top_n=500)
 
     def _compute_premarket_contexts(self) -> None:
-        """At 9:30 ET, compute PM context per symbol from buffered PM bars."""
+        """At 9:30 ET, compute PM context per symbol from buffered PM bars.
+
+        Bug G fix 2026-05-05: previously gated on daily_ctx is None, which
+        excluded tickers with <200 daily bars (e.g. SNDK after the WD
+        spinoff). Those tickers had daily_df available but were silently
+        skipped, making gap-and-go unreachable for them. Now we gate on
+        daily_df instead — the only thing premarket_ctx actually needs.
+        """
         for ticker, state in self.symbols.items():
-            if state.daily_ctx is None:
-                continue
             df = state.to_dataframe()
             if df.empty:
                 continue
-            # We need a daily DataFrame for compute_premarket_context;
-            # for the daily ATR it requires daily bars. We have daily_ctx
-            # already but compute_premarket_context expects a DataFrame.
-            # Rebuild a minimal daily DataFrame from cached state — or just
-            # skip if we don't have it cached as raw bars.
-            # SIMPLIFICATION: store the daily DataFrame on state during backfill
-            # so we can use it here. This is done in _run_baseline_backfill below.
+            # daily_df is needed by compute_premarket_context for ATR.
+            # daily_ctx is not needed here (only the gap-and-go path uses it
+            # internally, and only as a confidence boost, not a hard gate).
             daily_df = getattr(state, "daily_df", None)
             if daily_df is None:
                 continue
