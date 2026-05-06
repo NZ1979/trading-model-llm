@@ -25,7 +25,8 @@ import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 from urllib.request import Request, urlopen
 
 import aiohttp
@@ -74,6 +75,42 @@ def _normalize_symbol(symbol: str) -> str:
     s = str(symbol).strip().upper()
     s = s.replace("-", ".")
     return s
+
+
+@dataclass(frozen=True, slots=True)
+class WatchlistSource:
+    """A source of constituent symbols for the dynamic watchlist.
+
+    Each source has a name (used in metadata), a fetcher callable that
+    returns a set of normalized symbols, and sanity-check count bounds
+    that the fetcher's output must fall within. Failed bounds aborts
+    the refresh — partial watchlists are dangerous (a half-loaded source
+    silently shrinks the universe).
+
+    Universe parameterization (2026-05-06): added so model-specific forks
+    (gap-and-go on Russell 2000, large-cap-only on S&P 500, etc.) can
+    plug in their own source lists without modifying the build logic.
+    """
+    name: str
+    fetcher: Callable[[], set[str]]
+    min_count: int
+    max_count: int | None = None  # None = no upper bound
+
+
+def default_large_cap_sources() -> list["WatchlistSource"]:
+    """Default source set: S&P 500 + NASDAQ-100 + DJIA.
+
+    Used by build_dynamic_watchlist() when no sources parameter is passed.
+    Preserves the Phase B behavior. Future model forks construct
+    alternative source lists and pass them explicitly to build_dynamic_watchlist.
+    """
+    return [
+        WatchlistSource("sp500", get_sp500_symbols, min_count=400),
+        WatchlistSource("nasdaq100", get_nasdaq100_symbols,
+                        min_count=90, max_count=110),
+        WatchlistSource("djia", get_djia_symbols,
+                        min_count=30, max_count=30),
+    ]
 
 
 def get_sp500_symbols() -> set[str]:
@@ -271,38 +308,51 @@ async def build_dynamic_watchlist(
     polygon_key: str,
     *,
     top_n: int = 500,
+    sources: list[WatchlistSource] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
-    """Build the dynamic watchlist: union of S&P 500 + NASDAQ-100 + DJIA,
-    top N by 30-day average dollar volume.
+    """Build the dynamic watchlist: union of source sets, top N by 30-day ADV.
+
+    Args:
+        polygon_key: Polygon API key for the ADV computation.
+        top_n: max symbols in the output. Sorted by 30-day ADV descending.
+        sources: list of WatchlistSource instances to fetch and union. If
+            None (default), uses default_large_cap_sources(): S&P 500 +
+            NASDAQ-100 + DJIA. Model-specific forks pass their own source
+            lists (e.g. Russell 2000 for gap-and-go).
 
     Returns (watchlist_symbols, metadata) where metadata has source counts,
     union size, last-updated timestamp, and the count of symbols that had
     Polygon ADV data. Returns ([], {}) on any source-side failure that
     would produce an unsafe partial result.
     """
-    sp500 = get_sp500_symbols()
-    ndx = get_nasdaq100_symbols()
-    djia = get_djia_symbols()
-
-    if len(sp500) < 400:
-        logger.error("S&P 500 source returned %d symbols; aborting refresh",
-                     len(sp500))
-        return [], {}
-    if len(ndx) < 90:
-        logger.error("NASDAQ-100 source returned %d symbols; aborting refresh",
-                     len(ndx))
-        return [], {}
-    if len(djia) != 30:
-        logger.error(
-            "DJIA source returned %d symbols (expected 30); aborting refresh",
-            len(djia),
-        )
+    if sources is None:
+        sources = default_large_cap_sources()
+    if not sources:
+        logger.error("No watchlist sources provided; aborting refresh")
         return [], {}
 
-    union = sp500 | ndx | djia
+    by_name: dict[str, set[str]] = {}
+    for src in sources:
+        syms = src.fetcher()
+        if len(syms) < src.min_count:
+            logger.error(
+                "%s source returned %d symbols (< min %d); aborting refresh",
+                src.name, len(syms), src.min_count,
+            )
+            return [], {}
+        if src.max_count is not None and len(syms) > src.max_count:
+            logger.error(
+                "%s source returned %d symbols (> max %d); aborting refresh",
+                src.name, len(syms), src.max_count,
+            )
+            return [], {}
+        by_name[src.name] = syms
+
+    union: set[str] = set().union(*by_name.values())
     logger.info(
-        "Universe: SP500=%d, NDX=%d, DJIA=%d, union=%d",
-        len(sp500), len(ndx), len(djia), len(union),
+        "Universe: %s | union=%d",
+        ", ".join(f"{name}={len(syms)}" for name, syms in by_name.items()),
+        len(union),
     )
 
     advs = await fetch_30day_adv(union, polygon_key)
@@ -317,11 +367,7 @@ async def build_dynamic_watchlist(
 
     metadata = {
         "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "source_counts": {
-            "sp500": len(sp500),
-            "nasdaq100": len(ndx),
-            "djia": len(djia),
-        },
+        "source_counts": {name: len(syms) for name, syms in by_name.items()},
         "union_size": len(union),
         "top_n": top_n,
         "with_adv_data": advs_count,
