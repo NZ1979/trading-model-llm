@@ -1,0 +1,42 @@
+# Line-ending policy. The repository stores LF for all text files;
+# the working tree gets CRLF on Windows and LF on Linux/Mac.
+# This eliminates the cross-platform line-ending noise that bit us
+# on 2026-05-06 (bash sandbox vs PowerShell seeing different views
+# of the same files).
+*           text=auto eol=lf
+
+# Source code — always LF in repo, native in working tree
+*.py        text eol=lf
+*.sh        text eol=lf
+*.bash      text eol=lf
+
+# Configuration and data — always LF
+*.json      text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.toml      text eol=lf
+*.ini       text eol=lf
+*.cfg       text eol=lf
+*.env       text eol=lf
+
+# Documentation — always LF
+*.md        text eol=lf
+*.txt       text eol=lf
+*.rst       text eol=lf
+*.html      text eol=lf
+
+# Git itself
+.gitignore       text eol=lf
+.gitattributes   text eol=lf
+
+# Binary files — never touch line endings
+*.docx      binary
+*.xlsx      binary
+*.pdf       binary
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.zip       binary
+*.tar.gz    binary
