@@ -272,6 +272,7 @@ def compute_premarket_context(
     today_full_session_df: pd.DataFrame,
     ticker: str,
     historical_pm_volumes: list[int] | None = None,
+    rvol_threshold: float = UNUSUAL_RVOL_THRESHOLD,
 ) -> PremarketContext | None:
     """Compute pre-market levels, gap metrics, and RVOL.
 
@@ -286,6 +287,13 @@ def compute_premarket_context(
             If None or empty, RVOL defaults to 0 and is_unusual_volume to False
             (the gap-and-go signal will not fire). For paper testing without
             historical data, you can stub this with a fixed list.
+        rvol_threshold: PM RVOL multiple above which is_unusual_volume becomes
+            True. Defaults to the global UNUSUAL_RVOL_THRESHOLD=5.0. Phase C
+            (2026-05-06) adds per-ticker thresholds derived from each
+            ticker's own historical PM RVOL distribution; the caller passes
+            the ticker-specific value here. Falling back to the global
+            default preserves backward compatibility when no per-ticker
+            value exists.
 
     Returns None if data is insufficient. Call once at 9:30 AM ET; the result
     is static for the rest of the day.
@@ -348,7 +356,7 @@ def compute_premarket_context(
         premarket_low=pm_low,
         premarket_volume=pm_volume,
         premarket_rvol=float(rvol),
-        is_unusual_volume=rvol >= UNUSUAL_RVOL_THRESHOLD,
+        is_unusual_volume=rvol >= rvol_threshold,
         gap_pct=float(gap_pct),
         gap_atr_ratio=float(gap_atr_ratio),
     )

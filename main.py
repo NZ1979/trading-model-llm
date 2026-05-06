@@ -69,8 +69,13 @@ from data.news_pipeline import NewsSentimentPipeline, latest_sentiment
 from data.polygon_feed import PolygonRESTClient, backfill_premarket_baselines, backfill_daily_bars
 from data.polygon_news import PolygonNewsPipeline
 from data.finnhub_feed import FinnhubClient, refresh_earnings_calendar, is_earnings_day
+from data.pm_rvol_thresholds import (
+    load_thresholds as pm_rvol_thresholds_load,
+    get_threshold as pm_rvol_thresholds_get,
+)
 from data.watchlist_builder import read_watchlist_file, refresh_dynamic_watchlist
 from execution.alpaca_orders import AlpacaOrderClient, OrderResult
+from scripts.build_pm_rvol_thresholds import refresh_pm_rvol_thresholds
 from strategy.risk import compute_atr_stop_pct, size_from_risk, validate_order
 from strategy.signal_engine import evaluate_trade, TradeDecision
 
@@ -175,6 +180,16 @@ class TradingPlatform:
             t: SymbolState(ticker=t) for t in self.watchlist
         }
         self.pm_baselines: dict[str, list[int]] = {}
+
+        # Phase C 2026-05-06: per-ticker PM RVOL thresholds. Loaded at boot
+        # from config/pm_rvol_thresholds.json (produced by the daily 08:30 ET
+        # refresh task). Empty dict on missing file -> all lookups fall back
+        # to HARD_FALLBACK_THRESHOLD (5.0), preserving pre-Phase-C behavior.
+        self.pm_rvol_thresholds_path = Path("config/pm_rvol_thresholds.json")
+        self.pm_rvol_thresholds = pm_rvol_thresholds_load(
+            self.pm_rvol_thresholds_path,
+        )
+
         self._tasks: list[asyncio.Task] = []
         self._shutdown = asyncio.Event()
 
@@ -444,6 +459,7 @@ class TradingPlatform:
         pm_done_for: str | None = None
         earnings_done_for: str | None = None  # Wave 1A: not weekday-gated
         watchlist_done_for: str | None = None  # Phase B: not weekday-gated
+        pm_rvol_thresholds_done_for: str | None = None  # Phase C: not weekday-gated
 
         backfill_time = _parse_time(self.config["schedule"]["baseline_backfill_time"])
         pm_time = _parse_time(self.config["schedule"]["premarket_context_time"])
@@ -483,6 +499,24 @@ class TradingPlatform:
                     watchlist_done_for = today
                 except Exception:
                     logger.exception("Dynamic watchlist refresh failed; will retry")
+
+            # Per-ticker PM RVOL thresholds refresh (Phase C, 2026-05-06).
+            # Runs after the watchlist refresh so it operates on the current
+            # symbol set. Updates self.pm_rvol_thresholds in-place so changes
+            # take effect for the same trading day's pre-market context
+            # computation at 09:30 ET. Cost: ~5 minutes for 500 tickers.
+            if (
+                pm_rvol_thresholds_done_for != today
+                and watchlist_done_for == today
+                and now_t >= backfill_time
+            ):
+                try:
+                    await self._run_pm_rvol_thresholds_refresh()
+                    pm_rvol_thresholds_done_for = today
+                except Exception:
+                    logger.exception(
+                        "PM RVOL thresholds refresh failed; will retry"
+                    )
 
             # Pre-market context (09:30 ET)
             if (
@@ -615,6 +649,29 @@ class TradingPlatform:
         output_path = Path("config/watchlist_dynamic.json")
         await refresh_dynamic_watchlist(polygon_key, output_path, top_n=500)
 
+    async def _run_pm_rvol_thresholds_refresh(self) -> None:
+        """Refresh per-ticker PM RVOL thresholds (Phase C, 2026-05-06).
+
+        For every ticker in the current watchlist, fetch the last 180 days
+        of pre-market 1-minute bars, compute that ticker's PM RVOL
+        distribution, and set the threshold at the 85th percentile (clipped
+        to [2.0, 10.0]).
+
+        Schedule: daily at 08:30 ET, after _run_dynamic_watchlist_refresh
+        produces the latest watchlist file. Output:
+        config/pm_rvol_thresholds.json. Updates self.pm_rvol_thresholds
+        in-place so the same trading day's signal evaluations use the new
+        per-ticker values without requiring a service restart.
+        """
+        polygon_key = self.config["_secrets"]["polygon_key"]
+        output_path = self.pm_rvol_thresholds_path
+        await refresh_pm_rvol_thresholds(
+            api_key=polygon_key,
+            watchlist=sorted(self.watchlist),
+            output_path=output_path,
+        )
+        self.pm_rvol_thresholds = pm_rvol_thresholds_load(output_path)
+
     def _compute_premarket_contexts(self) -> None:
         """At 9:30 ET, compute PM context per symbol from buffered PM bars.
 
@@ -635,11 +692,18 @@ class TradingPlatform:
             if daily_df is None:
                 continue
 
+            # Phase C 2026-05-06: per-ticker PM RVOL threshold from
+            # historical distribution. Falls back to the global default
+            # (5.0) when no entry exists for this ticker.
+            ticker_threshold = pm_rvol_thresholds_get(
+                self.pm_rvol_thresholds, ticker,
+            )
             ctx = compute_premarket_context(
                 daily_df=daily_df,
                 today_full_session_df=df,
                 ticker=ticker,
                 historical_pm_volumes=self.pm_baselines.get(ticker),
+                rvol_threshold=ticker_threshold,
             )
             state.premarket_ctx = ctx
 
