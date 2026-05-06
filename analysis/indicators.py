@@ -173,6 +173,7 @@ class DailyContext:
     adx_14: float
     regime: Regime
     is_trending: bool
+    daily_atr_14: float = 0.0  # Wilder's ATR(14), in price units. 0 if unavailable.
 
 
 def compute_daily_context(daily_df: pd.DataFrame, ticker: str) -> DailyContext | None:
@@ -180,6 +181,8 @@ def compute_daily_context(daily_df: pd.DataFrame, ticker: str) -> DailyContext |
 
     Needs at least 200 daily bars. Returns None if data is insufficient.
     Call this once per ticker per day at market open.
+
+    Bug H 2026-05-06: also computes Wilder's ATR(14) for ATR-based stops.
     """
     if len(daily_df) < 200:
         return None
@@ -189,6 +192,15 @@ def compute_daily_context(daily_df: pd.DataFrame, ticker: str) -> DailyContext |
     adx14, _, _ = adx_dmi(daily_df["high"], daily_df["low"], close, period=14)
     last_adx = adx14.iloc[-1]
     last_close = close.iloc[-1]
+
+    # Wilder's ATR(14) for ATR-aware stop placement
+    atr14_series = _wilder(
+        true_range(daily_df["high"], daily_df["low"], daily_df["close"]),
+        14,
+    )
+    last_atr14 = atr14_series.iloc[-1]
+    if pd.isna(last_atr14) or last_atr14 < 0:
+        last_atr14 = 0.0
 
     if pd.isna(sma200) or pd.isna(last_close):
         return None
@@ -207,6 +219,7 @@ def compute_daily_context(daily_df: pd.DataFrame, ticker: str) -> DailyContext |
         adx_14=float(last_adx),
         regime=regime,
         is_trending=last_adx > 20,
+        daily_atr_14=float(last_atr14),
     )
 
 

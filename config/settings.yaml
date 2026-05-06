@@ -86,7 +86,10 @@ schedule:
 risk:
   max_position_pct: 20                             # single position cap as % of equity
   max_total_exposure_pct: 90                       # total exposure cap
-  stop_loss_pct: 2                                 # auto stop on every entry
+  stop_loss_pct: 2                                 # FALLBACK stop pct when ATR unavailable
+  stop_atr_multiplier: 1.5                         # Bug H: stop distance = N × daily ATR(14)
+  stop_atr_min_pct: 1.0                            # floor on ATR-based stop (% of entry)
+  stop_atr_max_pct: 5.0                            # cap on ATR-based stop (% of entry)
   risk_per_trade_pct: 0.5                          # max loss per trade as % of equity (used by size_from_risk)
 
 logging:

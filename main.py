@@ -71,7 +71,7 @@ from data.polygon_news import PolygonNewsPipeline
 from data.finnhub_feed import FinnhubClient, refresh_earnings_calendar, is_earnings_day
 from data.watchlist_builder import read_watchlist_file, refresh_dynamic_watchlist
 from execution.alpaca_orders import AlpacaOrderClient, OrderResult
-from strategy.risk import size_from_risk, validate_order
+from strategy.risk import compute_atr_stop_pct, size_from_risk, validate_order
 from strategy.signal_engine import evaluate_trade, TradeDecision
 
 logger = logging.getLogger(__name__)
@@ -794,8 +794,28 @@ class TradingPlatform:
             logger.warning("Skipping %s: equity unavailable", decision.ticker)
             return
 
-        stop_loss_pct = self.config["risk"]["stop_loss_pct"]
-        risk_per_trade = self.config["risk"].get("risk_per_trade_pct", 0.5)
+        # Bug H 2026-05-06: stop distance is now ATR-aware. Falls back to
+        # the configured fixed pct when daily_atr_14 is missing (e.g. for
+        # tickers with insufficient daily history).
+        fallback_stop_pct = self.config["risk"]["stop_loss_pct"]
+        risk_cfg = self.config["risk"]
+        daily_atr = (
+            state.daily_ctx.daily_atr_14
+            if state.daily_ctx is not None else 0.0
+        )
+        stop_loss_pct = compute_atr_stop_pct(
+            entry_price=latest_price,
+            daily_atr=daily_atr,
+            atr_multiplier=risk_cfg.get("stop_atr_multiplier", 1.5),
+            min_pct=risk_cfg.get("stop_atr_min_pct", 1.0),
+            max_pct=risk_cfg.get("stop_atr_max_pct", 5.0),
+            fallback_pct=fallback_stop_pct,
+        )
+        risk_per_trade = risk_cfg.get("risk_per_trade_pct", 0.5)
+        logger.info(
+            "%s: ATR stop sizing — atr=%.3f stop_pct=%.2f%% (fallback=%.2f%%)",
+            decision.ticker, daily_atr, stop_loss_pct, fallback_stop_pct,
+        )
         qty = size_from_risk(
             account_equity=equity,
             entry_price=latest_price,

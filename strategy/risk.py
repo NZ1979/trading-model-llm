@@ -212,3 +212,39 @@ def size_from_risk(
     risk_per_share = entry_price * (stop_loss_pct / 100.0)
     max_loss = account_equity * (risk_per_trade_pct / 100.0)
     return max(1, int(max_loss // risk_per_share))
+
+
+def compute_atr_stop_pct(
+    entry_price: float,
+    daily_atr: float,
+    atr_multiplier: float = 1.5,
+    min_pct: float = 1.0,
+    max_pct: float = 5.0,
+    fallback_pct: float = 2.0,
+) -> float:
+    """Convert daily ATR to a percentage stop distance, clipped to safe bounds.
+
+    Bug H 2026-05-06: replaces the global fixed-percentage stop with a
+    per-ticker ATR-based stop. Volatile names get wider stops; stable names
+    get tighter stops. Position size scales inversely (via size_from_risk),
+    so the dollar risk per trade stays constant.
+
+    Args:
+        entry_price: planned entry price.
+        daily_atr: Wilder's ATR(14) from daily bars, in price units.
+        atr_multiplier: how many ATRs to set the stop. 1.5 is a balance
+            between "tight enough to limit loss" and "wide enough to absorb
+            normal noise". Industry-typical range is 1.0-2.5.
+        min_pct: floor on stop distance as % of entry. Prevents absurdly
+            tight stops on low-ATR names.
+        max_pct: ceiling on stop distance as % of entry. Prevents absurdly
+            wide stops on high-ATR names (where position size becomes tiny).
+        fallback_pct: returned when entry_price or daily_atr are invalid.
+
+    Returns:
+        Stop distance as percentage of entry price (e.g. 2.5 = 2.5%).
+    """
+    if entry_price <= 0 or daily_atr <= 0:
+        return fallback_pct
+    raw_pct = (atr_multiplier * daily_atr / entry_price) * 100.0
+    return max(min_pct, min(max_pct, raw_pct))
