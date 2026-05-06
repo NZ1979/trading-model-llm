@@ -202,6 +202,95 @@ def get_djia_symbols() -> set[str]:
     return set()
 
 
+ISHARES_IWM_HOLDINGS_URL = (
+    "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
+    "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+)
+
+
+def get_russell2000_symbols() -> set[str]:
+    """Fetch current Russell 2000 constituents from iShares IWM ETF holdings.
+
+    The Russell 2000 reconstitutes annually (last Friday of June) and a
+    direct FTSE Russell feed is paywalled. iShares publishes the daily
+    holdings of their IWM ETF as a CSV — the practical canonical source
+    for "what's currently in the Russell 2000 by holdings weight."
+
+    Format quirks:
+      - The CSV starts with ~10 lines of fund-level metadata
+        (fund name, NAV, AUM, etc.) before the actual holdings table.
+      - Column header row begins with "Ticker".
+      - Holdings include non-equity instruments (cash, futures positions,
+        currency forwards) which we filter out via alphanumeric ticker
+        validation. Real Russell 2000 tickers are always alphanumeric
+        plus an optional class-share dot (e.g. "BRK.B").
+
+    Used by model-specific forks (e.g. gap-and-go on small caps) via
+    `default_small_cap_sources()` or by passing
+    `WatchlistSource("russell2000", get_russell2000_symbols, ...)`
+    directly to `build_dynamic_watchlist`.
+    """
+    req = Request(ISHARES_IWM_HOLDINGS_URL, headers=WIKI_HEADERS)
+    with urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
+        csv_text = resp.read().decode("utf-8", errors="replace")
+
+    # Find the row that begins the holdings table (header row starts with Ticker)
+    lines = csv_text.splitlines()
+    header_idx = None
+    for i, line in enumerate(lines):
+        stripped = line.lstrip('\ufeff').strip()
+        if stripped.startswith('"Ticker"') or stripped.startswith('Ticker,'):
+            header_idx = i
+            break
+    if header_idx is None:
+        logger.warning(
+            "iShares IWM holdings CSV: 'Ticker' header row not found"
+        )
+        return set()
+
+    # Parse from the header row onward
+    csv_data = "\n".join(lines[header_idx:])
+    df = pd.read_csv(io.StringIO(csv_data))
+    if "Ticker" not in df.columns:
+        logger.warning(
+            "iShares IWM holdings CSV: 'Ticker' column missing after parse"
+        )
+        return set()
+
+    symbols: set[str] = set()
+    for raw in df["Ticker"].dropna():
+        normalized = _normalize_symbol(str(raw))
+        # Real tickers are alphanumeric with optional dot.
+        # Skip cash/futures/currency rows (USD, -, JPY, etc. style entries
+        # often appear without a real equity ticker).
+        bare = normalized.replace(".", "")
+        if bare.isalnum() and 1 <= len(normalized) <= 5:
+            symbols.add(normalized)
+    return symbols
+
+
+def default_small_cap_sources() -> list["WatchlistSource"]:
+    """Default source set for small-cap-focused models: Russell 2000.
+
+    Returned as a single-source list so that the build_dynamic_watchlist
+    sanity-bound check still applies: the IWM CSV must return at least
+    1500 tickers (the index has 2000 by construction, allowing for some
+    parse loss). If iShares ever changes their CSV format and the parse
+    drops below this floor, the refresh aborts cleanly rather than
+    silently producing a tiny watchlist.
+
+    Used by gap-and-go-style model forks where the strategy is calibrated
+    for smaller, news-driven names with retail-flow follow-through.
+    """
+    return [
+        WatchlistSource(
+            "russell2000",
+            get_russell2000_symbols,
+            min_count=1500,
+        ),
+    ]
+
+
 async def _fetch_grouped_daily(
     session: aiohttp.ClientSession,
     polygon_key: str,
