@@ -291,22 +291,43 @@ This response would route through:
 
 ## Cost & latency model
 
+The cost/latency calculus depends entirely on which backend the signal
+generator is talking to. See `docs/HARDWARE_PLATFORM.md` for the full
+analysis. Summary:
+
+### Cloud backend (Anthropic; comparison baseline)
+
 | Tier | Input tokens (typical) | Output tokens | $/call | Latency |
 |---|---|---|---|---|
 | Haiku 4.5 | ~1500 | ~250 | $0.0011 | 400-800ms |
 | Sonnet 4.5 | ~1500 | ~250 | $0.0048 | 700-1500ms |
 
-With pre-filter target of ≤30 candidates per cycle, evaluating every
-5 minutes for 6.5 trading hours = 78 cycles × 30 = 2340 calls/day.
+With pre-filter at ≤30 candidates/cycle × 78 cycles/day = 2340 calls/day:
+- Haiku: $2.57/day, $51/month
+- Sonnet: $11.23/day, $225/month
 
-- **Haiku full cost**: $2.57/day = $51/month. Acceptable for paper.
-- **Sonnet full cost**: $11.23/day = $225/month. Acceptable but expensive.
-- **Hybrid**: Haiku for first-pass screening, Sonnet for final decisions on top 5-10 candidates per cycle. Probable cost: $4-6/day.
+### Local backend (RTX PRO 5000 Blackwell 48GB; primary)
 
-Latency: 30 sequential Haiku calls @ 600ms = 18s per cycle. Too slow for
-5-min cycles. Mitigations: parallel calls (asyncio gather), or accept
-that some cycles miss bars. Initial implementation: parallel with
-concurrency=10, expected wall-clock ~2s per cycle.
+| Model | 4-bit VRAM | Throughput | $/call | Per-call latency (250 out) |
+|---|---|---|---|---|
+| Qwen 2.5 72B | ~40GB | 50-70 tok/s | ~$0 | 3.5-5s |
+| Llama 3.3 70B | ~38GB | 50-80 tok/s | ~$0 | 3-5s |
+| Qwen 2.5 32B | ~17GB | ~100 tok/s | ~$0 | 2.5s |
+
+With local inference at zero marginal cost, the pre-filter exists only
+for *quality* reasons (don't run the model on tickers with obviously
+no setup) and for *throughput* (a 500-call cycle takes 60-120s with
+modest batching, comfortable within a 300s cycle budget).
+
+### Implications for the design
+
+1. **Pre-filter from cost-driven (≤30 candidates) → quality-driven (relax to 100-200, or full watchlist if model throughput allows).** The narrower limit was a budget constraint that no longer applies. Initial M2 keeps the conservative pre-filter; M3+ may relax it after measuring whether it costs us setups.
+
+2. **Per-call latency is higher locally (3-5s vs 700ms cloud).** This is offset by the absence of per-call dollar pressure; we just call concurrently with batching support from LM Studio's API.
+
+3. **Cloud backend remains the fallback.** If LM Studio is offline (workstation down, model unloaded, etc.), the signal generator falls back to Anthropic Haiku. This adds resilience without changing the schema or interface.
+
+4. **All cost numbers are sensitive to context length.** As we iterate the prompt and add more historical bars or news, input tokens grow. Local cost stays $0; cloud cost scales linearly. This favors longer-context experiments locally.
 
 ## Failure modes & fallbacks
 

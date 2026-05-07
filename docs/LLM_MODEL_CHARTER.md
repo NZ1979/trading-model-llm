@@ -4,10 +4,18 @@
 
 Replace the rule-based signal engine (gap-and-go + pullback in the base
 codebase) with an LLM-driven signal generator. At each evaluation tick,
-feed Claude a structured snapshot of market context, recent news, and
-computed technical indicators, and ask Claude to return a structured
+feed an LLM a structured snapshot of market context, recent news, and
+computed technical indicators, and have it return a structured
 Buy/Sell/Hold decision with reasoning, confidence, and a stop-loss
 recommendation.
+
+**Backend choice (updated 2026-05-07):** primary inference path is a
+locally-hosted 70B-class open-weight model (Qwen 2.5 72B Instruct or
+similar) running on a dedicated workstation with an RTX PRO 5000
+Blackwell 48GB GPU via LM Studio. Cloud Claude (Haiku/Sonnet) is the
+comparison baseline and the fallback when the local server is
+unavailable. Hardware specs and the architectural rationale for the
+local-first approach are in `docs/HARDWARE_PLATFORM.md`.
 
 ## Why this might work better than rules
 
@@ -204,3 +212,17 @@ strategy? Daily quota that shuts down LLM evaluation if exceeded?
 These are interesting directions but not the immediate goal. The
 immediate goal is: does a single Claude call per evaluation produce
 better trading decisions than the base's rule-based signals?
+
+## Related research and competing approaches
+
+This isn't the only way to ML-enhance momentum trading. Worth knowing
+the landscape (full notes in `docs/RESEARCH_NOTES.md`):
+
+- **Characteristic-Managed Momentum (CMM)**: ML-enhanced *traditional* momentum strategies. Engineers features that improve momentum signal quality and reduce crash risk. Different paradigm from ours (LLM-driven holistic reasoning) but tackles the same problem class.
+- **Regime-dependent model selection**: research suggests different ML model types (LSTM, SVM, etc.) excel in different market regimes. The implication for our work: Claude's regime-passing prompt may not be enough; regime-specific prompt templates may be required. Listed as an open question above.
+- **Ensemble methods**: combining multiple signal generators (rule-based + LLM + ML classifier) tends to outperform single-strategy approaches in published research. Our `strategy/signals/` plug-in architecture supports this; the LLM is one signal module, and we can register others alongside in M5+.
+
+We're betting on LLM holistic reasoning as the primary differentiator
+for this fork. If that bet pays off, the ensemble-of-strategies
+extension is straightforward. If it doesn't, the research above gives
+us alternative directions.
