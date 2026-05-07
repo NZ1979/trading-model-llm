@@ -2,6 +2,23 @@
 
 Intraday equity trading platform: news + sentiment + technical indicators + ES futures wall scanner + risk-validated execution + EOD journaling.
 
+This repo is the **shared infrastructure base**. Strategy-specific
+research and refinement happens in dedicated fork repos:
+
+- [`trading-model-gap-and-go`](https://github.com/NZ1979/trading-model-gap-and-go) — gap-and-go strategy on Russell 2000 small/mid-caps
+- [`trading-model-llm`](https://github.com/NZ1979/trading-model-llm) — LLM-driven signal generation (Qwen 72B / Claude)
+
+Codified 2026-05-07: changes that go in **this** repo are
+infrastructure-grade — bug fixes for production stability, generic
+data-feed improvements, deploy-procedure refinements, cross-cutting
+refactors usable by any strategy fork. Strategy-specific tuning
+(universe selection, regime filters, signal-selectivity heuristics,
+prompt engineering) belongs in the fork that uses it.
+
+Forks pull from this base via `git fetch upstream && git merge
+upstream/main`. Bug fixes here flow into all forks; strategy choices
+in forks stay isolated.
+
 ## Stack (all already decided, do not change)
 
 | Component | Service | Cost |
