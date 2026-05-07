@@ -34,6 +34,34 @@ Two reasons:
 
 2. **Cross-pollination via `git pull upstream`**. The base repo is set up as `upstream` here; when bug fixes or shared improvements land in `trading-platform`, this fork can `git fetch upstream && git merge upstream/main` to inherit them without automatically inheriting any base-specific strategy decisions.
 
+## Where work happens (architectural rule, codified 2026-05-07)
+
+This fork is the home of all LLM-strategy work going forward. The
+base codebase (`trading-platform`) provides shared infrastructure;
+this fork makes the strategy-specific decisions on top of it.
+
+**Land changes here when they are LLM-strategy-specific:**
+- Prompt engineering (templates, schema, few-shot examples)
+- LLM backend selection (local LM Studio vs cloud Anthropic)
+- Replay harness for prompt iteration (M2)
+- LLM signal generator implementation (M3)
+- Backtest comparison reports (M4)
+- Cost tracking and rate limiting
+
+**Land changes in the base when they are generic:**
+- Bug fixes affecting production stability
+- Infrastructure improvements (logging, data feeds, deploy procedures)
+- Cross-cutting refactors usable by any strategy fork
+
+**Pull base improvements into this fork via:**
+
+```powershell
+git fetch upstream
+git log HEAD..upstream/main --oneline
+git merge upstream/main
+git push
+```
+
 ## Setup
 
 Same as the base — see [SETUP_NEW_MACHINE.md](SETUP_NEW_MACHINE.md).
