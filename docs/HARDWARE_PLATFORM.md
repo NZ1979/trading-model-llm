@@ -83,22 +83,35 @@ drive controller.
 
 ## Architectural implications for the LLM model
 
-### Cost model rewrite
+### Cost model rewrite (tiered architecture)
 
-The original LLM_SIGNAL_INTERFACE.md cost model assumed Anthropic API:
+The architecture isn't local-only — it's a tiered split where Qwen
+local handles the hot path and Anthropic handles selective escalation
+plus offline evaluation. See LLM_SIGNAL_INTERFACE.md "Tiered evaluation"
+for the full design. Cost summary:
 
-| Model | Old (Anthropic) | New (local) |
-|---|---|---|
-| Per-call cost | $0.001-0.005 | ~$0 (electricity only) |
-| 30-call cycle | $0.03-0.15 | ~$0 |
-| Daily budget (78 cycles × 30 candidates) | $2-12 | ~$0 |
-| Monthly | $50-225 | ~$5-15 (electricity at $0.12/kWh × ~24/7 × 200W average) |
+| Path | Backend | Volume | Cost/day |
+|---|---|---|---|
+| Tier 1 (every candidate, every cycle) | Qwen 72B local | 30-200 × 78 cycles | ~$0.20 (electricity at $0.12/kWh × 200W × 8h) |
+| Tier 2 (selective escalation) | Sonnet 4.5 | 5-15 calls/day, capped at 25 | ~$0.10-0.30 (with prompt caching) |
+| Tier 3 (weekly Opus audit) | Opus 4.6 | ~12K decisions/audit | ~$2-5 amortized |
+| **Live operating** | | | **~$2-5/day, $60-150/month** |
 
-This eliminates the cost-driven pre-filter constraint. We can now
-evaluate as many candidates per cycle as the GPU supports. The
-pre-filter remains useful for *quality* reasons (don't run the LLM
+For comparison:
+- Original "Anthropic Sonnet on every call" assumption: ~$11-30/day, $225-900/month
+- Local-only with no Anthropic touch: ~$0.20/day electricity but no Tier 2 domain expertise on hard cases and no Tier 3 calibration anchor
+
+The tiered approach captures Claude's domain reasoning where it pays
+off (the 5-15 escalations/day where Qwen confidence is uncertain AND a
+real catalyst is present) and uses Opus as a periodic ground-truth
+labeler, while keeping ~99% of decisions on the deterministic, free,
+private local path.
+
+The pre-filter remains useful for *quality* reasons (don't run the LLM
 on tickers that obviously don't have a setup) but is no longer required
-for cost reasons.
+for cost reasons. M2-time Tier 3 labeling is bounded by replay window
+size; ~$200-400 per 60-day window is a fixed evaluation cost, not an
+operating cost.
 
 ### Latency model rewrite
 
@@ -151,11 +164,13 @@ machine. Integration approach:
 
 2. **LM Studio exposes an OpenAI-compatible HTTP API** on `localhost:1234/v1/chat/completions` (default port). This lets us use the existing `openai` Python package as the client; we just point `base_url` at LM Studio.
 
-3. **Our `strategy/signals/llm.py` module** uses an OpenAI-compatible client by default, with an optional `mode="anthropic"` config for fallback to cloud Claude. The schema-validated JSON output works the same against either backend.
+3. **Our `strategy/signals/llm.py` module** holds two clients: an OpenAI-compatible client pointed at LM Studio for Tier 1 (default path), and an Anthropic client used by Tier 2 (selective escalation) and Tier 3 (offline audit + M2 replay labeling). The schema-validated JSON output works the same against any backend; the same `LLMDecision` dataclass parses Qwen, Sonnet, and Opus responses identically.
 
-4. **Model swap is a config change, not a code change**. Switching from Qwen 72B to Llama 3.3 70B = change LM Studio's loaded model + restart LM Studio. The trading code doesn't know which model it's talking to.
+4. **Tier 1 model swap is a config change, not a code change.** Switching from Qwen 72B to Llama 3.3 70B = change LM Studio's loaded model + restart LM Studio. The trading code doesn't know which Tier 1 model it's talking to. Tier 2 and Tier 3 model identifiers (`claude-sonnet-4-5`, `claude-opus-4-6`) are pinned in `config/settings.yaml` so backtest reproducibility is preserved across Anthropic version drift.
 
-5. **For headless 24/7 service** (if we eventually move trader to the workstation): LM Studio has a server mode that runs the API without a UI. Can be set to start at boot. Alternative for production: replace LM Studio with `llama.cpp server` or `vLLM` for better throughput, same OpenAI-compatible API.
+5. **Tier-1-fallback mode.** If LM Studio is unreachable (workstation down, model unloaded, port collision), the signal generator promotes Tier 2 to handle every candidate temporarily. Cost during the outage is ~$5-20/day depending on volume; a one-day outage is acceptable, a multi-day outage triggers an alert. Detection is via a single failed call: connection refused or timeout > 8s flips a `t1_available` flag false and the system runs in Tier-2-only mode until a periodic health check succeeds.
+
+6. **For headless 24/7 service** (if we eventually move trader to the workstation): LM Studio has a server mode that runs the API without a UI. Can be set to start at boot. Alternative for production: replace LM Studio with `llama.cpp server` or `vLLM` for better throughput, same OpenAI-compatible API.
 
 ## Updated success criteria
 
@@ -178,12 +193,13 @@ even if it's free to run.
 ## Summary
 
 The workstation is purpose-built for this fork's research and (eventually)
-deployment. Three architectural shifts:
+deployment. Four architectural shifts:
 
-1. **Local LLM as the primary inference path.** Cloud Claude becomes a comparison baseline, not the default backend.
-2. **Pre-filter relaxed.** Cost-driven candidate narrowing is gone; quality-driven candidate narrowing optional.
-3. **Backtest at scale.** 30-day replays are the floor; 6-12 month replays with parameter sweeps are the ceiling.
+1. **Local LLM as the primary inference path (Tier 1).** Qwen 72B runs every candidate every cycle on the workstation GPU. Zero marginal cost, full privacy, deterministic.
+2. **Cloud Claude as selective augmentation, not full replacement (Tiers 2 + 3).** Sonnet handles the 5-15 escalations/day where Qwen confidence is uncertain AND a real catalyst is present. Opus 4.6 runs offline as gold-standard labeler for M2 replay and weekly live audit. Cloud is no longer "fallback only" — it has a defined, always-on role for the hard cases.
+3. **Pre-filter relaxed.** Cost-driven candidate narrowing is gone; quality-driven candidate narrowing optional.
+4. **Backtest at scale.** 30-day replays are the floor; 6-12 month replays with parameter sweeps and Opus labeling are the ceiling.
 
 Every other design doc in this fork (`LLM_MODEL_CHARTER.md`,
-`LLM_SIGNAL_INTERFACE.md`, `M2_REPLAY_HARNESS_DESIGN.md`) gets updated
-to reflect these shifts in companion commits.
+`LLM_SIGNAL_INTERFACE.md`, `M2_REPLAY_HARNESS_DESIGN.md`) reflects
+these shifts.

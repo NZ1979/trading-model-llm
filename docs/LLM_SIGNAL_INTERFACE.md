@@ -31,21 +31,35 @@ Existing infrastructure (unchanged from base):
 
 New for this fork (this doc specifies):
 
-  pre-filter (cheap)              LLM call (expensive)        decision
-  ----------------                ---------------             --------
+  pre-filter (cheap)              tiered LLM evaluation        decision
+  ----------------                ---------------------        --------
   watchlist (500)
         |
         v
   candidate_filter()  ---->  N candidates  ---->  build_context()
-                             (typ. 5-30)                |
+                             (typ. 30-200)              |
                                                         v
                                                    render_prompt()
                                                         |
                                                         v
-                                                    Claude API
+                                              +--------------------+
+                                              | Tier 1: Qwen 72B   |
+                                              | local, every call  |
+                                              +---------+----------+
                                                         |
+                                                   parse + validate
+                                                        |
+                                                  +-----+-----+
+                                                  | escalate? |  conf in [50,75]
+                                                  +-----+-----+  AND catalyst hit
+                                                        | yes (~5-15/day)
                                                         v
-                                                  parse_response()
+                                              +--------------------+
+                                              | Tier 2: Sonnet 4.5 |
+                                              | selective only     |
+                                              +---------+----------+
+                                                        |
+                                                  merge(T1, T2)
                                                         |
                                                         v
                                               TechnicalSignal
@@ -55,7 +69,130 @@ New for this fork (this doc specifies):
                                                         |
                                                         v
                                               _place_order() (existing)
+
+  Offline (not in hot path):
+    Tier 3: Claude Opus 4.6 - labels M2 replay decisions as gold
+            standard, and audits last week's live decisions weekly.
+            See "Tiered evaluation" section below.
 ```
+
+## Tiered evaluation: Qwen primary, Claude escalation, Opus evaluator
+
+The signal generator uses three model tiers, each chosen for what it
+does best and bounded by what it costs. The motivating problem: Qwen
+72B is fast, free, private, and deterministic, but has documented
+finance-domain reasoning gaps versus Claude Sonnet/Opus on ambiguous
+catalyst-driven decisions. Putting Claude in the per-candidate hot
+path defeats the privacy and zero-marginal-cost wins from local
+inference. The compromise: Claude only where its strengths actually
+compound.
+
+### Tier 1: Qwen 2.5 72B local — primary, hot path
+
+Runs on the local RTX PRO 5000 via LM Studio's OpenAI-compatible API.
+Evaluates every pre-filtered candidate every cycle. Zero marginal
+cost, full privacy (no data leaves the workstation), fully
+deterministic for backtest reproducibility (weights are immutable;
+temperature=0).
+
+Trade-offs accepted: weaker financial-domain reasoning than Claude on
+ambiguous catalyst-driven cases; non-reasoning architecture means
+chain-of-thought scaffolding must come from prompt structure rather
+than the model itself. Mitigated by Tier 2.
+
+### Tier 2: Claude Sonnet 4.5 — selective escalation
+
+Fired only when ALL of these hold for a candidate:
+
+1. Tier 1 returned `confidence ∈ [50, 75]` (the uncertain middle where stronger reasoning adds the most value; high-conviction Qwen calls don't need a second opinion, low-conviction calls become Hold anyway)
+2. Candidate has a high-quality catalyst flag set (`catalyst_flags` non-empty AND any item is one of `FDA_approval`, `M&A`, `earnings_beat_with_guidance_raise`, `breakthrough_news`)
+3. Pre-market RVOL > 3x (the setup is liquid enough to actually trade)
+4. Daily escalation budget not exhausted (cap: 25 calls/day, configurable)
+
+Expected volume: 5-15 escalations per trading day under normal
+conditions. Cost on Sonnet 4.5 with prompt caching: ~$0.10-0.30/day.
+The escalation budget cap protects against pathological volatility
+days where many candidates fall in the 50-75 confidence band.
+
+### Tier 1 + Tier 2 merge logic
+
+When Tier 2 fires, the final decision is computed by merging:
+
+```python
+def merge_tiers(t1: LLMDecision, t2: LLMDecision) -> LLMDecision:
+    # Both agree on action: trust the action, take the higher confidence,
+    # use Tier 2's reasoning (it's the more carefully reasoned output)
+    if t1.action == t2.action:
+        return t2.copy(
+            confidence=max(t1.confidence, t2.confidence),
+            reasoning=f"[T1+T2 agree] {t2.reasoning}",
+            tier_provenance="t1_t2_agree",
+        )
+
+    # Disagree: default to Hold. Disagreement = no edge, don't trade.
+    return LLMDecision(
+        action="Hold",
+        confidence=0,
+        setup_label="tier_disagreement",
+        reasoning=(
+            f"T1={t1.action}({t1.confidence}); "
+            f"T2={t2.action}({t2.confidence}). "
+            f"Defaulting to Hold."
+        ),
+        tier_provenance="t1_t2_disagree",
+    )
+```
+
+Both Tier 1 and Tier 2 outputs are recorded in the `decisions` table
+with a `tier_provenance` column. We can post-hoc analyze how often
+Tier 2 reverses Tier 1 and whether reversals were correct.
+
+### Tier 3: Claude Opus 4.6 — offline evaluator
+
+Not in the live signal path. Two uses:
+
+1. **M2 replay gold-standard labeling.** During M2 replay, we run Opus on every candidate alongside Qwen and record both. Opus's decision is treated as the reference label; we measure Qwen's agreement with Opus and investigate divergences as candidate prompt-improvement targets. Detail in `M2_REPLAY_HARNESS_DESIGN.md`.
+
+2. **Weekly live audit.** Once per week (Sunday), an offline job re-evaluates the prior week's live decisions with Opus on the same recorded context. Where Opus systematically disagrees with Qwen (e.g. Opus says Hold on 80% of Qwen's losing trades), we have a prompt-engineering signal. Output: `docs/reports/weekly_audit_<date>.md`.
+
+Cost: Opus pricing is roughly $15/$75 per MTok input/output. For a
+weekly audit of ~12,000 decisions, expect ~$15-30/audit. For an M2
+full replay labeling pass, ~$200-400 per 60-day window. Treated as a
+fixed cost of evaluating the system, not a per-trade operating cost.
+
+### Cost summary (live operating)
+
+| Tier | Backend | Volume/day | Cost/day |
+|---|---|---|---|
+| 1 | Qwen 72B local | 30-200 calls × 78 cycles | ~$0 (electricity) |
+| 2 | Sonnet 4.5 (selective) | 5-15 escalations, capped at 25 | ~$0.10-0.30 |
+| 3 | Opus 4.6 (weekly audit) | ~12K decisions/audit | ~$2-5 amortized |
+| **Total live** | | | **~$2-5/day** |
+
+For comparison: Claude in the hot path on every call would be ~$20/day on Sonnet (with caching) or ~$80-150/day on Opus. The tiered design captures domain expertise where it matters and spends ~95% less.
+
+### Why this structure
+
+Three reasons it's strictly better than Claude-everywhere:
+
+1. **Privacy preserved.** 99%+ of decisions stay on-workstation. Only escalations (rare) leak strategy details to Anthropic.
+2. **Determinism preserved.** Tier 1 is fully reproducible across versions; Tier 2 is the small, known fraction that depends on Anthropic version pinning.
+3. **Latency bounded.** Tier 1 adds ~3-5s per candidate; Tier 2 adds another ~1s but only on ~5-15 candidates/day, so net cycle time is unchanged.
+
+And three reasons it's strictly better than Qwen-only:
+
+1. **Domain expertise on hard cases.** The 5-15/day escalations are exactly the cases where Qwen's confidence indicates uncertainty AND a real catalyst is present. Claude's stronger financial reasoning is most valuable here.
+2. **Calibration anchor.** Tier 3 weekly Opus audits give us a reference standard to detect systematic Qwen biases.
+3. **Diversity of error.** When T1 and T2 agree, confidence is better justified. When they disagree, Hold is the safe default.
+
+### What changes if Qwen catches up
+
+If a future Qwen variant (the QwQ reasoning models, or Qwen 3.6 with
+its 256K context window enabling longer-form research-report context)
+closes the financial-domain reasoning gap, we shrink Tier 2 to
+fallback-only and remove the escalation rule. The architecture is
+designed so this is a config change (`escalation.enabled: false`),
+not a code change.
 
 ## Input context structure
 
@@ -291,20 +428,29 @@ This response would route through:
 
 ## Cost & latency model
 
-The cost/latency calculus depends entirely on which backend the signal
-generator is talking to. See `docs/HARDWARE_PLATFORM.md` for the full
-analysis. Summary:
+The cost/latency calculus depends on which tier handles the call. See
+`docs/HARDWARE_PLATFORM.md` for the workstation analysis and the
+"Tiered evaluation" section above for the operational summary. The
+tables below describe per-call economics for each backend; the Tier
+2 escalation rule (5-15 calls/day) and Tier 3 audit cadence (weekly)
+determine how often each is exercised.
 
-### Cloud backend (Anthropic; comparison baseline)
+### Cloud backend (Anthropic; Tier 2 selective escalation)
 
 | Tier | Input tokens (typical) | Output tokens | $/call | Latency |
 |---|---|---|---|---|
 | Haiku 4.5 | ~1500 | ~250 | $0.0011 | 400-800ms |
 | Sonnet 4.5 | ~1500 | ~250 | $0.0048 | 700-1500ms |
 
-With pre-filter at ≤30 candidates/cycle × 78 cycles/day = 2340 calls/day:
+Hypothetical "Sonnet on every candidate" (NOT the chosen architecture; included for comparison): pre-filter at ≤30 candidates/cycle × 78 cycles/day = 2340 calls/day:
 - Haiku: $2.57/day, $51/month
 - Sonnet: $11.23/day, $225/month
+
+Actual Tier 2 usage (5-15 escalations/day, capped at 25):
+- Sonnet: ~$0.10-0.30/day (with prompt caching enabled)
+- Haiku: ~$0.02-0.06/day (used only as Tier 2 fallback if Sonnet is rate-limited)
+
+Tier 3 (Opus 4.6 weekly audit): ~$15-30/audit; amortizes to ~$2-5/day.
 
 ### Local backend (RTX PRO 5000 Blackwell 48GB; primary)
 
@@ -323,15 +469,20 @@ modest batching, comfortable within a 300s cycle budget).
 
 1. **Pre-filter from cost-driven (≤30 candidates) → quality-driven (relax to 100-200, or full watchlist if model throughput allows).** The narrower limit was a budget constraint that no longer applies. Initial M2 keeps the conservative pre-filter; M3+ may relax it after measuring whether it costs us setups.
 
-2. **Per-call latency is higher locally (3-5s vs 700ms cloud).** This is offset by the absence of per-call dollar pressure; we just call concurrently with batching support from LM Studio's API.
+2. **Per-call latency is higher on Tier 1 local (3-5s vs 700ms cloud).** This is offset by the absence of per-call dollar pressure; we just call concurrently with batching support from LM Studio's API. Tier 2 escalations add ~1-2s on the candidates that fire them, but only ~5-15/day, so net impact on cycle time is minimal.
 
-3. **Cloud backend remains the fallback.** If LM Studio is offline (workstation down, model unloaded, etc.), the signal generator falls back to Anthropic Haiku. This adds resilience without changing the schema or interface.
+3. **Cloud backend has two roles, not one.** Tier 2 selective escalation (in-cycle) and Tier 3 weekly audit (offline). Plus a fallback role if LM Studio is offline (workstation down, model unloaded, etc.) — in that mode, Sonnet handles every call rather than just escalations, and we accept the cost for the duration of the outage.
 
-4. **All cost numbers are sensitive to context length.** As we iterate the prompt and add more historical bars or news, input tokens grow. Local cost stays $0; cloud cost scales linearly. This favors longer-context experiments locally.
+4. **All cost numbers are sensitive to context length.** As we iterate the prompt and add more historical bars or news, input tokens grow. Tier 1 local cost stays $0; Tier 2 and Tier 3 cloud cost scales linearly. This favors longer-context experiments locally; if a context expansion looks promising, we re-measure Tier 2 escalation cost before deploying.
 
-5. **Cloud costs above are uncached baseline.** With prompt caching enabled (next section), actual cloud spend drops by ~60%.
+5. **Cloud costs in tables above are uncached baseline.** With prompt caching enabled (next section), actual cloud spend drops by ~60%.
 
 ## Prompt caching strategy (cloud backend)
+
+Applies to Tier 2 (Sonnet escalations), Tier 3 (Opus audit + M2 replay
+labeling), and the Tier-1-fallback path when LM Studio is offline.
+Tier 1 hot-path uses local Qwen, which has no caching primitive but
+also no marginal token cost.
 
 Anthropic's `ephemeral` prompt cache reduces cached-input cost to 10% of base rate and avoids re-encoding the prefix on the server. Cache writes cost 1.25x base; TTL is 5 minutes from the last hit. Break-even: ~2 reuses of the same prefix within 5 minutes.
 
@@ -373,6 +524,13 @@ Assumed shape: 5K stable + 0.15K cycle-stable + 1K variable = ~6.15K input, 250 
 | **Total/day** | **~$52** | **~$20** |
 
 Savings ~60% on Sonnet. On Haiku the percentage is similar; absolute savings smaller (~$1.50/day). The earlier "Cost & latency model" table used 1500 input tokens as a rough lower bound; the 6K figure here reflects what the v1.0 template actually renders to once the bar table, news block, and prior-decisions block are populated.
+
+**Where this matters most in the tiered architecture:**
+
+- **Tier 1 fallback during LM Studio outages.** This is the only time Anthropic gets called on every candidate. Caching is the difference between a $5 outage and a $50 outage.
+- **Tier 3 M2 replay (Opus labeling).** ~140K calls per 60-day window; caching turns ~$3,100 into ~$1,200. Essential for affordable iteration.
+- **Tier 3 weekly Opus audit.** ~12K calls share a common prefix; caching saves ~$10/audit.
+- **Tier 2 selective escalation.** Small absolute savings (~$0.05/day) since volume is low, but the prompt structure must support caching anyway for the cases above.
 
 ### Prompt template reorganization (required)
 
@@ -416,12 +574,19 @@ We log Anthropic's `cache_creation_input_tokens` and `cache_read_input_tokens` p
 
 | Failure | Detection | Fallback |
 |---|---|---|
-| Anthropic API down / 503 | exception on call | Hold(api_failure), log + alert |
-| Schema-invalid output | Pydantic validation fails | Hold(schema_invalid), log raw response |
+| Tier 1 (Qwen/LM Studio) down or unreachable | connection refused / timeout | Switch to Tier-1-fallback mode: every candidate goes to Sonnet for the duration of the outage; alert operator |
+| Tier 1 schema-invalid output | Pydantic validation fails | Hold(schema_invalid_t1), log raw response, do not escalate |
+| Tier 1 latency > 8s | timeout=8000ms | Hold(t1_timeout) |
+| Tier 2 escalation timeout | timeout=2000ms | Use Tier 1 result alone, log; do not block cycle |
+| Tier 2 schema-invalid output | Pydantic validation fails | Use Tier 1 result alone, log raw response |
+| Tier 2 disagreement with Tier 1 | merge_tiers() | Hold(tier_disagreement); both outputs recorded |
+| Daily Tier 2 escalation budget exhausted | counter reaches 25 | All remaining candidates use Tier 1 result alone |
+| Anthropic API down / 503 (Tier 2) | exception on call | Use Tier 1 result alone, log + alert |
+| Anthropic API down / 503 (Tier 1 fallback) | exception on call | Hold(api_failure), log + alert |
 | Out-of-range field (confidence=150, stop=10×ATR) | range check after parse | clamp to bounds, proceed |
-| Latency > 3s | timeout=3000ms | Hold(api_timeout), proceed without LLM |
-| Daily Anthropic budget exhausted | spend tracker | switch to Hold for rest of day, alert |
+| Daily Anthropic budget exhausted (across all tiers) | spend tracker | switch to Hold for rest of day, alert |
 | Prompt version mismatch in replay | recorded version != current version | use recorded prompt verbatim from DB |
+| Tier 3 weekly Opus audit fails | exception in scheduled job | retry next week, alert; live trading unaffected |
 
 All fallback paths produce Hold, never a default Buy/Sell. The LLM
 errors safely.
@@ -449,6 +614,9 @@ actual signal engine implementation):
 - Cost tracking (recommendation: log input_tokens, output_tokens, model, cache_creation_input_tokens, cache_read_input_tokens per call; aggregate daily)
 - Decision storage schema in SQLite (extends existing `decisions` table with `prompt_version`, `raw_response`, `cost_cents`, `cache_read_tokens`, `cache_write_tokens` columns)
 - Prompt caching breakpoint placement (recommendation: two breakpoints as documented in "Prompt caching strategy" — system/schema/few-shot, then market context)
+- Tier 2 escalation client (recommendation: separate `AnthropicClient` instance with its own rate limiter and budget tracker, distinct from sentiment-pipeline Haiku client; share connection pool only)
+- Decision schema extension for tier provenance (recommendation: add `tier_provenance` enum column: `t1_only` | `t1_t2_agree` | `t1_t2_disagree` | `t1_fallback_t2` | `t1_only_budget_exhausted`)
+- Per-tier output storage (recommendation: store `t1_raw_response` always; `t2_raw_response` whenever Tier 2 fires; both are useful for post-hoc analysis even when merge picks one over the other)
 
 ## Status
 
@@ -462,5 +630,8 @@ engine) to build against. Sign-off here means we agree on:
 - The pre-filter approach (rule-based candidate selection before LLM call)
 - The fallback behavior (Hold on every failure mode)
 - The prompt caching strategy (two-breakpoint layout, variable content last)
+- The tiered evaluation architecture (Tier 1 Qwen primary, Tier 2 Sonnet selective escalation, Tier 3 Opus offline evaluator)
+- The escalation rule (conf 50-75 AND high-quality catalyst AND PM RVOL > 3x AND budget not exhausted)
+- The merge logic on Tier 1/Tier 2 disagreement (Hold)
 
 After sign-off, M2 (replay harness) becomes the next concrete deliverable.

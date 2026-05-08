@@ -12,13 +12,15 @@ If replay is broken or biased, every downstream conclusion is wrong.
 
 ## Purpose
 
-Three questions we want answered:
+Four questions we want answered:
 
 1. **Does the LLM strategy make different decisions than the base?** If LLM agrees with base 100% of the time, there's no point. If LLM differs sharply, that's where the value (or risk) lives.
 
 2. **Are the LLM's different decisions better?** Measured by: win rate, average win/loss size, P&L per dollar at risk, max drawdown over the replay window.
 
 3. **What does the LLM see that the rules miss, and vice versa?** Qualitative review of decisions where LLM and base disagree — does the LLM catch setups the rules miss? Does it avoid setups the rules over-fire on?
+
+4. **How well does Tier 1 (Qwen local) agree with Tier 3 (Opus gold-standard labels)?** Per `LLM_SIGNAL_INTERFACE.md` § Tiered evaluation, Opus runs alongside Qwen on every replay candidate as a reference labeler. Qwen-vs-Opus agreement rate, divergence patterns, and the realized P&L on each path tell us where Qwen's domain-reasoning gaps actually cost money. This drives prompt iteration and the threshold tuning for when Tier 2 escalation should fire in live operation.
 
 The harness must answer these without running on live trader-prod, so we
 can iterate on prompt + signal logic safely.
@@ -59,12 +61,28 @@ ticker_list ----+----> load_historical_bars() (Polygon)
                                   position_state,
                                   decision_history,
                               )
-                              llm_decision = llm_signal(ctx) ----> cache.get(hash(ctx))
-                                                                    or claude.call()
+                              # Tier 1 (always): Qwen local, the live primary
+                              t1_decision = qwen_signal(ctx) ----> cache.get(qwen_hash)
+                                                                    or qwen_call()
+                              # Tier 2 (selective): Sonnet escalation,
+                              # only when the live escalation rule fires
+                              t2_decision = None
+                              if escalation_rule(ctx, t1_decision):
+                                  t2_decision = sonnet_signal(ctx) -> cache.get(sonnet_hash)
+                                                                       or sonnet_call()
+                              # merge per LLM_SIGNAL_INTERFACE.md
+                              live_decision = merge_tiers(t1_decision, t2_decision)
+                              # Tier 3 (always): Opus gold-standard label,
+                              # offline path, never affects live_decision
+                              t3_decision = opus_signal(ctx)  ---> cache.get(opus_hash)
+                                                                    or opus_call()
+                              # Base rules still computed in parallel
                               base_decision = base_signal(ctx_to_base_inputs(ctx))
-                              record(date, time, ticker, llm_decision, base_decision)
-                              if llm_decision.action != Hold:
-                                  simulate_fill(llm_portfolio, llm_decision)
+                              record(date, time, ticker,
+                                     t1_decision, t2_decision, t3_decision,
+                                     live_decision, base_decision)
+                              if live_decision.action != Hold:
+                                  simulate_fill(llm_portfolio, live_decision)
                               if base_decision.action != Hold:
                                   simulate_fill(base_portfolio, base_decision)
                           mark_to_market(both portfolios)
@@ -86,8 +104,17 @@ class ReplayConfig:
     start_date: date                       # inclusive
     end_date: date                         # inclusive
     tickers: list[str] | str               # explicit list, or "watchlist" to use today's
-    llm_tier: str                          # "haiku" | "sonnet" | "hybrid"
     llm_prompt_version: str                # "v1.0", "v1.1", etc.
+
+    # Tiered backend selection (mirrors live architecture)
+    t1_backend: str = "qwen_local"         # "qwen_local" | "llama_local" | "haiku" (cloud only for ablation)
+    t1_model_id: str = "qwen2.5-72b-instruct-q4"
+    t2_enabled: bool = True                # Tier 2 escalation
+    t2_model_id: str = "claude-sonnet-4-5"
+    t2_max_per_day: int = 25               # daily escalation budget cap
+    t3_enabled: bool = True                # Tier 3 Opus labeling
+    t3_model_id: str = "claude-opus-4-6"
+    t3_sample_rate: float = 1.0            # 1.0 = label every candidate; 0.1 = sample 10% to control cost
 
     # Pre-filter parameters (cheap rule-based candidate selection)
     pre_filter_min_pm_rvol: float = 2.0
@@ -212,27 +239,51 @@ base portfolios use this; it's not the place to differ.
 
 ## LLM caching
 
-To control cost during iteration, the harness caches LLM responses
-keyed by `(prompt_hash, model)`:
+To control cost during iteration, the harness caches every LLM
+response keyed by `(prompt_hash, backend, model_id, prompt_version)`.
+Each tier has its own cache namespace so we can re-run a replay with
+just one tier modified (e.g. a new Qwen prompt) without re-paying for
+the other tiers.
 
 ```python
-def cached_llm_call(prompt: str, model: str) -> dict:
-    key = sha256(prompt.encode()).hexdigest()
-    cache_path = config.cache_dir / model / f"{key}.json"
+def cached_llm_call(prompt: str, backend: str, model_id: str,
+                    prompt_version: str) -> dict:
+    key = sha256(f"{prompt_version}|{prompt}".encode()).hexdigest()
+    cache_path = config.cache_dir / backend / model_id / f"{key}.json"
     if cache_path.exists():
         return json.load(open(cache_path))
-    response = anthropic_client.messages.create(...)
+    response = call_backend(backend, model_id, prompt)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    json.dump(response.model_dump(), open(cache_path, "w"))
+    json.dump(response, open(cache_path, "w"))
     return response
 ```
 
-First run of a replay window: full cost. Re-runs of the same replay (to
-iterate on the comparison report format, not the prompt): zero cost.
+First run of a replay window: full cost on whichever tiers are
+enabled. Re-runs of the same replay against the same prompts: zero
+LLM cost. Re-runs with a bumped prompt_version: only that tier
+re-pays; the other tiers' caches still hit.
 
-When the prompt version bumps (v1.0 → v1.1), the cache key includes the
-prompt version, so we don't accidentally use cached v1.0 responses
-against v1.1 queries.
+Cache layout:
+```
+.replay_cache/
+    qwen_local/
+        qwen2.5-72b-instruct-q4/
+            <prompt_v1.0_sha>.json
+    anthropic/
+        claude-sonnet-4-5/
+            <prompt_v1.0_sha>.json
+        claude-opus-4-6/
+            <prompt_v1.0_sha>.json
+```
+
+The prompt_version included in the cache key ensures v1.0 and v1.1
+caches don't collide. When iterating a prompt, only the affected
+tier's cache invalidates; the other two tiers' caches remain valid.
+
+For Tier 1 (Qwen local), "cost" is wall-clock time, not dollars —
+caching matters because re-running a 60-day replay against fresh
+LLM calls on a 50-tok/s model takes hours. With cache hits, the
+same replay finishes in minutes.
 
 ## Storage
 
@@ -258,15 +309,32 @@ CREATE TABLE replay_decisions (
     run_id INTEGER NOT NULL,
     timestamp TEXT NOT NULL,
     ticker TEXT NOT NULL,
-    decision_source TEXT NOT NULL,     -- "llm" or "base"
+    decision_source TEXT NOT NULL,     -- "live_merged" | "base" | "t1_only" | "t2_only" | "t3_only"
+    -- For decision_source = "live_merged": this is the merged Tier1+Tier2 result
+    -- that drives the simulated portfolio. The per-tier rows below capture each
+    -- tier's individual output for analysis even when not chosen.
     action TEXT NOT NULL,               -- Buy/Sell/Hold
     setup_label TEXT,
     confidence INTEGER,
     reasoning TEXT,
-    raw_response TEXT,                  -- JSON for LLM, debug str for base
+    raw_response TEXT,                  -- JSON for LLM tier, debug str for base
     risk_check_result TEXT,             -- "approved" or rejection reason
+    tier_provenance TEXT,               -- "t1_only" | "t1_t2_agree" | "t1_t2_disagree" | NULL for non-merged rows
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
     FOREIGN KEY (run_id) REFERENCES replay_runs(run_id)
 );
+
+-- Each (timestamp, ticker) pair produces up to 5 rows in replay_decisions:
+--   1. decision_source="t1_only"      : Tier 1 raw output (always present when ticker passes pre-filter)
+--   2. decision_source="t2_only"      : Tier 2 raw output (present only when escalation rule fired)
+--   3. decision_source="t3_only"      : Tier 3 Opus gold-standard label (present per t3_sample_rate)
+--   4. decision_source="live_merged"  : the merged decision used by the simulated portfolio
+--   5. decision_source="base"         : the base codebase rules-based decision (the comparison baseline)
+--
+-- This shape lets us answer: how often does T2 reverse T1? how often does T3 disagree
+-- with T1? when T1 and T3 disagree, which one would have made money? without re-running
+-- any LLM calls.
 
 CREATE TABLE replay_fills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -295,14 +363,19 @@ Markdown sections:
 ### 1. Run metadata
 - Date range
 - Ticker count, candidate count after pre-filter
-- LLM tier, prompt version
-- Total LLM calls made (cache hits vs misses)
-- Total cost (only counts cache misses)
+- Prompt version
+- Tier configuration: T1 backend + model_id, T2 enabled/model_id, T3 enabled/sample_rate/model_id
+- Calls per tier: T1 (cache hits / misses), T2 (cache hits / misses), T3 (cache hits / misses)
+- Cost per tier in dollars (T1: ~$0; T2: $X.XX; T3: $XX.XX)
+- Total wall-clock time for the run, broken down by tier (Qwen local time vs Anthropic API time)
 
 ### 2. Decision summary
-- LLM decision count by action and setup_label
+- T1 (Qwen) decision count by action and setup_label
+- T2 (Sonnet, when fired) decision count by action and setup_label
+- T3 (Opus gold standard) decision count by action and setup_label
+- live_merged decision count (the one driving the simulated portfolio)
 - Base decision count by action and setup
-- Side-by-side counts in a table
+- Side-by-side counts in a table (one column per source)
 
 ### 3. Portfolio performance
 - Starting cash, ending equity for each portfolio
@@ -362,10 +435,37 @@ A strategy that performs decently in normal markets but blows up in
 crashes is not deployable. Crash-period replay surfaces this before
 live trading does.
 
+### 5d. Tier agreement & escalation analysis (added 2026-05-08)
+
+This section quantifies the value of the tiered architecture per
+`LLM_SIGNAL_INTERFACE.md` § Tiered evaluation.
+
+**Tier 1 vs Tier 3 (Qwen vs Opus gold-standard) agreement:**
+- Overall agreement rate (% of candidates where T1 and T3 chose the same action)
+- Confusion matrix: T1 action × T3 action (3×3 grid of Buy/Sell/Hold)
+- Of T1-T3 disagreements: how many turned out profitable for the T1 side vs the T3 side (using simulated fills)
+- Disagreement-by-confidence-band: do T1's high-confidence decisions agree with T3 more than its low-confidence ones? (Proxy for confidence calibration.)
+
+**Tier 2 escalation behavior:**
+- How many cycles fired Tier 2 escalations (vs the daily cap of 25)?
+- Of Tier 2 firings: how often did T2 confirm T1 (`t1_t2_agree`) vs reverse it (`t1_t2_disagree`)?
+- When T2 reversed T1, what was the realized P&L on the merged Hold decision vs what would have happened if we'd taken T1's original Buy/Sell?
+- When T2 confirmed T1, was the realized P&L different from T1-only's path? (Confirmation alone shouldn't change outcome, but the merged confidence affects sizing.)
+
+**Where Tier 2 escalation would have helped if it had fired more often:**
+- For decisions where T1 was wrong (took a losing trade) AND T3 was right (would have held): how many would the escalation rule have caught? This calibrates the escalation rule's threshold (currently conf 50-75 + catalyst).
+- For decisions where T1 was right AND T3 was wrong (Opus blocking a winning trade): how often does this happen? If frequent, Opus is too conservative as a labeler and we should weight its disagreements less.
+
+**Implications for production tuning:**
+- If T1-T3 agreement is >90% and disagreements split roughly 50/50 on profitability: Tier 1 is good enough, narrow Tier 2 escalation rule.
+- If T1-T3 agreement is 70-85% and Opus is right >60% of the time on disagreements: widen Tier 2 escalation rule (lower the conf threshold, drop the catalyst requirement on some setups).
+- If T1-T3 agreement is <70%: Qwen prompt needs significant work before deploying, regardless of escalation.
+
 ### 6. Failure modes
 - LLM API failures: count + most common
 - Schema validation failures: count + sample
 - Risk module rejections: count + reasons
+- Tier 2 budget exhaustion days (escalation cap of 25 hit during cycle)
 
 ### 7. Top decisions worth manual review
 - 5 highest-confidence wins
@@ -379,38 +479,57 @@ python scripts/replay_with_llm.py \
     --start 2026-04-01 \
     --end 2026-04-30 \
     --tickers watchlist \
-    --tier sonnet \
+    --t1-backend qwen_local \
+    --t1-model qwen2.5-72b-instruct-q4 \
+    --t2-enabled \
+    --t2-model claude-sonnet-4-5 \
+    --t3-enabled \
+    --t3-model claude-opus-4-6 \
+    --t3-sample-rate 1.0 \
     --prompt-version v1.0 \
     --output-dir docs/reports/
 ```
 
-For a single-day spot check (cheaper, faster):
+For a single-day spot check (cheaper, faster) with Tier 3 disabled to save Opus cost during iteration:
 
 ```
-python scripts/replay_with_llm.py --start 2026-05-05 --end 2026-05-05 --tickers AAPL,NVDA,DDOG
+python scripts/replay_with_llm.py --start 2026-05-05 --end 2026-05-05 \
+    --tickers AAPL,NVDA,DDOG --t3-enabled=false
+```
+
+For a Tier-1-only ablation (measure how much Tier 2 + Tier 3 actually contribute):
+
+```
+python scripts/replay_with_llm.py --start 2026-05-05 --end 2026-05-05 \
+    --tickers watchlist --t2-enabled=false --t3-enabled=false
 ```
 
 ## Code structure
 
 ```
 scripts/replay_with_llm.py            # CLI entry point + main loop
-strategy/signals/llm.py               # the live signal generator (built in M3)
+strategy/signals/llm.py               # the live signal generator (built in M3) — orchestrates T1+T2+merge
+strategy/signals/llm_clients.py       # backend clients: QwenLocalClient, AnthropicClient (used by T1, T2, T3 alike)
+strategy/signals/escalation.py        # escalation_rule(ctx, t1_decision) -> bool
+strategy/signals/merge.py             # merge_tiers(t1, t2) -> live_decision
 data/replay/
     historical_bars.py                # Polygon-backed bar loader, point-in-time
     historical_news.py                # news loader with timestamp gating
     historical_sentiment.py           # query trader-prod's sentiment table
     market_context.py                 # SPY, VIX context
     ticker_metadata.py                # sector, market cap; cached locally
-data/replay_cache.py                  # llm response caching helpers
+data/replay_cache.py                  # per-tier llm response caching (qwen_local/, anthropic/<model>/)
 sim/portfolio.py                      # SimulatedPortfolio class
 sim/fills.py                          # fill simulator with slippage
 sim/comparison.py                     # base vs LLM comparison metrics
+sim/tier_analysis.py                  # T1-T2 and T1-T3 agreement metrics for report § 5d
 docs/reports/replay_v1_<date>.md      # output reports (gitignored)
 ```
 
-`strategy/signals/llm.py` is the same code that runs live — replay and
-production share that module. The `data/replay/*` and `sim/*` modules
-are replay-only (live doesn't need them).
+`strategy/signals/llm.py`, `escalation.py`, and `merge.py` are the
+same code that runs live — replay and production share these modules.
+The `data/replay/*` and `sim/*` modules are replay-only (live doesn't
+need them).
 
 ## Backtest credibility checklist
 
@@ -425,7 +544,11 @@ these checks:
 - [ ] News timestamps offset by 30s lag (documented; configurable)
 - [ ] Both portfolios start with identical initial state
 - [ ] Risk module applies identically to both
-- [ ] LLM cache cleared when prompt version changes
+- [ ] LLM cache cleared when prompt version changes (per-tier; bumping prompt for T1 doesn't invalidate T3 cache)
+- [ ] All three tiers see identical LLMContext (no information leakage between tiers — Opus must not see Qwen's decision when labeling, and vice versa)
+- [ ] Tier 2 escalation rule in replay matches the live config exactly (conf 50-75 + catalyst flag + PM RVOL > 3x); a "what-if escalation rule X" sweep must use a different config to be honest
+- [ ] Tier 3 sample rate documented in the report header; if t3_sample_rate < 1.0, the agreement metrics are statistical estimates with confidence intervals, not exact counts
+- [ ] Anthropic model IDs pinned in config and recorded in the run metadata; replays months later use the same pinned IDs
 
 ## Open questions
 
@@ -440,6 +563,12 @@ These need answers before M2 implementation begins.
 4. **Sentiment point-in-time gap.** Same boundary — trader-prod's sentiment table starts 2026-04-29. Pre-2026-04-29 replays have no sentiment context. Acceptable initial limitation; we replay the most recent 30 days primarily.
 
 5. **Multi-day position tracking.** If the LLM returns `time_horizon: overnight` or `multi_day`, the simulated position carries across days. The base never carries overnight; ensure portfolio bookkeeping handles this asymmetry without crashing the comparison.
+
+6. **Tier 3 Opus labeling cost budget.** A 60-day, full-watchlist replay with `t3_sample_rate=1.0` is roughly 140K Opus calls × ~$0.02/call (with caching) ≈ $200-400. M2.1-M2.4 initial scope (30-day, watchlist) is half that. We should set a hard budget cap in the harness (`config.t3_max_dollars_per_run = 500`) that aborts the Opus pass if exceeded, so a config typo can't run up a large bill. For prompt iteration where Opus labels don't need to refresh: cache hits are free, so the second iteration on the same window costs $0 for T3. Initial proposal: cap at $500/run; revisit after first M2 run measures actual cost.
+
+7. **Tier 1 wall-clock budget.** Qwen local at 50-70 tok/s × 250 output tokens × 140K calls = roughly 100 hours of GPU time per 60-day full replay. With 4-way batching that drops to ~25 hours, with 8-way to ~12-15 hours. Acceptable for an overnight run; not acceptable for interactive iteration. Mitigation: most iteration happens on cached responses (zero wall-clock); fresh-prompt iterations are scheduled overnight or scoped to a smaller window first.
+
+8. **Tier 2 escalation rule honesty.** The escalation rule references catalyst flags from the news classifier. Historical news classifier output may differ from current classifier output (the classifier itself has been updated over time). For replay correctness, we re-run today's classifier on historical news rather than using whatever was logged at the time. Document the gap; flag any replay where classifier version drift might bias escalation rates.
 
 ## Backtest scope expansion (with workstation hardware)
 
@@ -472,17 +601,18 @@ This is the design spec for M2. Sign-off here means we agree on:
 - Replay loop structure and time discretization (78 ticks/day, 09:30-15:55)
 - Data sources and point-in-time correctness rules
 - Pre-filter approach
-- Caching strategy
-- Storage schema (replay_results.db)
-- Comparison report format
-- CLI shape
+- Per-tier caching strategy with prompt-version-keyed namespaces
+- Storage schema (replay_results.db) recording per-tier outputs
+- Comparison report format including Section 5d (tier agreement & escalation analysis)
+- CLI shape with tier toggles
+- Three-tier replay execution: T1 always, T2 on escalation rule, T3 always (subject to sample_rate and budget cap)
 
 After sign-off, implementation work begins:
-- M2.1: scaffolding (CLI, config, data loaders) — ~1 day
-- M2.2: replay loop + portfolio sim — ~1 day
-- M2.3: comparison report generator — ~half day
-- M2.4: stub LLM signal generator (returns Hold; for plumbing test) — ~1 hour
-- Total M2 effort: ~3 days of focused work
+- M2.1: scaffolding (CLI, config, data loaders, per-tier cache layout) — ~1 day
+- M2.2: replay loop + portfolio sim + tier orchestration (call T1, conditionally T2, always T3) — ~1.5 days
+- M2.3: comparison report generator (sections 1-7 + section 5d tier analysis) — ~1 day
+- M2.4: stub Tier 1 LLM signal generator (returns Hold; for plumbing test) + stub Anthropic client for T2/T3 (returns canned response) — ~2 hours
+- Total M2 effort: ~4 days of focused work (was ~3; tier orchestration adds ~1 day)
 
 After M2 is working, M3 is the only thing standing between us and a real
 backtest result.
