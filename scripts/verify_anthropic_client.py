@@ -153,29 +153,73 @@ async def main() -> int:
         call_kwargs["system"][0]["cache_control"] == {"type": "ephemeral"},
     )
 
-    # ---- Path 2: schema-invalid tool input — confidence out of range ----
-    bad_input = {
+    # ---- Path 2a: out-of-range numerics + over-long strings get
+    # clamped/truncated instead of raising. Anthropic's tool-use
+    # doesn't enforce numeric bounds or maxLength, so we normalize
+    # at parse time per the design doc's "clamp to bounds, proceed". ----
+    clamp_input = {
         "action": "Buy",
-        "confidence": 999,  # rejected by Pydantic ge=0, le=100
-        "setup_label": "x",
-        "reasoning": "y",
-        "stop_loss_atr_multiple": 1.5,
-        "take_profit_atr_multiple": 2.0,
+        "confidence": 999,                        # clamp -> 100
+        "setup_label": "x" * 100,                 # truncate -> 47 + "..." (50 chars)
+        "reasoning": "y" * 500,                   # truncate -> 277 + "..." (280 chars)
+        "stop_loss_atr_multiple": 10.0,           # clamp -> 3.0
+        "take_profit_atr_multiple": 99.0,         # clamp -> 5.0
+        "alternative_view": "z" * 200,            # truncate -> 137 + "..." (140 chars)
     }
-    mock_create = AsyncMock(return_value=_make_mock_response(bad_input))
+    mock_create = AsyncMock(return_value=_make_mock_response(clamp_input))
     _patch_client(client, mock_create)
     try:
-        await client.evaluate(ctx)
-        all_ok &= _print("schema-invalid raises SchemaInvalidError", False, "no exception")
-    except SchemaInvalidError as exc:
+        decision = await client.evaluate(ctx)
+        clamped_ok = (
+            decision.confidence == 100
+            and len(decision.setup_label) == 50
+            and decision.setup_label.endswith("...")
+            and len(decision.reasoning) == 280
+            and decision.reasoning.endswith("...")
+            and decision.stop_loss_atr_multiple == 3.0
+            and decision.take_profit_atr_multiple == 5.0
+            and len(decision.alternative_view) == 140
+            and decision.alternative_view.endswith("...")
+        )
         all_ok &= _print(
-            "schema-invalid raises SchemaInvalidError",
-            "validation failed" in str(exc).lower(),
-            f"{type(exc).__name__}: {str(exc)[:80]}",
+            "out-of-range fields clamp/truncate (no raise)",
+            clamped_ok,
+            f"conf={decision.confidence} setup_len={len(decision.setup_label)} "
+            f"reasoning_len={len(decision.reasoning)} stop={decision.stop_loss_atr_multiple} "
+            f"tp={decision.take_profit_atr_multiple}",
         )
     except Exception as exc:
         all_ok &= _print(
-            "schema-invalid raises SchemaInvalidError",
+            "out-of-range fields clamp/truncate (no raise)",
+            False,
+            f"unexpected exception: {type(exc).__name__}: {exc}",
+        )
+
+    # ---- Path 2b: genuinely malformed input still raises ----
+    # Wrong enum value for action. Pydantic rejects (clamping doesn't
+    # apply to enums), surfaces as SchemaInvalidError.
+    bad_action_input = {
+        "action": "Maybe",                        # not in {Buy, Sell, Hold}
+        "confidence": 50,
+        "setup_label": "x",
+        "reasoning": "y",
+    }
+    mock_create = AsyncMock(return_value=_make_mock_response(bad_action_input))
+    _patch_client(client, mock_create)
+    try:
+        await client.evaluate(ctx)
+        all_ok &= _print(
+            "invalid action enum raises SchemaInvalidError", False, "no exception"
+        )
+    except SchemaInvalidError as exc:
+        all_ok &= _print(
+            "invalid action enum raises SchemaInvalidError",
+            "validation failed" in str(exc).lower(),
+            f"{str(exc)[:80]}",
+        )
+    except Exception as exc:
+        all_ok &= _print(
+            "invalid action enum raises SchemaInvalidError",
             False,
             f"wrong exception type: {type(exc).__name__}",
         )

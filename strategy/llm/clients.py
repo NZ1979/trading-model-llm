@@ -43,6 +43,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from .prompts import render_messages
 from .types import LLMContext, LLMDecision
 
 logger = logging.getLogger(__name__)
@@ -114,36 +115,6 @@ def _llm_decision_tool_schema() -> dict[str, Any]:
 
 
 # ============================================================================
-# Stub prompt rendering (replaced in step 5)
-# ============================================================================
-
-
-def _render_stub_prompt(ctx: LLMContext) -> str:
-    """Minimal prompt that exercises the API integration.
-
-    Replaced in step 5 with the full template loaded from
-    ``llm_prompt_v{version}.txt``. Until then, the stub returns just
-    enough text to validate the SDK call shape, the tool-use schema,
-    the parse path, and the retry behavior.
-    """
-    return (
-        f"Evaluating ticker {ctx.ticker} at {ctx.timestamp_et} "
-        f"(prompt_version={ctx.prompt_version}). The full evaluation "
-        f"prompt is not yet implemented. For this plumbing test, "
-        f"return Hold with confidence=0, setup_label='plumbing_stub', "
-        f"and reasoning='step 3 plumbing test'. Use the submit_decision "
-        f"tool."
-    )
-
-
-_STUB_SYSTEM_PROMPT = (
-    "You are an intraday equity trader under test. The evaluation "
-    "prompt is being scaffolded. Always submit a decision via the "
-    "submit_decision tool."
-)
-
-
-# ============================================================================
 # AnthropicClient
 # ============================================================================
 
@@ -182,11 +153,18 @@ class AnthropicClient:
         self.max_tokens = max_tokens
         self.timeout_s = timeout_s
 
-        # SDK reads ANTHROPIC_API_KEY from env if api_key is None.
-        # Constructing without a key is allowed (the SDK errors at
-        # call time, not init time) so unit tests can mock the client.
+        # Strip whitespace from the key. A pasted key with a trailing
+        # newline or a leading space crashes deep inside httpcore/h11
+        # with an opaque "Illegal header value" message that surfaces
+        # as APIConnectionError after 3 retries — minutes wasted
+        # debugging what looks like a network problem. Defang it here.
+        # SDK reads ANTHROPIC_API_KEY from env if api_key is None;
+        # construction without a key is allowed so unit tests can mock
+        # the client.
+        raw_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        clean_key = raw_key.strip() if raw_key else None
         self._client = AsyncAnthropic(
-            api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"),
+            api_key=clean_key,
             timeout=timeout_s,
         )
         self._tool_schema = _llm_decision_tool_schema()
@@ -201,10 +179,10 @@ class AnthropicClient:
                 ``submit_decision`` tool_use block, or the tool input
                 failed Pydantic validation, or a 4xx surfaced.
         """
-        prompt = _render_stub_prompt(ctx)
+        rendered = render_messages(ctx)
 
         try:
-            response = await self._call_with_retry(prompt)
+            response = await self._call_with_retry(rendered)
         except RetryError as exc:
             inner = exc.last_attempt.exception()
             raise APIUnavailableError(
@@ -259,17 +237,14 @@ class AnthropicClient:
         retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
         reraise=False,
     )
-    async def _call_with_retry(self, prompt: str) -> Any:
+    async def _call_with_retry(self, rendered: dict[str, Any]) -> Any:
+        # ``rendered`` carries 'system' (with breakpoint 1) and 'messages'
+        # (with breakpoint 2 on market context). Tools and tool_choice
+        # are owned by the client since they're tied to the LLMDecision
+        # schema, not the prompt content.
         return await self._client.messages.create(
             model=self.model_id,
             max_tokens=self.max_tokens,
-            system=[
-                {
-                    "type": "text",
-                    "text": _STUB_SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
             tools=[
                 {
                     "name": _TOOL_NAME,
@@ -278,7 +253,7 @@ class AnthropicClient:
                 }
             ],
             tool_choice={"type": "tool", "name": _TOOL_NAME},
-            messages=[{"role": "user", "content": prompt}],
+            **rendered,
         )
 
 
