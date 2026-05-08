@@ -329,6 +329,89 @@ modest batching, comfortable within a 300s cycle budget).
 
 4. **All cost numbers are sensitive to context length.** As we iterate the prompt and add more historical bars or news, input tokens grow. Local cost stays $0; cloud cost scales linearly. This favors longer-context experiments locally.
 
+5. **Cloud costs above are uncached baseline.** With prompt caching enabled (next section), actual cloud spend drops by ~60%.
+
+## Prompt caching strategy (cloud backend)
+
+Anthropic's `ephemeral` prompt cache reduces cached-input cost to 10% of base rate and avoids re-encoding the prefix on the server. Cache writes cost 1.25x base; TTL is 5 minutes from the last hit. Break-even: ~2 reuses of the same prefix within 5 minutes.
+
+This signal generator is a textbook fit. The per-call input is mostly stable across many calls:
+
+- **Highly stable** (changes only on `prompt_version` bump): system prompt, output schema, few-shot examples → 4-6K tokens
+- **Cycle-stable** (refreshes every 5 min when SPY bar arrives): market context (SPY/VIX/regime) → ~150 tokens
+- **Per-ticker variable**: fundamentals, daily regime, intraday bars, news, position state, history, time-of-day → 800-1500 tokens
+
+30-200 candidates per cycle all share both stable layers; only the per-ticker block varies.
+
+### Cache layout
+
+Two cache breakpoints, ordered most-stable to least-stable:
+
+```
+[cache_control: ephemeral, breakpoint 1]   ← persists across cycles
+  System prompt
+  Output schema (tool definition)
+  Few-shot examples
+
+[cache_control: ephemeral, breakpoint 2]   ← rewritten each 5-min cycle
+  Market context (SPY change, VIX, regime label)
+
+[no cache_control — per-ticker, variable]
+  Ticker block (fundamentals → daily → intraday → news → position → history → time)
+```
+
+Breakpoint 1 keeps hitting until we deploy a new prompt version. Breakpoint 2 is rewritten on the first call of each 5-min cycle and hits for the remaining 29-199 calls in that cycle.
+
+### Expected savings (Sonnet 4.5)
+
+Assumed shape: 5K stable + 0.15K cycle-stable + 1K variable = ~6.15K input, 250 output. 30 candidates × 78 cycles = 2340 calls/day.
+
+| | Without caching | With caching |
+|---|---|---|
+| Input cost/day | ~$43 | ~$11 (read) + ~$0.07 (write) |
+| Output cost/day | ~$8.80 | ~$8.80 |
+| **Total/day** | **~$52** | **~$20** |
+
+Savings ~60% on Sonnet. On Haiku the percentage is similar; absolute savings smaller (~$1.50/day). The earlier "Cost & latency model" table used 1500 input tokens as a rough lower bound; the 6K figure here reflects what the v1.0 template actually renders to once the bar table, news block, and prior-decisions block are populated.
+
+### Prompt template reorganization (required)
+
+The v1.0 template starts with `"You are an intraday equity trader evaluating {ticker} at {timestamp_et}."` — that puts variable content at position 1, defeating cache hits. Restructured order (functionally equivalent — same information reaches the LLM):
+
+```
+[stable, cacheable — breakpoint 1]
+  Role + decision criteria + output schema + few-shot examples
+
+[cycle-stable, cacheable — breakpoint 2]
+  # Market context
+  SPY today: ...; VIX: ...; Regime: ...
+
+[variable, not cached]
+  # Evaluating {ticker} at {timestamp_et}
+  [ticker fundamentals → daily → intraday → news → position → history → time]
+```
+
+Restructure happens before M3 implementation; locked into `llm_prompt_v1.txt` from the start so cache hits work on the first deployed prompt.
+
+### Replay harness implication
+
+60-day replay × ~30 candidates × 78 cycles ≈ 140K calls. Without caching that's ~$3,100 on Sonnet; with caching ~$1,200. Caching is the difference between affordable and unaffordable prompt iteration during M2.
+
+Replay uses caching by default — the rendered-prompt log is byte-identical to live, so cache breakpoints and TTL behave identically. Bypass caching only when investigating a suspected cache-correctness bug.
+
+### Local backend note
+
+LM Studio exposes no prompt-caching primitive. Local inference has zero marginal token cost, so caching contributes nothing there. The reorganization above is harmless for local inference — one prompt template structure works for both backends.
+
+### What invalidates the cache
+
+- `prompt_version` bump → breakpoint 1 invalidated (rare; deploy boundary)
+- New 5-min cycle (SPY bar arrives) → breakpoint 2 rewritten
+- 5-min idle (no calls hitting the cache) → TTL expiry, both invalidated
+- Model identifier change (e.g. `claude-sonnet-4-5` → `claude-sonnet-4-6`) → both invalidated
+
+We log Anthropic's `cache_creation_input_tokens` and `cache_read_input_tokens` per call into the `decisions` table for cost accounting and to detect cache-miss regressions (e.g. accidental prompt drift that breaks the prefix match).
+
 ## Failure modes & fallbacks
 
 | Failure | Detection | Fallback |
@@ -363,8 +446,9 @@ actual signal engine implementation):
 - Sync vs async API client (recommendation: async to support parallel calls)
 - Tool-use vs raw JSON output (recommendation: tool-use for guaranteed schema compliance)
 - Where the prompt template lives in the codebase (recommendation: `strategy/signals/llm_prompt_v1.txt` as a static text file with format placeholders)
-- Cost tracking (recommendation: log input_tokens, output_tokens, model per call; aggregate daily)
-- Decision storage schema in SQLite (extends existing `decisions` table with `prompt_version`, `raw_response`, `cost_cents` columns)
+- Cost tracking (recommendation: log input_tokens, output_tokens, model, cache_creation_input_tokens, cache_read_input_tokens per call; aggregate daily)
+- Decision storage schema in SQLite (extends existing `decisions` table with `prompt_version`, `raw_response`, `cost_cents`, `cache_read_tokens`, `cache_write_tokens` columns)
+- Prompt caching breakpoint placement (recommendation: two breakpoints as documented in "Prompt caching strategy" — system/schema/few-shot, then market context)
 
 ## Status
 
@@ -377,5 +461,6 @@ engine) to build against. Sign-off here means we agree on:
   starting point — will iterate)
 - The pre-filter approach (rule-based candidate selection before LLM call)
 - The fallback behavior (Hold on every failure mode)
+- The prompt caching strategy (two-breakpoint layout, variable content last)
 
 After sign-off, M2 (replay harness) becomes the next concrete deliverable.
