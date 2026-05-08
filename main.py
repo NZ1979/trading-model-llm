@@ -861,11 +861,17 @@ class TradingPlatform:
         # Bug H 2026-05-06: stop distance is now ATR-aware. Falls back to
         # the configured fixed pct when daily_atr_14 is missing (e.g. for
         # tickers with insufficient daily history).
+        # Bug I fix 2026-05-07: _place_order doesn't receive `state` as a
+        # parameter, so we look it up from self.symbols by ticker. Without
+        # this lookup, the original Bug H code crashes with NameError on
+        # every signal that reaches the order placement path, blocking
+        # actual orders even though the signal engine fires correctly.
         fallback_stop_pct = self.config["risk"]["stop_loss_pct"]
         risk_cfg = self.config["risk"]
+        state = self.symbols.get(decision.ticker)
         daily_atr = (
             state.daily_ctx.daily_atr_14
-            if state.daily_ctx is not None else 0.0
+            if state is not None and state.daily_ctx is not None else 0.0
         )
         stop_loss_pct = compute_atr_stop_pct(
             entry_price=latest_price,
