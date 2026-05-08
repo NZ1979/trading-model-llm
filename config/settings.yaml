@@ -95,3 +95,36 @@ risk:
 logging:
   level: INFO                                      # DEBUG | INFO | WARNING | ERROR
   decisions_to_db: true                            # log every TradeDecision to SQLite
+
+# Tiered LLM signal generator — see docs/LLM_SIGNAL_INTERFACE.md
+# Phase 0 (current): Tier 1 served by Haiku stand-in until workstation
+# arrives. Tier 2 = Sonnet selective escalation. Tier 3 = Opus offline,
+# disabled in the live engine (replay/audit jobs flip it on per-run).
+llm:
+  enabled: false                                   # master switch; flip to true once signal_engine.evaluate is wired into main.py
+  prompt_version: v0.0-stub                        # bump on prompt template change; invalidates per-tier cache
+
+  t1:
+    backend: haiku_stand_in                        # haiku_stand_in (bridge) | anthropic | qwen_local (workstation)
+    model_id: claude-haiku-4-5                     # required; haiku_stand_in pins this to claude-haiku-4-5
+    timeout_s: 30
+    max_tokens: 1024
+
+  t2:
+    enabled: true                                  # selective Sonnet escalation
+    backend: anthropic
+    model_id: claude-sonnet-4-5
+    timeout_s: 30
+    max_tokens: 1024
+    max_per_day: 25                                # daily escalation budget cap
+    confidence_floor: 50                           # only escalate when t1 confidence in [floor, ceiling]
+    confidence_ceiling: 75
+    pm_rvol_min: 3.0                               # additional gate: pre-market RVOL above this
+
+  t3:
+    enabled: false                                 # live default OFF; replay/audit jobs override per-run
+    backend: anthropic
+    model_id: claude-opus-4-6
+    timeout_s: 60
+    max_tokens: 1024
+    sample_rate: 1.0                               # 1.0 = label every candidate; <1 to subsample for cost

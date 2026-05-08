@@ -1,0 +1,13 @@
+# LLM signal generator (Tier 1 Qwen local + Tier 2 Sonnet + Tier 3 Opus)
+# Additive to requirements.txt; install with:
+#   pip install -r requirements.txt -r requirements-llm.txt
+#
+# Pinned floors are deliberate — see docs/LLM_SIGNAL_INTERFACE.md for which
+# features each version unlocks (prompt caching, strict tool-use schema,
+# OpenAI-compatible chat API used by LM Studio).
+
+anthropic>=0.45.0          # bump from base's 0.39.0: prompt caching + strict tool-use schema
+openai>=1.50.0             # LM Studio Tier 1 client (OpenAI-compatible API on localhost:1234)
+pydantic>=2.5.0            # LLMDecision schema validation
+tenacity>=8.2.0            # retry decorator for API transient errors
+pytest-asyncio>=0.23.0     # async test support for signal_engine tests
