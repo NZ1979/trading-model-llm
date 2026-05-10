@@ -3,9 +3,86 @@
 This is the design contract for the next phase of the LLM trading model.
 It supersedes v1's "LLM as direct trader" pattern with "LLM as analyst +
 deterministic TradePolicy" pattern, plus shadow analytics, fail-closed
-hierarchy, and schema splits. After sign-off here, implementation work
-begins; v1 code paths remain in place until the v2 paths are validated
-end-to-end via the M2 replay harness.
+hierarchy, schema splits, and an explicit profit-maximization objective.
+After sign-off here, implementation work begins; v1 code paths remain in
+place until the v2 paths are validated end-to-end via the M2 replay harness.
+
+## 0. Primary Objective: Maximize Risk-Adjusted Profit
+
+The primary goal of the LLM trading model is to maximize realized
+financial profit on the paper account, measured as a risk-adjusted
+return metric and subject to hard drawdown constraints.
+
+**Optimized metric**: 90-day rolling **Calmar ratio** = annualized P&L ÷
+maximum drawdown over the window. Calmar is preferred over Sharpe because
+it penalizes only drawdowns (the kind of volatility that actually hurts an
+account), not all volatility (Sharpe penalizes upside volatility too).
+Professional CTAs report Calmar to investors for the same reason: it
+matches the right intuition about strategy quality.
+
+**Secondary metrics tracked alongside** (informational, not directly optimized):
+- Sharpe ratio (annualized)
+- Win rate
+- Expectancy per trade in R-multiples
+- Profit factor (gross wins ÷ gross losses)
+- Best / worst day
+- Average days between new equity highs
+
+**Hard constraints** (any breach forces Hold-only mode until investigated):
+- Maximum drawdown ceiling: 15% from account peak
+- Single-day loss cap: 5% of account equity
+- Per-trade risk cap: 1.0% (raised from v1's 0.5% once edge is proven)
+- Total exposure cap: 90% (unchanged)
+- Operational: any system breach (clamp anomaly storm, network split, data staleness) forces Hold-only
+
+**What "maximize profit" specifically means in design choices:**
+
+The v1 design has a "do no harm" posture ("be no worse than base, prefer
+Hold"). V2 elevates profit to primary, which changes specific tradeoffs
+without removing the safety constraints:
+
+1. **Position sizing scales with proven edge.** Once a bucket has 30+
+   samples with statistically significant positive expectancy, position
+   size grows toward the per-trade risk cap (capped at half-Kelly for
+   safety) instead of staying tiny indefinitely.
+
+2. **Take-profit logic actually fires.** Bracket orders include both stop
+   and take-profit legs. Positions that hit target during the day exit
+   immediately at broker level rather than waiting for the 15:55 ET
+   flatten. See § B.1 for the full multi-layer profit-protection design.
+
+3. **Hold default is a tunable, not a virtue.** The "Hold by default"
+   bias becomes a numerical threshold: trade when expected R clears the
+   profit-optimization threshold. The threshold is tuned against
+   historical Calmar, not pinned to a conservative constant.
+
+4. **Position-management LLM is profit-positive, not just risk-positive.**
+   SCALE_UP and TAKE_PARTIAL become first-class actions alongside
+   defensive ones. When a setup is working, adding to a winner is
+   profit-maximizing; when a setup has run, banking partial profit and
+   letting the rest ride is profit-maximizing.
+
+5. **Bucket gating uses Calmar contribution, not just expected R.** A
+   bucket with marginal point-estimate expectancy can still be deployed
+   if its returns are uncorrelated with other deployed buckets and it
+   reduces portfolio drawdown (diversification benefit).
+
+6. **15:55 ET flatten becomes the safety net, not the exit strategy.**
+   Most exits should happen earlier via take-profit (broker-side),
+   trailing stop (deterministic), or LLM EXIT/TAKE_PARTIAL signals.
+   The 15:55 routine catches stragglers; well-managed positions are
+   already closed by then.
+
+**What does NOT change under profit-max framing:**
+- Risk validator stays as the final gate; no LLM or policy output bypasses it
+- Fail-closed hierarchy stays; profit-max during a degraded system is dangerous
+- Schema validation, clamp-anomaly tracking, regime-stratified gating all stay
+- Discrete qty_tier system stays (we add Kelly-fraction *within* a tier rather than removing tiers)
+- All paper trading until 100+ historical samples in a deployed bucket show realized positive Calmar
+
+The objective and its constraints are codified once here. The rest of the
+doc references back to this section when an implementation choice is a
+profit-vs-conservatism tradeoff.
 
 Reference docs:
 - `LLM_SIGNAL_INTERFACE.md` — v1 contract (output schema, prompt template, tier orchestration)
@@ -113,13 +190,18 @@ class TradeReadiness(str, Enum):
 
 
 class PositionAction(str, Enum):
-    """For decisions on already-held positions, evaluated every 5 min."""
-    HOLD = "hold"                    # No change
-    TRIM = "trim"                    # Reduce size (e.g. take 1/2 off into strength)
-    EXIT = "exit"                    # Close immediately
-    TIGHTEN_STOP = "tighten_stop"    # Move stop closer to current price
-    SCALE_UP = "scale_up"            # Add to position
-    NO_OPINION = "no_opinion"        # LLM cannot judge; defer to bracket stop
+    """For decisions on already-held positions, evaluated every 5 min.
+
+    Profit-aware action set under v2's max-profit framing. See § B.1
+    Layer 3 for the full action -> order mapping in TradePolicy.
+    """
+    HOLD = "hold"                      # No change; trust bracket + trailing stop
+    SCALE_UP = "scale_up"              # Add to a working position
+    TAKE_PARTIAL = "take_partial"      # Sell 1/3 to 1/2 to bank profit, let rest run
+    TRIM = "trim"                      # Sell 50% defensively (uncertainty rising)
+    EXIT = "exit"                      # Close immediately (LLM call, not stop hit)
+    TIGHTEN_STOP = "tighten_stop"      # LLM-driven stop tightening beyond ratchet
+    NO_OPINION = "no_opinion"          # Defer to bracket + trailing stop
 
 
 class LLMAnalysis(BaseModel):
@@ -257,26 +339,195 @@ engine reads it and selects its evaluation path accordingly.
 
 ## Tier B — quality, do alongside
 
-### B.1 Position management evaluator (5-min cadence)
+### B.1 Profit-maximizing position management
+
+The single biggest change between v1 and v2 trading behavior. V1 placed a
+bracket order with a stop and then waited for either the stop to hit or
+15:55 ET to flatten. V2 actively works the position throughout the day to
+capture wins as they develop, protect them as they grow, and re-deploy
+capital from setups that have stalled.
+
+The design is a **defense-in-depth stack of five layers**, each cheaper
+than the next-higher layer at catching the most common case, with the
+expensive layers handling cases the cheap ones miss. The 15:55 ET flatten
+remains as the final safety net, but a well-managed position is rarely
+still open at 15:55.
+
+#### B.1 Layer 1: Static take-profit leg (broker-side, instant)
+
+**Every bracket order includes both a stop AND a take-profit leg.**
+
+Currently `execution/alpaca_orders.py::submit_bracket_order` accepts a
+`take_profit_limit_price` parameter but the v1 caller passes None for it.
+V2 wires it: TP price is set at `entry + (take_profit_atr_multiple × daily_ATR_14)`
+for longs, or `entry - (take_profit_atr_multiple × daily_ATR_14)` for shorts.
+
+**Why this layer first:** zero latency. When price prints at TP, Alpaca's
+servers fill the order immediately, before our next 5-min eval cycle
+fires. Captures the case where a setup runs 2-3R inside a single 5-min bar
+and would have faded back below target by the next eval.
+
+**Implementation effort:** 0.5 day. The Alpaca OTO order shape already
+supports both legs; we just need to compute and pass the TP price at
+order submission time.
+
+#### B.1 Layer 2: Profit-locking trailing stop (deterministic, every cycle)
+
+**Once a position is in profit by 1R or more, the stop ratchets up to
+lock in gains.** Pure deterministic logic; no LLM call needed. Runs every
+5-min cycle in the policy module.
+
+Ratchet schedule (R = entry-to-stop distance, in dollars):
+
+| Position state | New stop level |
+|---|---|
+| Position up by less than 1R | Original stop (no change) |
+| Position up by 1R or more | Move stop to entry + 0.10R buffer (effectively breakeven) |
+| Position up by 2R or more | Move stop to entry + 1.0R (lock 50% of best move) |
+| Position up by 3R or more | Move stop to entry + 2.0R (lock ~67% of best move) |
+| Position up by 4R or more | Trail stop at high-water-mark minus 1.5R |
+
+The ratchet is **one-way**: a stop never moves backward (looser). If price
+pulls back from a peak, the stop stays at the highest level it reached.
+
+Implementation: each 5-min cycle, for every open position, compute the
+target trailing-stop level. If the target is tighter than the current
+stop, cancel the existing stop child and submit a new one at the target
+level. Use the same Alpaca DELETE-then-POST pattern that
+`replace_stop_for_position` uses today.
+
+**Why this layer matters:** captures the case where a position runs to 3R
+peak and then fades over the next 30 min. Without this, the original stop
+1R below entry sits unchanged and we give back the entire gain. With this,
+we exit at the locked-in 2R level when the pullback hits.
+
+**Race condition note:** between the bracket TP filling and the eval
+running its trailing-stop update, both could fire on a fast move. That's
+fine; whichever broker-side order fills first wins, the other becomes a
+no-op. We just need to handle "position not found" cleanly when updating
+a stop on a position that just got TP'd.
+
+#### B.1 Layer 3: LLM position-management evaluator (5-min cadence)
 
 Held positions get re-evaluated every 5 min, same cadence as new candidate
-evaluation. Cost is acceptable; we are not constrained on calls per cycle.
+evaluation. The LLM sees current unrealized P&L, distance to stop, distance
+to TP, recent bars, and the news/sentiment context, and emits a refined
+`LLMAnalysis.position_action`:
 
-When `ctx.currently_holding == True`:
+```
+class PositionAction(str, Enum):
+    HOLD          = "hold"           # No change; trust bracket + trailing stop
+    SCALE_UP      = "scale_up"       # Add to a working position
+    TAKE_PARTIAL  = "take_partial"   # Sell 1/3 to 1/2 to bank profit, let rest run
+    TRIM          = "trim"           # Sell 50% defensively (uncertainty rising)
+    EXIT          = "exit"           # Close immediately (LLM is making the call)
+    TIGHTEN_STOP  = "tighten_stop"   # LLM-driven stop tightening beyond the deterministic ratchet
+    NO_OPINION    = "no_opinion"     # Defer to bracket + trailing stop
+```
 
-- The prompt template includes the position state block (already in v1)
-- The LLM emits `LLMAnalysis.position_action` (HOLD | TRIM | EXIT | TIGHTEN_STOP | SCALE_UP | NO_OPINION)
-- The TradePolicy maps the action to a concrete order:
-  - HOLD: no order
-  - TRIM: market sell N% of qty (default 50%; configurable)
-  - EXIT: market close position
-  - TIGHTEN_STOP: replace existing stop with a tighter stop computed from current price minus 0.5 ATR
-  - SCALE_UP: bracket order for additional qty if exposure cap allows; else HOLD
-  - NO_OPINION: no order; bracket stop continues to govern
+TradePolicy mapping (when ctx.currently_holding):
 
-Rationale for keeping 5-min and not moving to 15: held positions are *more*
-important than candidate evaluations. We do not want a faster eval cadence
-on potential entries than on actual capital at risk.
+| LLM action | Order placed |
+|---|---|
+| HOLD | No order; existing bracket + trailing stop continue |
+| SCALE_UP | New bracket order for additional qty if exposure cap allows; else demote to HOLD with reason logged |
+| TAKE_PARTIAL | Market sell `partial_fraction × qty` (default 0.5; configurable per setup type). Remaining position keeps its bracket and trailing stop. |
+| TRIM | Same as TAKE_PARTIAL but signals "defensive" rather than "profit-banking" — used for shadow analytics bucket grouping |
+| EXIT | Market close full position; cancel remaining bracket children |
+| TIGHTEN_STOP | Replace stop with current-price minus 0.5 ATR (long) or plus 0.5 ATR (short), only if tighter than current stop |
+| NO_OPINION | No order; bracket + trailing stop continue |
+
+**Difference between TAKE_PARTIAL (new) and TRIM (existing):** semantically
+identical action (sell a portion), but recorded with different `intent`
+metadata so the shadow analytics can answer questions like "when LLM
+flagged TAKE_PARTIAL, did the remainder continue to run?" vs "when LLM
+flagged TRIM defensively, did the remainder fade?" The realized R on each
+action class informs whether the LLM's profit-banking instinct is
+positively expected or not.
+
+**Difference between EXIT and the trailing stop hitting:** EXIT is the
+LLM's active call to close (e.g., "thesis broken: SPY just broke key
+support and our long is fading"). Trailing stop is mechanical; it fires
+on price action regardless of whether the LLM has a view. Both outcomes
+are logged separately for analysis.
+
+**SCALE_UP becomes a first-class action under profit-max framing.**
+V1 had it as an optional escape hatch; v2 elevates it: when a setup is
+working strongly (LLM sees continuation strength + trailing stop already
+locked in 1R+ of gains + market regime supports the direction), adding
+to the winner is the profit-max move. The deterministic trailing stop
+alone won't generate this; the LLM's holistic read is what triggers it.
+
+#### B.1 Layer 4: Late-day exit bias (deterministic, time-of-day modifier)
+
+After 14:30 ET (90 min before close), the policy applies an
+exit-leaning modifier to LLM actions:
+
+| Time window | Modifier |
+|---|---|
+| 09:35 - 14:30 ET | Normal: LLM action passes through unchanged |
+| 14:30 - 15:00 ET | If LLM action is HOLD on a position in profit > 1R, downgrade to TIGHTEN_STOP (lock more of the gain) |
+| 15:00 - 15:30 ET | If LLM action is HOLD on any position in profit, downgrade to TAKE_PARTIAL (bank half) |
+| 15:30 - 15:55 ET | If LLM action is anything other than EXIT or HOLD-with-explicit-overnight-thesis, downgrade to EXIT (close defensively before flatten) |
+| 15:55 ET | Unconditional flatten (existing safety net) |
+
+**Why time-of-day matters for profit:** late-day liquidity thins, news
+flow drops, mean-reversion pressure rises. A position in 2R profit at
+13:00 has plenty of time to develop further; the same position at 15:30
+is statistically more likely to give back gains than make new highs.
+Banking the gain locks in profit and avoids the close-of-day flatten
+slippage.
+
+**The 15:55 ET flatten remains** as the final safety net, but it should
+catch only stragglers — positions where every prior layer passed (LLM
+recommended HOLD with overnight-thesis, time-of-day modifier didn't
+override, no take-profit hit, no trailing stop hit). Most days, by
+15:55 ET there should be nothing left to flatten.
+
+#### B.1 Layer 5: [Deferred] Price-event-triggered evaluation
+
+A 5-min eval cadence has a structural blind spot: a position can run 2R
+inside one 5-min bar (entry at 09:35, target at 09:36 inside the bar that
+prints at 09:40), and our next eval doesn't fire until 09:40. Layer 1's
+broker-side TP catches the literal target hit; but we miss the case where
+price runs 1.7R, stalls, fades back to 0.5R, all within one 5-min bar,
+without ever printing exactly at our TP price.
+
+**Mitigation deferred to a later phase.** Possible future approaches:
+- Subscribe to 1-min bars for tickers with open positions; trigger a
+  position-mgmt eval when price moves more than 1 ATR from entry within a
+  single 1-min bar
+- Use Alpaca's trade-update WebSocket to fire evals on every fill
+- Add a polling loop (every 30s) that checks each open position's current
+  price vs entry and fires an eval if a threshold is crossed
+
+These add complexity (new feeds, reconciliation against the 5-min cycle)
+without proven value. Defer until shadow analytics show that meaningful
+profit is being missed inside the 5-min window. If the 60-day replay
+shows that >5% of profitable trades had a peak-to-trough decline within
+the 5-min bar of >0.5R that was unrecovered by next-bar exit, build
+Layer 5. Otherwise, the four layers above are sufficient.
+
+#### B.1 Layered defense summary
+
+| Layer | Mechanism | Latency | Catches |
+|---|---|---|---|
+| 1. Static TP leg | Broker-side bracket order | ~zero | Price printing exactly at target |
+| 2. Trailing stop | Deterministic policy, 5-min cycle | Up to 5 min | Position runs to peak then fades |
+| 3. LLM eval | Tier 1 evaluation, 5-min cycle | 5 min + LLM latency | Thesis breakage, regime shift, continuation strength |
+| 4. Late-day modifier | Time-of-day rule on LLM action | Same as Layer 3 | Late-day fade risk |
+| 5. 15:55 flatten | Hard safety net | None | Anything still open |
+
+A well-managed profitable position typically exits via Layer 1 (target
+hit) or Layer 2 (peak then fade). Layer 3 closes positions when the
+thesis breaks. Layer 4 handles the end-of-day fade pattern. Layer 5 is
+the final guarantee that nothing carries overnight without explicit
+intent. The 15:55 flatten should rarely have anything to do.
+
+**Rationale for keeping 5-min cadence (not 15):** held positions are
+*more* important than candidate evaluations. We do not want a faster eval
+cadence on potential entries than on actual capital at risk. Cost is
+not a constraint.
 
 ### B.2 Multi-condition escalation
 
@@ -577,10 +828,19 @@ expectancy gates future decisions. Without shadow_outcomes infrastructure
 
 ## Sequencing
 
+**Pre-step (do immediately, in parallel with everything below).**
+**B.1 Layer 1: wire the static take-profit leg into bracket orders.**
+Estimated 0.5 day. No architectural prerequisites; touches only
+`execution/alpaca_orders.py::submit_bracket_order`'s caller and the order
+config. This change improves production behavior the day it ships, well
+before the v2 architecture is complete. Treat as a hotfix-class change:
+land it, deploy it, then return to the architectural work below.
+
 1. **A.2 Shadow analytics** (1-2 days). Database schema, follower process,
    first M2 replay populating shadow_outcomes for the last 30 days against
    v1 decisions already in the DB. Without this, every other improvement
-   is unmeasurable.
+   is unmeasurable. Calmar ratio computation uses these tables; without
+   them we cannot measure progress against the primary objective.
 
 2. **A.1 Schema split** (2 days). LLMAnalysis Pydantic class, prompt
    template additions to elicit the new fields, parser updates. Run
@@ -601,7 +861,8 @@ expectancy gates future decisions. Without shadow_outcomes infrastructure
    buckets show positive realized R.
 
 6. **Tier B improvements** (2-3 days each, parallel). B.1 position
-   management, B.2 multi-trigger escalation, B.3 clamp observability,
+   management Layers 2-4 (Layer 1 already shipped per pre-step; Layer 5
+   deferred), B.2 multi-trigger escalation, B.3 clamp observability,
    B.4 deployment gates wired to bucket stats.
 
 7. **Tier C hardening** (1 day each). C.1-C.4. All before live paper.
@@ -665,12 +926,16 @@ adding value at all, or do we need a different prompt / model?"
 
 This is the design contract for v2. Sign-off here means we agree on:
 
+- The primary objective: maximize 90-day rolling Calmar subject to drawdown + per-trade risk constraints
 - The architectural change (LLM as analyst + deterministic TradePolicy)
 - The schema split (LLMAnalysis + advisory LLMDecision wrapped in LLMOutput)
 - Shadow-mode analytics as the precondition for everything else (A.2 first)
 - The fail-closed hierarchy (degrade to gap-and-go fork, not to cloud-everywhere)
-- Position management at 5-min cadence
-- Bucket-stratified deployment gating
-- Sequencing: shadow analytics → schema → policy → M2 replay → Tier B/C → live
+- Position management at 5-min cadence with the five-layer profit-protection stack (Layer 1 ships first as a hotfix; Layer 5 deferred)
+- Bucket-stratified deployment gating using Calmar contribution, not just expected R
+- Kelly-fraction sizing within qty tiers once buckets prove out
+- Late-day exit bias modifier in TradePolicy
+- Sequencing: Layer 1 hotfix immediately → shadow analytics → schema → policy → M2 replay → Tier B/C → live
 
-After sign-off, implementation work begins on A.2.
+After sign-off, implementation work begins on Layer 1 (take-profit hotfix)
+in parallel with A.2 (shadow analytics).
