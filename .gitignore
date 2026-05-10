@@ -48,3 +48,6 @@ node_modules/
 package-lock.json
 package.json
 gap-and-go.tar.gz
+
+# Pytest tempdir artifacts (created by --basetemp option)
+pytest-cache-files-*/

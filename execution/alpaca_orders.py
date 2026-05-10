@@ -135,6 +135,7 @@ class OrderResult:
     side: Side
     ticker: str
     stop_price: float | None
+    take_profit_price: float | None = None  # Layer 1 v2: TP target if bracket submitted; None for OTO-only orders
 
 
 class AlpacaOrderClient:
@@ -244,15 +245,24 @@ class AlpacaOrderClient:
         qty: int,
         limit_price: float,
         stop_price: float,
+        take_profit_limit_price: float | None = None,
         client_order_id: str | None = None,
         time_in_force: str = "day",
     ) -> OrderResult:
-        """Submit a bracket order: entry (limit) + stop-loss as OCO children.
+        """Submit a bracket order: entry (limit) + stop-loss + optional take-profit.
 
         Why limit (not market) for the entry?
           Paper market orders fill at unrealistic prices in fast moves. A
           limit at the latest mid gives realistic fills and is what every
           serious intraday system uses. If unfilled by EOD it cancels.
+
+        Layer 1 of v2 profit-protection (see docs/LLM_MODEL_V2_REFINEMENTS.md
+        § B.1): when take_profit_limit_price is supplied, the order is
+        submitted as a full bracket (parent limit + stop_loss child + take_profit
+        child). Alpaca holds both children server-side, so a fast move that
+        prints at the TP price fills instantly with zero local latency. When
+        take_profit_limit_price is None, behavior is identical to v1: an OTO
+        order with stop_loss only (Bug C 2026-04-30 fix preserved).
 
         Args:
             ticker: equity symbol.
@@ -260,34 +270,74 @@ class AlpacaOrderClient:
             qty: positive integer share count.
             limit_price: entry limit price.
             stop_price: stop-loss trigger (already validated by risk module).
+            take_profit_limit_price: optional take-profit target. For buy orders,
+                must be strictly above limit_price; for sell orders, strictly
+                below. Out-of-range values raise ValueError before submit so
+                the operator gets a clear error rather than an opaque Alpaca 422.
             client_order_id: optional dedup key. Auto-generated if None.
             time_in_force: "day" (default) | "gtc" | "ioc" | "fok".
 
         Returns:
-            OrderResult with success flag and order_id (if accepted by Alpaca).
+            OrderResult with success flag, order_id, and take_profit_price
+            (None when no TP leg was attached).
         """
         if client_order_id is None:
             client_order_id = f"{ticker}-{side}-{int(time.time() * 1000)}"
 
-        # OTO (one-triggers-other): parent limit order with a single
-        # stop_loss child leg. order_class=bracket would require BOTH
-        # take_profit AND stop_loss; we only want stop_loss because exits
-        # come from the next opposite signal or the 15:55 ET flatten.
-        # Bug C fix 2026-04-30: was "bracket" before, which Alpaca rejects
-        # with HTTP 422 "bracket orders require take_profit.limit_price".
-        payload: dict[str, Any] = {
-            "symbol": ticker,
-            "qty": str(qty),
-            "side": side,
-            "type": "limit",
-            "limit_price": f"{limit_price:.2f}",
-            "time_in_force": time_in_force,
-            "order_class": "oto",
-            "stop_loss": {
-                "stop_price": f"{stop_price:.2f}",
-            },
-            "client_order_id": client_order_id,
-        }
+        # Defensive validation of TP/limit relationship — fail fast on
+        # caller bugs rather than getting an opaque 422 from Alpaca.
+        if take_profit_limit_price is not None:
+            if side == "buy" and take_profit_limit_price <= limit_price:
+                raise ValueError(
+                    f"take_profit_limit_price ${take_profit_limit_price:.2f} "
+                    f"must be strictly above limit_price ${limit_price:.2f} "
+                    f"for a buy bracket"
+                )
+            if side == "sell" and take_profit_limit_price >= limit_price:
+                raise ValueError(
+                    f"take_profit_limit_price ${take_profit_limit_price:.2f} "
+                    f"must be strictly below limit_price ${limit_price:.2f} "
+                    f"for a sell bracket"
+                )
+
+        # Build the order payload. Two shapes:
+        #   - "oto" (no TP supplied): preserves v1 behavior exactly.
+        #     order_class=bracket would require BOTH take_profit AND
+        #     stop_loss; oto with a single stop_loss child is what
+        #     Bug C 2026-04-30 fixed.
+        #   - "bracket" (TP supplied): full bracket with both children
+        #     held server-side. Activated by v2 Layer 1.
+        if take_profit_limit_price is not None:
+            payload: dict[str, Any] = {
+                "symbol": ticker,
+                "qty": str(qty),
+                "side": side,
+                "type": "limit",
+                "limit_price": f"{limit_price:.2f}",
+                "time_in_force": time_in_force,
+                "order_class": "bracket",
+                "take_profit": {
+                    "limit_price": f"{take_profit_limit_price:.2f}",
+                },
+                "stop_loss": {
+                    "stop_price": f"{stop_price:.2f}",
+                },
+                "client_order_id": client_order_id,
+            }
+        else:
+            payload = {
+                "symbol": ticker,
+                "qty": str(qty),
+                "side": side,
+                "type": "limit",
+                "limit_price": f"{limit_price:.2f}",
+                "time_in_force": time_in_force,
+                "order_class": "oto",
+                "stop_loss": {
+                    "stop_price": f"{stop_price:.2f}",
+                },
+                "client_order_id": client_order_id,
+            }
 
         try:
             data = await self._post("/v2/orders", payload)
@@ -300,6 +350,7 @@ class AlpacaOrderClient:
                 side=side,
                 ticker=ticker,
                 stop_price=stop_price,
+                take_profit_price=take_profit_limit_price,
             )
         except AlpacaAPIError as e:
             # Bug D fix: AlpacaAPIError already includes the response body's
@@ -310,6 +361,7 @@ class AlpacaOrderClient:
                 success=False, order_id=None, client_order_id=client_order_id,
                 error=str(e), submitted_qty=qty, side=side,
                 ticker=ticker, stop_price=stop_price,
+                take_profit_price=take_profit_limit_price,
             )
         except Exception as e:
             logger.exception("Order submit failed for %s", ticker)
@@ -317,6 +369,7 @@ class AlpacaOrderClient:
                 success=False, order_id=None, client_order_id=client_order_id,
                 error=str(e), submitted_qty=qty, side=side,
                 ticker=ticker, stop_price=stop_price,
+                take_profit_price=take_profit_limit_price,
             )
 
     # ------------------------------------------------------------------
