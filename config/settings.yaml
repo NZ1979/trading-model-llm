@@ -91,6 +91,8 @@ risk:
   stop_atr_min_pct: 1.0                            # floor on ATR-based stop (% of entry)
   stop_atr_max_pct: 5.0                            # cap on ATR-based stop (% of entry)
   risk_per_trade_pct: 0.5                          # max loss per trade as % of equity (used by size_from_risk)
+  take_profit_enabled: false                       # Layer 1 v2: when true, attach a take-profit leg to every bracket order. Default false until validated; flip to true to activate.
+  take_profit_atr_multiple: 2.0                    # TP distance from entry as N x daily ATR(14). With stop_atr_multiplier=1.5 and tp=2.0 the reward/risk ratio is ~1.33; raise to 3.0 for ~2:1 R/R
 
 logging:
   level: INFO                                      # DEBUG | INFO | WARNING | ERROR

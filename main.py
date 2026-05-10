@@ -247,6 +247,24 @@ class TradingPlatform:
                 "CREATE INDEX IF NOT EXISTS idx_orders_ticker_ts "
                 "ON orders(ticker, ts DESC)"
             )
+            # Shadow outcomes table: forward returns, MAE/MFE, would-stop/target.
+            # Populated by scripts/backfill_shadow_outcomes.py and eventually a
+            # live follower. See docs/LLM_MODEL_V2_REFINEMENTS.md sec A.2 (in
+            # the trading-model-llm fork) and strategy/llm/metrics.py.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS shadow_outcomes ("
+                "decision_id INTEGER PRIMARY KEY, "
+                "return_5m_pct REAL, return_15m_pct REAL, return_30m_pct REAL, "
+                "return_60m_pct REAL, return_eod_pct REAL, "
+                "mae_pct REAL, mfe_pct REAL, "
+                "mae_at_minutes INTEGER, mfe_at_minutes INTEGER, "
+                "stop_would_hit INTEGER, stop_hit_at_minutes INTEGER, "
+                "target_would_hit INTEGER, target_hit_at_minutes INTEGER, "
+                "first_touch TEXT, "
+                "avg_spread_bps REAL, estimated_slippage_bps REAL, "
+                "populated_at REAL NOT NULL, horizon_complete TEXT NOT NULL, "
+                "FOREIGN KEY(decision_id) REFERENCES decisions(id))"
+            )
 
     # ------------------------------------------------------------------
     # Boot
@@ -918,19 +936,44 @@ class TradingPlatform:
             self._log_order_rejection(decision, qty, latest_price, check.reason, decision_id)
             return
 
-        # Submit bracket
+        # Compute take-profit price (Layer 1 of v2 profit-protection).
+        # When risk.take_profit_enabled is True, attach a TP leg to the bracket
+        # order at limit_price plus or minus tp_atr_multiple times daily ATR(14).
+        # Broker holds the TP server-side; fast moves to target fill instantly
+        # without waiting for the next 5-min eval. When disabled (default),
+        # behavior is identical to v1 (OTO with stop only).
+        # See docs/LLM_MODEL_V2_REFINEMENTS.md sec B.1 Layer 1 (in trading-model-llm fork).
+        tp_price = None
+        risk_cfg = self.config["risk"]
+        if risk_cfg.get("take_profit_enabled", False):
+            tp_atr_multiple = float(risk_cfg.get("take_profit_atr_multiple", 2.0))
+            if daily_atr > 0:
+                tp_distance = tp_atr_multiple * daily_atr
+                if side == "buy":
+                    tp_price = round(latest_price + tp_distance, 2)
+                else:
+                    tp_price = round(latest_price - tp_distance, 2)
+            else:
+                logger.warning(
+                    "%s: take_profit_enabled but daily_atr=0; submitting without TP leg",
+                    decision.ticker,
+                )
+
+        # Submit bracket (TP leg attached if tp_price is not None)
         result = await self.order_client.submit_bracket_order(
             ticker=decision.ticker,
             side=side,
             qty=check.quantity,
             limit_price=round(latest_price, 2),
             stop_price=check.stop_price,
+            take_profit_limit_price=tp_price,
         )
         if result.success:
+            tp_log = "" if tp_price is None else " tp $%.2f" % tp_price
             logger.info(
-                "ORDER %s %s %d @ ~$%.2f (stop $%.2f, %d%% pos / %d%% total)",
+                "ORDER %s %s %d @ ~$%.2f (stop $%.2f%s, %d%% pos / %d%% total)",
                 result.side.upper(), result.ticker, result.submitted_qty,
-                latest_price, result.stop_price,
+                latest_price, result.stop_price, tp_log,
                 int(check.position_pct), int(check.total_exposure_pct),
             )
         else:
