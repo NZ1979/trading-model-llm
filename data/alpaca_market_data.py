@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -62,6 +63,13 @@ class AlpacaBarStream:
         self._api_secret = api_secret
         self._symbols = {s.upper() for s in symbols}
         self._on_bar = on_bar
+        # Diagnostic throughput counters (added 2026-05-12 to investigate
+        # silent bar-flow failure). Periodic log every 60s shows messages
+        # and bars received, distinguishing "WS dead" from "WS alive but
+        # no bars" from "bars flowing but downstream silent".
+        self._msg_count_window = 0
+        self._bar_count_window = 0
+        self._window_start_monotonic = 0.0
         self._feed = feed
         self._url = ALPACA_BARS_WS_SIP if feed == "sip" else ALPACA_BARS_WS_IEX
         self._running = False
@@ -101,6 +109,23 @@ class AlpacaBarStream:
         )
 
     async def _process_message(self, raw: str | bytes) -> None:
+        # Throughput heartbeat — log message/bar counts every 60s so we
+        # can distinguish WS-dead vs WS-alive-but-no-bars vs bars-flowing.
+        now = time.monotonic()
+        if self._window_start_monotonic == 0.0:
+            self._window_start_monotonic = now
+        elif now - self._window_start_monotonic >= 60.0:
+            logger.info(
+                "Alpaca WS throughput: last %.1fs -> %d messages, %d bars",
+                now - self._window_start_monotonic,
+                self._msg_count_window,
+                self._bar_count_window,
+            )
+            self._msg_count_window = 0
+            self._bar_count_window = 0
+            self._window_start_monotonic = now
+
+        self._msg_count_window += 1
         try:
             messages = json.loads(raw)
         except json.JSONDecodeError:
@@ -111,6 +136,7 @@ class AlpacaBarStream:
             if msg.get("T") != "b":
                 continue  # not a bar
 
+            self._bar_count_window += 1
             try:
                 # Alpaca bar fields:
                 #   T="b", S=symbol, t=ISO timestamp (start of minute),

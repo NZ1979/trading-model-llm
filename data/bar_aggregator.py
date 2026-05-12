@@ -29,6 +29,7 @@ downstream treat low-volume bars normally.
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
@@ -59,6 +60,11 @@ class BarAggregator:
         self._buffers: dict[str, list[MinuteBar]] = defaultdict(list)
         # Per-symbol: start timestamp of the currently-open 5-min window
         self._window_start: dict[str, datetime] = {}
+        # Throughput counters (added 2026-05-12 for diagnosis of silent
+        # bar flow failure). Periodic log every 60s shows 5-min bars
+        # emitted across all symbols.
+        self._emit_count_window = 0
+        self._window_start_monotonic = 0.0
 
     async def on_minute_bar(self, bar: MinuteBar) -> None:
         """Process an incoming 1-min bar.
@@ -100,6 +106,19 @@ class BarAggregator:
         bars = self._buffers.get(symbol)
         if not bars:
             return
+        # Throughput heartbeat: log how many 5-min bars emitted per 60s
+        now = time.monotonic()
+        if self._window_start_monotonic == 0.0:
+            self._window_start_monotonic = now
+        elif now - self._window_start_monotonic >= 60.0:
+            logger.info(
+                "BarAggregator throughput: last %.1fs -> %d 5-min bars emitted",
+                now - self._window_start_monotonic,
+                self._emit_count_window,
+            )
+            self._emit_count_window = 0
+            self._window_start_monotonic = now
+        self._emit_count_window += 1
         five = FiveMinBar(
             symbol=symbol,
             timestamp=window_start,

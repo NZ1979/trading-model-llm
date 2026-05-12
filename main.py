@@ -156,6 +156,12 @@ class TradingPlatform:
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        # Diagnostic throughput counters (added 2026-05-12). Periodic log
+        # every 60s shows signal evaluation activity, so a silent failure
+        # downstream of the bar handler becomes visible.
+        self._eval_count_window = 0
+        self._actionable_count_window = 0
+        self._eval_window_start_monotonic = 0.0
         # Phase B: prefer dynamic watchlist if recent (<7 days); else fall
         # back to settings.yaml's static list. Dynamic file is rebuilt
         # daily at 08:30 ET by `_run_dynamic_watchlist_refresh`. SIP
@@ -772,6 +778,23 @@ class TradingPlatform:
             in Phase 6; one entry per ticker per day until flattened)
           - risk validator approves the sized order
         """
+        # Throughput heartbeat: every 60s log evaluate_and_execute calls
+        # and how many returned non-Hold. A silent market is N>0 evals
+        # with 0 actionable; a broken pipeline is N=0 evals.
+        now = time.monotonic()
+        if self._eval_window_start_monotonic == 0.0:
+            self._eval_window_start_monotonic = now
+        elif now - self._eval_window_start_monotonic >= 60.0:
+            logger.info(
+                "SignalEngine throughput: last %.1fs -> %d evals, %d actionable",
+                now - self._eval_window_start_monotonic,
+                self._eval_count_window,
+                self._actionable_count_window,
+            )
+            self._eval_count_window = 0
+            self._actionable_count_window = 0
+            self._eval_window_start_monotonic = now
+        self._eval_count_window += 1
         df = state.to_dataframe()
         if df.empty:
             return  # nothing to evaluate yet
@@ -824,6 +847,8 @@ class TradingPlatform:
 
         # 6. Log decision (dedup repeated identical Holds)
         is_actionable = decision.action != "Hold"
+        if is_actionable:
+            self._actionable_count_window += 1
         is_changed = (
             decision.action != state.last_decision_action
             or decision.setup != state.last_decision_setup

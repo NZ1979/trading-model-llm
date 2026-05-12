@@ -81,7 +81,13 @@ async def _fetch_minute_bars(
                 return None
             data = await r.json()
             return data.get("results", []) or []
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError,
+            json.JSONDecodeError, ValueError) as e:
+        # json.JSONDecodeError: Polygon occasionally returns truncated/malformed
+        # JSON bodies, especially on large multi-day responses. Without this in
+        # the except list, the exception escapes asyncio.gather and kills the
+        # whole batch (causing 0 PM contexts and 0 trades for the day).
+        # ValueError covers older aiohttp versions where .json() raises ValueError.
         logger.warning("Polygon fetch error for %s: %s", ticker, e)
         return None
 
@@ -210,7 +216,21 @@ async def build_thresholds(
                 return
             thresholds[ticker] = round(t, 2)
 
-        await asyncio.gather(*[process(t) for t in tickers])
+        # return_exceptions=True so a single unexpected exception in one
+        # ticker's process() doesn't cancel the gather and zero out the
+        # whole batch. Per Rule 18 (fail-loud): we still log every
+        # raised exception, but at WARNING (not crash) so the daily
+        # routine continues to produce thresholds for the other 499
+        # tickers.
+        results = await asyncio.gather(
+            *[process(t) for t in tickers], return_exceptions=True
+        )
+        for ticker, result in zip(tickers, results):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "pm_rvol_thresholds process(%s) raised %s: %s",
+                    ticker, type(result).__name__, result,
+                )
 
     return thresholds
 
