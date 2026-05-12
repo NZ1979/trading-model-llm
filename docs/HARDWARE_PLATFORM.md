@@ -30,21 +30,22 @@ This GPU runs models that previously required cloud APIs:
 | Model | Approx 4-bit VRAM | Throughput on RTX PRO 5000 (est.) | Quality estimate |
 |---|---|---|---|
 | Llama 3.3 70B Instruct | ~38GB | ~50-80 tok/s | Top open-source for general reasoning |
-| Qwen 3.6-27B Instruct | ~40GB | ~45-70 tok/s | Top open-source for structured-output tasks |
+| Qwen 3.6-27B Instruct (dense) | ~17GB | ~120-180 tok/s | **Production target** — flagship-tier 27B dense (Apr 2026), 262k native context, strong JSON discipline |
 | DeepSeek R1 Distill 70B | ~38GB | ~50-80 tok/s | Chain-of-thought reasoning specifically |
 | Llama 3.1 8B Instruct | ~5GB | ~150+ tok/s | Fast, less capable; useful for pre-filter or screening |
 | Qwen 2.5 32B Instruct | ~17GB | ~100 tok/s | Balanced; large headroom for batching |
 
-Headroom at 70B 4-bit: ~8GB for KV cache and activations. Enough for
-modest batching (4-8 concurrent requests). At 32B 4-bit, ~30GB headroom
-allows much higher batching (16-32 concurrent), trading per-decision
-quality for cycle throughput.
+Headroom at 27B 4-bit: ~31GB free for KV cache, activations, and batching.
+Enough to batch 16-32 concurrent requests at moderate context, or run at
+full 262k single-stream context, or host a second smaller model side-by-side.
+The 48GB card is overprovisioned for Qwen 3.6-27B — meaningful margin for
+future model swaps up to ~38GB (Llama 3.3 70B fits with ~10GB of headroom).
 
-The model choice between 32B and 70B is empirical — M2 replay can
-compare decisions from each on the same context and we measure the
-P&L difference. Initial production target: **Qwen 3.6-27B Instruct**
-(strong JSON-output discipline matters for our schema-validated
-pipeline) with Llama 3.3 70B as a fallback comparison point.
+Initial production target: **Qwen 3.6-27B Instruct** (dense). Strong
+JSON-output discipline matters for our schema-validated pipeline, and the
+262k native context window means we can pass full daily-bar histories
+without truncation. Llama 3.3 70B remains a comparison point if M2 replay
+surfaces a quality gap at 27B; the 48GB GPU has the VRAM to load it.
 
 ### 192GB RAM removes the data-loading bottleneck
 
@@ -92,7 +93,7 @@ for the full design. Cost summary:
 
 | Path | Backend | Volume | Cost/day |
 |---|---|---|---|
-| Tier 1 (every candidate, every cycle) | Qwen 3.6-27B local | 30-200 × 78 cycles | ~$0.20 (electricity at $0.12/kWh × 200W × 8h) |
+| Tier 1 (every candidate, every cycle) | Qwen 3.6-27B local | 30-200 × 78 cycles | ~$0.10 (electricity at $0.12/kWh × ~100W × 8h) |
 | Tier 2 (selective escalation) | Sonnet 4.5 | 5-15 calls/day, capped at 25 | ~$0.10-0.30 (with prompt caching) |
 | Tier 3 (weekly Opus audit) | Opus 4.6 | ~12K decisions/audit | ~$2-5 amortized |
 | **Live operating** | | | **~$2-5/day, $60-150/month** |
@@ -115,15 +116,15 @@ operating cost.
 
 ### Latency model rewrite
 
-| Path | Old (Anthropic) | New (local 70B) |
+| Path | Old (Anthropic) | New (local Qwen 3.6-27B) |
 |---|---|---|
-| Single call | 700-1500ms (network + inference) | 3-5s (250 output tokens × 50-80 tok/s) |
-| 30-candidate cycle (concurrent) | ~2s (10-way concurrency) | ~5-10s (4-8 way batching) |
-| 500-candidate cycle | not feasible (cost) | 60-120s (depending on batching) |
+| Single call | 700-1500ms (network + inference) | 1.5-2.5s (250 output tokens × 120-180 tok/s) |
+| 30-candidate cycle (concurrent) | ~2s (10-way concurrency) | ~2-4s (16-32 way batching) |
+| 500-candidate cycle | not feasible (cost) | 20-40s (depending on batching) |
 
-Local is *slower per call* than Anthropic but *cheaper enough that we
-can do many more calls*. For 5-min cycle evaluation, a 60-120s full-watchlist
-sweep is comfortable — we have 300s of cycle time before the next bar.
+Local at 27B is *comparable per call* to Anthropic with substantially
+larger batching headroom on the 48GB GPU. A 20-40s full-watchlist sweep
+leaves substantial cycle-time margin — we have 300s before the next bar.
 
 ### Live trading deployment options
 

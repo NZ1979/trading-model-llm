@@ -313,7 +313,7 @@ children.push(bulletRich([
 ]));
 children.push(bulletRich([
   new TextRun({ text: "Latency bounded. ", bold: true }),
-  new TextRun({ text: "Tier 1 local adds 3-5s per candidate; Tier 2 adds another 1-2s but only on the 5-15 candidates per day where it fires. Net cycle time is unchanged." }),
+  new TextRun({ text: "Tier 1 local adds 1.5-2.5s per candidate at Qwen 3.6-27B speeds; Tier 2 adds another 1-2s but only on the 5-15 candidates per day where it fires. Net cycle time is unchanged." }),
 ]));
 children.push(p("And three reasons it is strictly better than running Qwen alone:"));
 children.push(bulletRich([
@@ -414,7 +414,7 @@ children.push(h2("5.3 Cost summary"));
 children.push(makeTableCustom(
   ["Path", "Backend", "Volume", "Cost / day"],
   [
-    ["Tier 1 (local)", "Qwen 3.6-27B local", "30-200 × 78 cycles", "~$0.20 (electricity)"],
+    ["Tier 1 (local)", "Qwen 3.6-27B local", "30-200 × 78 cycles", "~$0.10 (electricity)"],
     ["Tier 1 fallback", "Anthropic Haiku/Sonnet", "Only on workstation outage", "$5-20 during outage"],
     ["Tier 2 escalation", "Anthropic Sonnet", "5-15 / day (cap 25)", "~$0.10-0.30"],
     ["Tier 3 weekly audit", "Anthropic Opus", "~12K decisions per audit", "~$2-5 amortized"],
@@ -437,14 +437,14 @@ children.push(bullet("LM Studio on the workstation (pre-installed on the Puget b
 children.push(bullet("OpenSSH client for VPS deploys"));
 
 children.push(h2("6.2 Hardware floor"));
-children.push(bullet("Workstation: 48 GB VRAM minimum to run Qwen 3.6-27B at 4-bit. 32B variants run on lower-VRAM GPUs but trade decision quality for size"));
+children.push(bullet("Workstation: 48 GB VRAM target for Qwen 3.6-27B at 4-bit (~17 GB used, ~31 GB headroom for batching, long context, model swaps up to 70B-class). Lower-VRAM GPUs can host 27B but lose batching headroom."));
 children.push(bullet("Workstation RAM: 64 GB sufficient; 192 GB lets the M2 replay harness keep the entire 1-min bar dataset in memory"));
 children.push(bullet("VPS: 4 vCPU / 8 GB RAM is more than enough; CPX21 (3 vCPU, 4 GB) handles the existing trader plus the LLM client without issue"));
 children.push(bullet("Network: outbound HTTPS (port 443) to api.anthropic.com, paper-api.alpaca.markets, api.polygon.io, finnhub.io"));
 
 children.push(h2("6.3 Storage"));
 children.push(bullet("Workstation: 6 TB NVMe across three drives (OS + code, market data archives + model weights, cache)"));
-children.push(bullet("Single 70B 4-bit model weight file is approximately 40 GB; budget room for two or three variants"));
+children.push(bullet("Qwen 3.6-27B 4-bit weight file is approximately 17 GB; 70B-class fallback weights run ~40 GB. Budget for two or three variants on the 4 TB data drive."));
 children.push(bullet("VPS: 75 GB total; deploy + database + journals use under 5 MB per day"));
 
 children.push(h2("6.4 Required environment variables"));
