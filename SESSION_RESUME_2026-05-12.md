@@ -16,9 +16,23 @@ Asyncio orchestrator pattern. `main.py` boots a news firehose, an Alpaca SIP bar
 
 ## Production state today
 
-- **VPS:** `5.161.199.155` (Hetzner Ashburn, CPX21). Runs the gap-and-go fork on Alpaca paper account `PA3REQ1LMPKO`. `llm.enabled: false`. Code at `/opt/trader/app`, systemd unit `trader.service`, secrets at `/etc/trading-platform/env`.
-- **Large Cap account `PA3QAZ941NFN`** is reserved for when the LLM model deploys. Must not co-exist with the gap-and-go fork on a single `trader.service`. Verify which fork's code runs where before recommending any infra action.
-- **Watchlist:** full S&P 500 (503 symbols) for gap-and-go. LLM-specific watchlist TBD.
+### VPS (running)
+
+- **`5.161.199.155`** (Hetzner Ashburn, CPX21). Runs the **gap-and-go fork** (rule-based, llm.enabled: false) on Alpaca paper account `PA3REQ1LMPKO`. Code at `/opt/trader/app`, systemd unit `trader.service`, secrets at `/etc/trading-platform/env`.
+- **Large Cap account `PA3QAZ941NFN`** reserved for the LLM model deployment. Must not co-exist with the gap-and-go fork on a single `trader.service`.
+
+### Workstation (operational since ~2026-05-11 evening MDT)
+
+- **Puget Z890 C132-XL.** Intel Core Ultra 7 270K Plus 24-core, **RTX PRO 5000 Blackwell 48GB VRAM**, 192GB DDR5-4800 RAM, 6TB NVMe Gen4 across 3 drives, Win11 Pro. Full specs in `docs/HARDWARE_PLATFORM.md`.
+- **LM Studio installed and operational.** Qwen 3.6-27B Instruct loaded.
+- **Qwen 3.6-27B benchmarked 2026-05-12:** 43.9 and 48.2 tok/s on two contexts at single-stream, thinking-disabled tool-use. Single 250-token call ≈ 5.5s; 500-token call ≈ 11s. Real throughput is lower than the pre-arrival estimate of 120-180 tok/s but well within the 300s cycle budget for batched candidate evaluation.
+- **`LocalClient` (LM Studio OpenAI-compat) fully implemented** in `strategy/llm/clients.py`. Includes Qwen 3.6-specific handling: `/no_think` injection to suppress thinking-mode (which otherwise causes empty tool_calls with finish_reason=stop), XML tool-call fallback parser for Qwen's native `<function=submit_decision>...</function>` format, temperature=0 for determinism.
+- **`qwen_local` backend wired** in `strategy/llm/factory.py`. Construction is cheap; failures surface at evaluate-time per Rule 18.
+- **Verify + smoke scripts** in place: `scripts/verify_qwen_local.py` (server + model loaded + PONG roundtrip), `scripts/smoke_test_qwen_decision.py` (end-to-end LLMDecision generation).
+
+### Watchlist + data feeds
+
+- **Watchlist:** full S&P 500 (503 symbols) for gap-and-go on VPS. LLM-specific watchlist TBD when LLM model goes live.
 - **Active data feeds:** Alpaca SIP bars, Alpaca News, Polygon REST historical, Finnhub earnings calendar.
 - **Dormant:** Databento (canceled), Polygon options walls (deferred).
 
@@ -41,19 +55,20 @@ Commits landed on `origin/main` today:
 
 ## What's left before live trading
 
-### Phase 1 — V2 architectural foundation (none built yet)
+### Phase 1 — V2 architectural foundation
 
-| # | Task | Effort | Notes |
-|---|---|---|---|
-| 1 | Layer 1 take-profit hotfix | ~0.5 day | Wire `take_profit_limit_price` into `execution/alpaca_orders.py::submit_bracket_order` callers. Ships independently. |
-| 2 | A.2 Shadow analytics infrastructure | 1-2 days | `shadow_outcomes` table + day_1/2/3_eod_pct extensions + follower process + initial M2 replay |
-| 3 | `position_trace` ledger | 1 day | Event-trace table + decisions schema additions (holding_day, version fields, bucket_key_used) |
-| 4 | A.1 Schema split | 2 days | `LLMAnalysis` Pydantic class, prompt template additions, parser updates. Shadow mode for one week before live reliance. |
-| 5 | A.3 Health state machine | 1 day | HealthState dataclass, periodic probes, T1-down branch falls back to gap-and-go fork |
-| 6 | TradePolicy module + tests | 2 days | Pure-deterministic, fully unit-tested, hierarchical bucket lookup per Q1 |
-| 7 | M2 replay with v2 | 3 days | 60-day replay producing per-bucket expectancy report |
+| # | Task | Status | Effort | Notes |
+|---|---|---|---|---|
+| 1 | Layer 1 take-profit | **Code wired, feature flag OFF** | flip + verify | `execution/alpaca_orders.py::submit_bracket_order` accepts `take_profit_limit_price`. Callers don't pass it yet. To activate: set `risk.take_profit_enabled: true` in `config/settings.yaml` AND update the caller in `main.py` (or wherever bracket orders are submitted) to compute and pass the TP price. |
+| 2 | A.2 Shadow analytics | **Schema exists, not populated** | 1 day to first populated run | `shadow_outcomes` table created at boot in `main.py`. `scripts/backfill_shadow_outcomes.py` + `scripts/analyze_shadow_outcomes.py` exist. Run the backfill against the existing decisions to seed initial rows. Then extend with day_1/2/3_eod_pct columns per Q2 resolution. |
+| 3 | `position_trace` ledger (Q2) | Not built | 1 day | Event-trace table + decisions schema additions (holding_day, four version fields, bucket_key_used) |
+| 4 | A.1 Schema split (`strategy/llm/analysis.py`) | Not built | 2 days | `LLMAnalysis` Pydantic class, prompt template additions, parser updates. Shadow mode for one week before live reliance. |
+| 5 | A.3 Health state machine | Not built | 1 day | `HealthState` dataclass, periodic probes, T1-down branch falls back to gap-and-go fork |
+| 6 | TradePolicy module (`strategy/llm/policy.py`) | Not built | 2 days | Pure-deterministic, fully unit-tested, hierarchical bucket lookup per Q1 |
+| 7 | Wire `signal_engine.evaluate` into `main.py` hot path | Not done | 0.5 day | `main.py` currently calls only the rule-based dispatcher; the v1/v2 LLM signal engine path is not yet called from `on_5min_bar`. Will need wiring once policy.py exists. |
+| 8 | M2 replay with v2 | Not started | 3 days | 60-day replay producing per-bucket expectancy report |
 
-Phase 1 estimate: **~10 days focused work**.
+Phase 1 revised estimate: **~9 days focused work** (Layer 1 take-profit is now mostly a config flip + a caller wiring, not a from-scratch implementation).
 
 ### Phase 2 — Quality layers (Tier B)
 
@@ -85,13 +100,15 @@ Phase 2 estimate: **~10-12 days**.
 
 Phase 3 estimate: **~7-10 days**.
 
-### Phase 4 — Hardware bridge (runs in parallel)
+### Phase 4 — Hardware bridge (DONE except trader-to-workstation network plumbing)
 
-| # | Task | Status |
-|---|---|---|
-| 1 | Workstation arrival + Qwen 3.6-27B local inference set up | Awaiting hardware |
-| 2 | `LocalClient` implementation (currently raises `NotImplementedError`) | Blocked on hardware |
-| 3 | VPS↔workstation network plumbing + fail-closed | Blocked on hardware |
+| # | Task | Status | Notes |
+|---|---|---|---|
+| 1 | Workstation arrival + Qwen 3.6-27B local inference set up | **COMPLETE** (2026-05-11/12) | Puget Z890 on-site; LM Studio + Qwen 3.6-27B benchmarked at 43-48 tok/s |
+| 2 | `LocalClient` implementation | **COMPLETE** (commit `b0d6c95` on 2026-05-11) | `strategy/llm/clients.py::LocalClient` with Qwen 3.6 quirks handled; `qwen_local` backend wired in factory.py |
+| 3 | Qwen verify + smoke scripts | **COMPLETE** | `scripts/verify_qwen_local.py`, `scripts/smoke_test_qwen_decision.py` |
+| 4 | Flip `t1.backend` from `haiku_stand_in` to `qwen_local` in `config/settings.yaml` | Not done | Pending Phase 1 completion; needs `llm.enabled: true` and `signal_engine.evaluate` wired into `main.py` first |
+| 5 | VPS↔workstation network plumbing (heartbeat + decision shipping if trader stays on VPS) | Not built | See Phase 3 C.4. Only needed if running Option A from `HARDWARE_PLATFORM.md` (trader on VPS, LLM on workstation). Skip if trader moves to workstation (Option B). |
 
 ### Phase 5 — Live paper deployment
 
@@ -101,7 +118,7 @@ Phase 3 estimate: **~7-10 days**.
 
 ## Total estimate to first live LLM-driven paper trade
 
-**4-6 weeks of focused work**, depending on workstation arrival and M2 replay findings. If no buckets show positive expectancy after the first 30-day M2 replay, that's itself a finding (the question becomes "is the LLM adding value at all, or does the prompt/model need to change") and the timeline extends.
+**4-6 weeks of focused work** from 2026-05-12, depending on M2 replay findings. Workstation+Qwen no longer on the critical path (operational since Mon 05/11). If no buckets show positive expectancy after the first 30-day M2 replay, that's itself a finding (the question becomes "is the LLM adding value at all, or does the prompt/model need to change") and the timeline extends.
 
 ## Open implementation tasks (carried from this session)
 
@@ -138,11 +155,14 @@ All five design questions resolved and committed. Only implementation task #6 ca
 
 ## Orienting phrases to start a new session
 
-Say one of these to a fresh Cowork session pointed at `C:\trading\LLM model\` after the model finishes reading this file:
+Say one of these to a fresh Cowork session pointed at `C:\trading\LLM model\`:
 
-- **"Start Phase 1 #1: implement the Layer 1 take-profit hotfix."** Fastest immediate-value change; ships independently of v2 architecture.
-- **"Start Phase 1 #2: build the shadow_outcomes follower process."** This is the precondition for every measurement that comes after; nothing else is meaningful without it.
-- **"Pick up Task #6: do the EH-informed RTH earnings wiring."** Self-contained 1-2 day feature task using already-installed Finnhub calendar + Phase B watchlist + Phase C PM RVOL infra.
-- **"Walk me through the V2 implementation sequencing again."** If the order of Phase 1 work needs fresh framing.
-- **"What's the current production state of 5.161.199.155?"** If returning after a few days and wanting to confirm the gap-and-go fork is still healthy before touching anything in the LLM model fork.
-- **"Verify signal evaluation worked at market open."** If returning during/after a trading session and wanting to confirm the production gap-and-go fork fired decisions correctly.
+- **"Activate Layer 1 take-profit."** Flip `risk.take_profit_enabled` to true and wire the caller in `main.py` to compute and pass `take_profit_limit_price`. Code path already in place. ~0.5 day.
+- **"Run the shadow_outcomes backfill against current decisions."** `python scripts/backfill_shadow_outcomes.py` then `python scripts/analyze_shadow_outcomes.py`. Seeds the analytics table from existing v1 decisions; precondition for measuring anything.
+- **"Build `strategy/llm/policy.py` (TradePolicy module)."** The largest single Phase 1 task. Implements Q1's hierarchical bucket lookup + the decision logic. Pure-deterministic, unit-testable. ~2 days.
+- **"Build `strategy/llm/analysis.py` (LLMAnalysis schema)."** Q-resolution A.1: Pydantic LLMAnalysis class + LLMOutput wrapper + prompt template additions. ~2 days.
+- **"Add `position_trace` table and the schema additions on `decisions`."** Per Q2 + Q4 resolutions: holding_day, four version fields, bucket_key_used. ~1 day.
+- **"Verify Qwen Tier 1 is still serving correctly."** Runs `python scripts/verify_qwen_local.py` and reports.
+- **"Pick up Task #6: EH-informed RTH earnings wiring."** Finnhub calendar → watchlist_builder + pm_rvol_thresholds. ~1-2 days.
+- **"Walk me through the v2 implementation sequencing again with current state."** If the priority order needs fresh framing given today's snapshot.
+- **"What's running on the VPS right now?"** Status check on the gap-and-go fork at `5.161.199.155`.
