@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Two project-specific docs in the repo root contain non-negotiable context — read them before any operational instruction:
 
-- `CLAUDE_PREFLIGHT.md` — 23 numbered rules covering credential handling (Rules 21–22), credential-leak prevention in logs (URL-based auth + httpx logging), execution-context labelling for every command block (Rule 16), placeholder/assumption auditing (Rule 20), fail-loud error handling (Rule 18), and verification-before-conclusion (Rule 14). These are corrections to prior failures; treat them as hard requirements, not style suggestions.
+- `CLAUDE_PREFLIGHT.md` — 24 numbered rules covering credential handling (Rules 21–22), credential-leak prevention in logs (URL-based auth + httpx logging), execution-context labelling for every command block (Rule 16), placeholder/assumption auditing (Rule 20), fail-loud error handling (Rule 18), verification-before-conclusion (Rule 14), and bash-mount-staleness on Windows-side files (Rule 24). These are corrections to prior failures; treat them as hard requirements, not style suggestions.
 - `PROJECT_BLUEPRINT.md` — the running platform's deployment state, locked-in vendor stack, daily timeline, signal logic, and "do not re-debate" facts (e.g. Polygon Stocks Starter is 15-min delayed and used for historical only; Databento was canceled).
 - `docs/LLM_MODEL_CHARTER.md` and `docs/LLM_SIGNAL_INTERFACE.md` — what makes this fork different from the base. The fork replaces the rule-based signal engine with a tiered LLM signal generator.
 
@@ -41,6 +41,10 @@ Before asking the user to paste back the output of any command, ask: "Could the 
 ### Rule 23: Verify actual system date/time before any time-anchored claim
 
 Before ANY statement that includes "today", "tomorrow", "this morning", "market is open/closed", "we have N hours", a deadline, or a market-session reference, run `date && TZ=America/New_York date` and reason from the fresh values. Session env headers drift over long sessions; remembered framing from earlier in the conversation goes stale. State the verified time inline so the claim is auditable: e.g., "It is now Tue 10:33 AM EDT; market has been open for 1h 3m." Trading-platform market hours are 09:30–16:00 ET on weekdays excluding US market holidays.
+
+### Rule 24: The Cowork bash mount can serve stale snapshots of Windows-side files
+
+The file tools (Read/Write/Edit) and the bash sandbox mount at `/sessions/<id>/mnt/LLM model/` can disagree about file content for paths under `C:\trading\LLM model\`. The bash mount can be hours stale even after a successful Edit returns "file updated." NEVER claim "verified on disk" based on a Read spot-check; Read and Edit share the same in-process view, so a clean Read after a clean Edit proves only that the in-process buffer is consistent, not that the Windows disk received the write. NEVER run `git add`/`commit`/`push` from the bash sandbox against Windows-side files. Verification of disk state for Windows-side files runs from PowerShell on the user's workstation: `(Get-Content <file> | Measure-Object -Line).Lines` plus `Get-Content -Tail 5`, compared against the Edit-tool's expected values. Bash `sync` does not refresh the mount. Include `Remove-Item .git\index.lock -ErrorAction SilentlyContinue` in any PowerShell commit block since the bash sandbox often leaves a 0-byte `.git/index.lock` that Windows-side git operations cannot work around until cleared.
 
 ---
 
