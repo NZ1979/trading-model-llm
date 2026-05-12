@@ -108,7 +108,7 @@ class ReplayConfig:
 
     # Tiered backend selection (mirrors live architecture)
     t1_backend: str = "qwen_local"         # "qwen_local" | "llama_local" | "haiku" (cloud only for ablation)
-    t1_model_id: str = "qwen2.5-72b-instruct-q4"
+    t1_model_id: str = "qwen3.6-27b-instruct-q4"
     t2_enabled: bool = True                # Tier 2 escalation
     t2_model_id: str = "claude-sonnet-4-5"
     t2_max_per_day: int = 25               # daily escalation budget cap
@@ -267,7 +267,7 @@ Cache layout:
 ```
 .replay_cache/
     qwen_local/
-        qwen2.5-72b-instruct-q4/
+        qwen3.6-27b-instruct-q4/
             <prompt_v1.0_sha>.json
     anthropic/
         claude-sonnet-4-5/
@@ -480,7 +480,7 @@ python scripts/replay_with_llm.py \
     --end 2026-04-30 \
     --tickers watchlist \
     --t1-backend qwen_local \
-    --t1-model qwen2.5-72b-instruct-q4 \
+    --t1-model qwen3.6-27b-instruct-q4 \
     --t2-enabled \
     --t2-model claude-sonnet-4-5 \
     --t3-enabled \
@@ -581,12 +581,12 @@ scope) assumed a developer laptop. The dedicated workstation
 - **6-12 month replays** instead of 30 days. 192GB RAM holds the full bar dataset in memory; 6TB NVMe makes initial data loading fast; local LLM inference is ~$0 so we can replay without budget ceiling.
 - **Full Russell 3000 ticker scope** instead of just the watchlist. The pre-filter narrows candidates per cycle but the universe of candidates can be all 3000 names.
 - **Parameter sweeps**. 24-core CPU runs 16-24 parallel backtests; sweeping ATR multiplier × confidence threshold × pre-filter PM RVOL is feasible in hours.
-- **Multiple model variants in parallel comparisons**. Run the same replay against Qwen 72B, Llama 3.3 70B, Qwen 32B, Sonnet (cloud), Haiku (cloud); compare quality and throughput.
+- **Multiple model variants in parallel comparisons**. Run the same replay against Qwen 3.6-27B, Llama 3.3 70B, Qwen 32B, Sonnet (cloud), Haiku (cloud); compare quality and throughput.
 - **Walk-forward validation**. Train prompt on first 80% of period, test on last 20%, slide window forward. Standard ML practice; previously cost-prohibitive.
 
 ### Phased rollout (within M2)
 
-- **M2.1-M2.4 (initial scope, ~3 days)**: 30-day replay, watchlist tickers, single LLM model (Qwen 72B local), no parameter sweep. Goal: prove the harness works.
+- **M2.1-M2.4 (initial scope, ~3 days)**: 30-day replay, watchlist tickers, single LLM model (Qwen 3.6-27B local), no parameter sweep. Goal: prove the harness works.
 - **M2.5 (~2 days)**: extend to 90-day replay, add a second model (Llama 3.3 70B) for comparison.
 - **M2.6 (~2 days)**: add walk-forward validation and a parameter sweep dimension.
 - **M2.7 (~2-3 days)**: extend ticker universe to Russell 3000.

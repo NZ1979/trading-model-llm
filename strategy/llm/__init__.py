@@ -3,7 +3,7 @@
 This package implements the tiered LLM evaluation architecture documented
 in ``docs/LLM_SIGNAL_INTERFACE.md``:
 
-- **Tier 1** (``LocalClient``): Qwen 72B local via LM Studio, hot path,
+- **Tier 1** (``LocalClient``): Qwen 3.6-27B local via LM Studio, hot path,
   every candidate every cycle. During the pre-workstation bridge period
   Tier 1 is served by ``AnthropicClient`` with model
   ``claude-haiku-4-5`` (the "haiku_stand_in" backend).

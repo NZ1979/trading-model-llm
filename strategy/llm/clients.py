@@ -8,7 +8,7 @@ Two concrete clients implement the ``LLMClient`` protocol:
   Tier 1 backend during the pre-workstation bridge period.
 - ``LocalClient``: calls LM Studio's OpenAI-compatible endpoint at
   ``localhost:1234/v1`` via the ``openai`` SDK. Becomes the live Tier
-  1 backend once the workstation is online with Qwen 72B loaded.
+  1 backend once the workstation is online with Qwen 3.6-27B loaded.
 
 Both share the same input/output shape: take an ``LLMContext``, return
 an ``LLMDecision``. The signal engine doesn't know which it is talking

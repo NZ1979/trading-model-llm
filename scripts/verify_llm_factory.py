@@ -161,7 +161,7 @@ def main() -> int:
     # ---- qwen_local raises NotImplementedError (placeholder) ----
     cfg_local = _enabled_default_config()
     cfg_local["t1"]["backend"] = "qwen_local"
-    cfg_local["t1"]["model_id"] = "qwen2.5-72b-instruct-q4"
+    cfg_local["t1"]["model_id"] = "qwen3.6-27b-instruct-q4"
     try:
         build_tier_clients(cfg_local)
         all_ok &= _print(

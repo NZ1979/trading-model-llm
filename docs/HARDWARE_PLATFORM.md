@@ -30,7 +30,7 @@ This GPU runs models that previously required cloud APIs:
 | Model | Approx 4-bit VRAM | Throughput on RTX PRO 5000 (est.) | Quality estimate |
 |---|---|---|---|
 | Llama 3.3 70B Instruct | ~38GB | ~50-80 tok/s | Top open-source for general reasoning |
-| Qwen 2.5 72B Instruct | ~40GB | ~45-70 tok/s | Top open-source for structured-output tasks |
+| Qwen 3.6-27B Instruct | ~40GB | ~45-70 tok/s | Top open-source for structured-output tasks |
 | DeepSeek R1 Distill 70B | ~38GB | ~50-80 tok/s | Chain-of-thought reasoning specifically |
 | Llama 3.1 8B Instruct | ~5GB | ~150+ tok/s | Fast, less capable; useful for pre-filter or screening |
 | Qwen 2.5 32B Instruct | ~17GB | ~100 tok/s | Balanced; large headroom for batching |
@@ -42,7 +42,7 @@ quality for cycle throughput.
 
 The model choice between 32B and 70B is empirical — M2 replay can
 compare decisions from each on the same context and we measure the
-P&L difference. Initial production target: **Qwen 2.5 72B Instruct**
+P&L difference. Initial production target: **Qwen 3.6-27B Instruct**
 (strong JSON-output discipline matters for our schema-validated
 pipeline) with Llama 3.3 70B as a fallback comparison point.
 
@@ -92,7 +92,7 @@ for the full design. Cost summary:
 
 | Path | Backend | Volume | Cost/day |
 |---|---|---|---|
-| Tier 1 (every candidate, every cycle) | Qwen 72B local | 30-200 × 78 cycles | ~$0.20 (electricity at $0.12/kWh × 200W × 8h) |
+| Tier 1 (every candidate, every cycle) | Qwen 3.6-27B local | 30-200 × 78 cycles | ~$0.20 (electricity at $0.12/kWh × 200W × 8h) |
 | Tier 2 (selective escalation) | Sonnet 4.5 | 5-15 calls/day, capped at 25 | ~$0.10-0.30 (with prompt caching) |
 | Tier 3 (weekly Opus audit) | Opus 4.6 | ~12K decisions/audit | ~$2-5 amortized |
 | **Live operating** | | | **~$2-5/day, $60-150/month** |
@@ -148,7 +148,7 @@ M2 is feasible:
 - **Ticker universe**: full Russell 3000 (~3000 names) instead of just the watchlist
 - **Parameter sweep dimension**: scan ATR multiplier × confidence threshold × pre-filter PM RVOL together
 - **Walk-forward validation**: train prompt on first 80% of period, test on last 20%, repeat with shifted windows
-- **Multiple model variants**: run the same replay against Qwen 72B, Llama 3.3 70B, Qwen 32B, in parallel; compare result quality vs latency vs throughput
+- **Multiple model variants**: run the same replay against Qwen 3.6-27B, Llama 3.3 70B, Qwen 32B, in parallel; compare result quality vs latency vs throughput
 
 The hardware enables the experiment, but every additional dimension
 multiplies wall-clock time. Initial M2 still targets a single-model,
@@ -160,13 +160,13 @@ once the harness works.
 LM Studio is the local LLM hosting platform pre-installed on the
 machine. Integration approach:
 
-1. **LM Studio loads the chosen model** (Qwen 2.5 72B Instruct 4-bit, downloaded once from HuggingFace via LM Studio's UI).
+1. **LM Studio loads the chosen model** (Qwen 3.6-27B Instruct 4-bit, downloaded once from HuggingFace via LM Studio's UI).
 
 2. **LM Studio exposes an OpenAI-compatible HTTP API** on `localhost:1234/v1/chat/completions` (default port). This lets us use the existing `openai` Python package as the client; we just point `base_url` at LM Studio.
 
 3. **Our `strategy/signals/llm.py` module** holds two clients: an OpenAI-compatible client pointed at LM Studio for Tier 1 (default path), and an Anthropic client used by Tier 2 (selective escalation) and Tier 3 (offline audit + M2 replay labeling). The schema-validated JSON output works the same against any backend; the same `LLMDecision` dataclass parses Qwen, Sonnet, and Opus responses identically.
 
-4. **Tier 1 model swap is a config change, not a code change.** Switching from Qwen 72B to Llama 3.3 70B = change LM Studio's loaded model + restart LM Studio. The trading code doesn't know which Tier 1 model it's talking to. Tier 2 and Tier 3 model identifiers (`claude-sonnet-4-5`, `claude-opus-4-6`) are pinned in `config/settings.yaml` so backtest reproducibility is preserved across Anthropic version drift.
+4. **Tier 1 model swap is a config change, not a code change.** Switching from Qwen 3.6-27B to Llama 3.3 70B = change LM Studio's loaded model + restart LM Studio. The trading code doesn't know which Tier 1 model it's talking to. Tier 2 and Tier 3 model identifiers (`claude-sonnet-4-5`, `claude-opus-4-6`) are pinned in `config/settings.yaml` so backtest reproducibility is preserved across Anthropic version drift.
 
 5. **Tier-1-fallback mode.** If LM Studio is unreachable (workstation down, model unloaded, port collision), the signal generator promotes Tier 2 to handle every candidate temporarily. Cost during the outage is ~$5-20/day depending on volume; a one-day outage is acceptable, a multi-day outage triggers an alert. Detection is via a single failed call: connection refused or timeout > 8s flips a `t1_available` flag false and the system runs in Tier-2-only mode until a periodic health check succeeds.
 
@@ -195,7 +195,7 @@ even if it's free to run.
 The workstation is purpose-built for this fork's research and (eventually)
 deployment. Four architectural shifts:
 
-1. **Local LLM as the primary inference path (Tier 1).** Qwen 72B runs every candidate every cycle on the workstation GPU. Zero marginal cost, full privacy, deterministic.
+1. **Local LLM as the primary inference path (Tier 1).** Qwen 3.6-27B runs every candidate every cycle on the workstation GPU. Zero marginal cost, full privacy, deterministic.
 2. **Cloud Claude as selective augmentation, not full replacement (Tiers 2 + 3).** Sonnet handles the 5-15 escalations/day where Qwen confidence is uncertain AND a real catalyst is present. Opus 4.6 runs offline as gold-standard labeler for M2 replay and weekly live audit. Cloud is no longer "fallback only" — it has a defined, always-on role for the hard cases.
 3. **Pre-filter relaxed.** Cost-driven candidate narrowing is gone; quality-driven candidate narrowing optional.
 4. **Backtest at scale.** 30-day replays are the floor; 6-12 month replays with parameter sweeps and Opus labeling are the ceiling.

@@ -43,7 +43,7 @@ New for this fork (this doc specifies):
                                                         |
                                                         v
                                               +--------------------+
-                                              | Tier 1: Qwen 72B   |
+                                              | Tier 1: Qwen 3.6-27B   |
                                               | local, every call  |
                                               +---------+----------+
                                                         |
@@ -87,7 +87,7 @@ path defeats the privacy and zero-marginal-cost wins from local
 inference. The compromise: Claude only where its strengths actually
 compound.
 
-### Tier 1: Qwen 2.5 72B local — primary, hot path
+### Tier 1: Qwen 3.6-27B local — primary, hot path
 
 Runs on the local RTX PRO 5000 via LM Studio's OpenAI-compatible API.
 Evaluates every pre-filtered candidate every cycle. Zero marginal
@@ -164,7 +164,7 @@ fixed cost of evaluating the system, not a per-trade operating cost.
 
 | Tier | Backend | Volume/day | Cost/day |
 |---|---|---|---|
-| 1 | Qwen 72B local | 30-200 calls × 78 cycles | ~$0 (electricity) |
+| 1 | Qwen 3.6-27B local | 30-200 calls × 78 cycles | ~$0 (electricity) |
 | 2 | Sonnet 4.5 (selective) | 5-15 escalations, capped at 25 | ~$0.10-0.30 |
 | 3 | Opus 4.6 (weekly audit) | ~12K decisions/audit | ~$2-5 amortized |
 | **Total live** | | | **~$2-5/day** |
@@ -456,7 +456,7 @@ Tier 3 (Opus 4.6 weekly audit): ~$15-30/audit; amortizes to ~$2-5/day.
 
 | Model | 4-bit VRAM | Throughput | $/call | Per-call latency (250 out) |
 |---|---|---|---|---|
-| Qwen 2.5 72B | ~40GB | 50-70 tok/s | ~$0 | 3.5-5s |
+| Qwen 3.6-27B | ~40GB | 50-70 tok/s | ~$0 | 3.5-5s |
 | Llama 3.3 70B | ~38GB | 50-80 tok/s | ~$0 | 3-5s |
 | Qwen 2.5 32B | ~17GB | ~100 tok/s | ~$0 | 2.5s |
 

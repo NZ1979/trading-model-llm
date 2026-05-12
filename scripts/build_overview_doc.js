@@ -242,7 +242,7 @@ children.push(p(
   "This document describes the LLM Trading Model: an intraday equity trading system whose signal generation is performed by large language models rather than fixed rule-based heuristics. It is one of two strategy forks in the broader trading platform; the sibling fork, trading-model-gap-and-go, runs deterministic gap-and-go logic against a Russell 2000 universe. Both share infrastructure (data feeds, broker, risk validation, deploy procedures) inherited from the trading-platform base repository."
 ));
 children.push(p(
-  "The signal generator uses a three-tier evaluation architecture. Tier 1 (Qwen 2.5 72B running locally on a workstation GPU) evaluates every candidate every cycle. Tier 2 (Claude Sonnet 4.5) is invoked only on ambiguous, high-stakes setups. Tier 3 (Claude Opus 4.6) labels decisions offline as a gold standard for evaluation. The design balances cost, latency, privacy, and decision quality across complementary models rather than depending on any single one."
+  "The signal generator uses a three-tier evaluation architecture. Tier 1 (Qwen 3.6-27B running locally on a workstation GPU) evaluates every candidate every cycle. Tier 2 (Claude Sonnet 4.5) is invoked only on ambiguous, high-stakes setups. Tier 3 (Claude Opus 4.6) labels decisions offline as a gold standard for evaluation. The design balances cost, latency, privacy, and decision quality across complementary models rather than depending on any single one."
 ));
 children.push(p(
   "As of this document’s writing, the package scaffolding, schema, prompt template, escalation logic, merge logic, and orchestrator are complete and validated by 87 mocked-test assertions plus one live Anthropic Haiku call. The local Tier 1 backend is a placeholder pending workstation hardware delivery; a stand-in routes to Claude Haiku 4.5 in the bridge period so all downstream code paths can be exercised against real cloud inference."
@@ -285,7 +285,7 @@ children.push(p(
 children.push(makeTableCustom(
   ["Tier", "Model", "Role", "Volume / day"],
   [
-    ["1", "Qwen 2.5 72B (local)", "Hot path; every candidate every cycle", "30-200 × 78 cycles"],
+    ["1", "Qwen 3.6-27B (local)", "Hot path; every candidate every cycle", "30-200 × 78 cycles"],
     ["2", "Claude Sonnet 4.5", "Selective escalation on ambiguous setups", "5-15 (cap 25)"],
     ["3", "Claude Opus 4.6", "Offline gold-standard labeler (M2 replay + weekly audit)", "Replay-time only"],
   ],
@@ -318,7 +318,7 @@ children.push(bulletRich([
 children.push(p("And three reasons it is strictly better than running Qwen alone:"));
 children.push(bulletRich([
   new TextRun({ text: "Domain expertise on hard cases. ", bold: true }),
-  new TextRun({ text: "Qwen 72B has documented finance-domain reasoning gaps versus Claude. The 5-15 escalations per day are exactly the catalyst-driven setups where the gap matters." }),
+  new TextRun({ text: "Qwen 3.6-27B has documented finance-domain reasoning gaps versus Claude. The 5-15 escalations per day are exactly the catalyst-driven setups where the gap matters." }),
 ]));
 children.push(bulletRich([
   new TextRun({ text: "Calibration anchor. ", bold: true }),
@@ -339,8 +339,8 @@ children.push(makeTableCustom(
   ["Component", "Provider", "Purpose"],
   [
     ["Anthropic SDK (anthropic>=0.45)", "Anthropic", "Tier 2 Sonnet, Tier 3 Opus, Tier-1 stand-in (Haiku)"],
-    ["OpenAI SDK (openai>=1.50)", "LM Studio (workstation)", "Tier 1 Qwen 72B local; LM Studio exposes OpenAI-compatible API"],
-    ["LM Studio", "Local app", "Hosts and serves the local Qwen 72B model on RTX PRO 5000"],
+    ["OpenAI SDK (openai>=1.50)", "LM Studio (workstation)", "Tier 1 Qwen 3.6-27B local; LM Studio exposes OpenAI-compatible API"],
+    ["LM Studio", "Local app", "Hosts and serves the local Qwen 3.6-27B model on RTX PRO 5000"],
   ],
   [3120, 3120, 3120],
 ));
@@ -414,7 +414,7 @@ children.push(h2("5.3 Cost summary"));
 children.push(makeTableCustom(
   ["Path", "Backend", "Volume", "Cost / day"],
   [
-    ["Tier 1 (local)", "Qwen 72B local", "30-200 × 78 cycles", "~$0.20 (electricity)"],
+    ["Tier 1 (local)", "Qwen 3.6-27B local", "30-200 × 78 cycles", "~$0.20 (electricity)"],
     ["Tier 1 fallback", "Anthropic Haiku/Sonnet", "Only on workstation outage", "$5-20 during outage"],
     ["Tier 2 escalation", "Anthropic Sonnet", "5-15 / day (cap 25)", "~$0.10-0.30"],
     ["Tier 3 weekly audit", "Anthropic Opus", "~12K decisions per audit", "~$2-5 amortized"],
@@ -437,7 +437,7 @@ children.push(bullet("LM Studio on the workstation (pre-installed on the Puget b
 children.push(bullet("OpenSSH client for VPS deploys"));
 
 children.push(h2("6.2 Hardware floor"));
-children.push(bullet("Workstation: 48 GB VRAM minimum to run Qwen 72B at 4-bit. 32B variants run on lower-VRAM GPUs but trade decision quality for size"));
+children.push(bullet("Workstation: 48 GB VRAM minimum to run Qwen 3.6-27B at 4-bit. 32B variants run on lower-VRAM GPUs but trade decision quality for size"));
 children.push(bullet("Workstation RAM: 64 GB sufficient; 192 GB lets the M2 replay harness keep the entire 1-min bar dataset in memory"));
 children.push(bullet("VPS: 4 vCPU / 8 GB RAM is more than enough; CPX21 (3 vCPU, 4 GB) handles the existing trader plus the LLM client without issue"));
 children.push(bullet("Network: outbound HTTPS (port 443) to api.anthropic.com, paper-api.alpaca.markets, api.polygon.io, finnhub.io"));
@@ -499,10 +499,10 @@ children.push(makeTableCustom(
 
 children.push(h2("7.5 LM Studio (workstation only)"));
 children.push(numbered("Open LM Studio (pre-installed on the Puget build)"));
-children.push(numbered("Search and download Qwen 2.5 72B Instruct, 4-bit quantization"));
+children.push(numbered("Search and download Qwen 3.6-27B Instruct, 4-bit quantization"));
 children.push(numbered("Load the model and verify VRAM utilization stays under 48 GB"));
 children.push(numbered("Start the local server (default localhost:1234, OpenAI-compatible /v1)"));
-children.push(numbered("In settings.yaml, change llm.t1.backend from haiku_stand_in to qwen_local and llm.t1.model_id to qwen2.5-72b-instruct-q4 (or whatever LM Studio reports)"));
+children.push(numbered("In settings.yaml, change llm.t1.backend from haiku_stand_in to qwen_local and llm.t1.model_id to qwen3.6-27b-instruct-q4 (or whatever LM Studio reports)"));
 children.push(numbered("Restart the trader. Tier 1 now hits the local model; Tier 2 and Tier 3 stay on Anthropic"));
 
 children.push(h2("7.6 Verification"));
@@ -646,7 +646,7 @@ children.push(p(
   "When the workstation is delivered and configured, the LLM model fork transitions from cloud-only stand-in to local Tier 1. The transition is a config change (one line) plus an LM Studio model load. No code changes."
 ));
 children.push(numbered("Install LM Studio (already pre-installed on Puget build)"));
-children.push(numbered("Download Qwen 2.5 72B Instruct 4-bit weights"));
+children.push(numbered("Download Qwen 3.6-27B Instruct 4-bit weights"));
 children.push(numbered("Start LM Studio server on localhost:1234"));
 children.push(numbered("Edit config/settings.yaml: llm.t1.backend from haiku_stand_in to qwen_local; llm.t1.model_id to the LM Studio model identifier"));
 children.push(numbered("Restart the trader; verify logs show \"Tier 1: qwen_local\""));

@@ -10,7 +10,7 @@ Buy/Sell/Hold decision with reasoning, confidence, and a stop-loss
 recommendation.
 
 **Backend choice (updated 2026-05-07):** primary inference path is a
-locally-hosted 70B-class open-weight model (Qwen 2.5 72B Instruct or
+locally-hosted 70B-class open-weight model (Qwen 3.6-27B Instruct or
 similar) running on a dedicated workstation with an RTX PRO 5000
 Blackwell 48GB GPU via LM Studio. Cloud Claude (Haiku/Sonnet) is the
 comparison baseline and the fallback when the local server is

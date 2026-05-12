@@ -48,7 +48,7 @@ Module layout:
 
 Three-tier architecture, per `docs/LLM_SIGNAL_INTERFACE.md`:
 
-- **Tier 1** (every candidate, hot path): Qwen 2.5 72B local via LM Studio when the workstation arrives; Haiku stand-in (`backend: haiku_stand_in`, pinned to `claude-haiku-4-5`) during the bridge.
+- **Tier 1** (every candidate, hot path): Qwen 3.6-27B local via LM Studio when the workstation arrives; Haiku stand-in (`backend: haiku_stand_in`, pinned to `claude-haiku-4-5`) during the bridge.
 - **Tier 2** (selective escalation, ~5–25/day): Sonnet 4.5. Triggered by `escalation.escalation_rule` when T1 confidence is in `[confidence_floor, confidence_ceiling]` (default 50–75) AND a pre-market RVOL gate fires. Budget consumed on *attempt*, not success, so flaky endpoints can't blow the daily cap on retries.
 - **Tier 3** (offline only, never live): Opus. Used by the M2 replay harness and weekly audit to label decisions as gold standard.
 
