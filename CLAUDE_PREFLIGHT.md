@@ -387,3 +387,26 @@ Before any deploy that touches outbound HTTP requests:
 - Add the logger-suppression block to `setup_logging` once and don't remove it.
 - For credentials that are already exposed in logs: rotate the credential AND vacuum journalctl history (the leak persists on disk until vacuumed).
 - When working with user on log diagnostics, before asking them to paste any log lines, predict which vendors' calls would have triggered logging in the time window. If any of those vendors use URL-based auth and logger suppression isn't in place, redirect to a redacted query (per Rule 21) instead of asking for raw log paste.
+
+
+## Rule 23: Verify actual system date/time before any time-anchored claim
+
+Time changes during long sessions. Session env headers, prior messages, and recalled state go stale. Any claim that depends on the current date, time, day-of-week, or market session state must be grounded in a fresh `date` check at the moment the claim is made, not in remembered framing from earlier in the conversation.
+
+**The rule, hard:**
+
+Before any statement that includes phrases like "today", "tomorrow", "this morning", "market is closed/open", "we have N hours/minutes", "after market close", "before X happens", a deadline, or any market-session reference:
+
+1. Run `date && TZ=America/New_York date` (or the equivalent on the user's shell) to capture actual current UTC + ET time.
+2. Reason from those values, not from the session's env header (which is set at session start and drifts over multi-hour sessions) and not from anything you said earlier in the conversation.
+3. State the verified time inline so the claim is auditable: e.g., "It is now Tue 10:33 AM EDT; market has been open for 1h 3m" rather than "Market is open."
+4. For any trading-platform recommendation that depends on market state, the math is: regular hours 09:30–16:00 ET on weekdays, excluding US market holidays. Note holiday exceptions explicitly when relevant.
+
+**Specific trap already fallen into (2026-05-12):** A long session started Monday evening EDT. By the next morning at 10:33 AM EDT, Claude told the user "Market closed since 16:00 ET. No rush — anytime before Tuesday 9:30 ET gets you back in time for tomorrow's open." Wrong on every clause: it was Tuesday at the time of the statement, market was open and had been for an hour, the user had asked to stop a service before market open and we were already past it. The session env header at start did contain the correct date (Tuesday May 12, 2026) but Claude carried forward Monday-evening framing without rechecking. Real impact: trading hours were lost while the user investigated.
+
+**How to apply:**
+
+- For ANY response that includes a time/date reference, run `date` first or use a time-aware tool. Never state market state from memory.
+- For long sessions specifically, recheck the time periodically — what was "evening" when the session started may be "morning" hours later.
+- If a user reports an unexpected state ("the service isn't trading"), the FIRST diagnostic is `date` followed by `systemctl is-active` or equivalent. Don't theorize from stale time-context.
+- Phrase time-anchored statements with the verified value embedded. The embedded timestamp makes the claim auditable and forces the verification step to actually happen.

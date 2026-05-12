@@ -6,9 +6,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Two project-specific docs in the repo root contain non-negotiable context — read them before any operational instruction:
 
-- `CLAUDE_PREFLIGHT.md` — 22 numbered rules covering credential handling (Rules 21–22), credential-leak prevention in logs (URL-based auth + httpx logging), execution-context labelling for every command block (Rule 16), placeholder/assumption auditing (Rule 20), fail-loud error handling (Rule 18), and verification-before-conclusion (Rule 14). These are corrections to prior failures; treat them as hard requirements, not style suggestions.
+- `CLAUDE_PREFLIGHT.md` — 23 numbered rules covering credential handling (Rules 21–22), credential-leak prevention in logs (URL-based auth + httpx logging), execution-context labelling for every command block (Rule 16), placeholder/assumption auditing (Rule 20), fail-loud error handling (Rule 18), and verification-before-conclusion (Rule 14). These are corrections to prior failures; treat them as hard requirements, not style suggestions.
 - `PROJECT_BLUEPRINT.md` — the running platform's deployment state, locked-in vendor stack, daily timeline, signal logic, and "do not re-debate" facts (e.g. Polygon Stocks Starter is 15-min delayed and used for historical only; Databento was canceled).
 - `docs/LLM_MODEL_CHARTER.md` and `docs/LLM_SIGNAL_INTERFACE.md` — what makes this fork different from the base. The fork replaces the rule-based signal engine with a tiered LLM signal generator.
+
+## Hard rules — quoted verbatim from CLAUDE_PREFLIGHT.md
+
+These are not stylistic preferences. Each one was added after a specific failure cost real time and trust. The full rationale, trap history, and "how to apply" notes are in `CLAUDE_PREFLIGHT.md`; this section is the loud-and-visible version so the rules can't be skipped because the file wasn't opened.
+
+### Rule 14: Verification before conclusion
+
+NEVER present a diagnostic claim, root cause, or fix as a conclusion until it has been tested and verified against real data or output **in this session**. Until verified, mark every finding explicitly as `HYPOTHESIS:` or `UNVERIFIED:` in the message itself. End-to-end claims require end-to-end execution, not module-level inference.
+
+### Rule 16: Always state where a command/script is to be run
+
+Every command block must declare its execution context explicitly, before the code, with no ambiguity. No naked code blocks. When switching shells between consecutive blocks (e.g., from local PowerShell into an SSH session, or back out), say it loudly — "open a NEW PowerShell window — do NOT use the open SSH session" — before the next code block. The context label alone is not enough on its own.
+
+### Rule 18: Error handling — fail loud, never fake
+
+Priority order, top to bottom: 1) Works correctly with real data; 2) Falls back visibly with a banner/log warning/annotated status; 3) Fails with a clear error message (exception, non-zero exit, "FAILED" log line); 4) Silently degrades to look "fine" — **NEVER do this**. Never substitute placeholder data, swallow exceptions silently, or hide failures behind aggregated success counts.
+
+### Rule 20: Audit output for placeholders and unstated assumptions
+
+Before sending a command/script to the user, scan for: literal placeholder strings (`<paste-your-key>`, `REPLACE_ME`), unstated input assumptions (HOW/WHERE did they save it?), path assumptions, tool-availability assumptions (is `python` on PATH?), and state assumptions (is the service running, env var exported, prior step completed?). Either resolve them with concrete values (asking first if needed) or call them out explicitly. **Project-specific corollary**: the Hetzner VPS at `5.161.199.155` is NOT necessarily the LLM model's deployment. As of 2026-05-12 it runs the gap-and-go fork (`llm.enabled: false`) on account `PA3REQ1LMPKO`. The Large Cap account `PA3QAZ941NFN` is reserved for when the LLM model eventually deploys, on the workstation or a separate VPS, and must not co-exist with gap-and-go on a single `trader.service`. Verify which fork's code runs where before recommending any infrastructure action.
+
+### Rule 21: Never request command output that would expose credentials
+
+Before asking the user to paste back the output of any command, ask: "Could the output contain a secret?" If yes, redesign the command to extract only the non-secret information. Length checks (`awk '{print length($2)}'`), existence counts (`grep -c`), last-4-chars fingerprints, hash prefixes — never the raw value. Applies to `cat`/`tail`/`head`/`grep`-without-redaction, `env`/`printenv`/`Get-ChildItem env:`, process listings, service unit files (`systemctl cat`), and any log dump that might include credentials in URLs or headers.
+
+### Rule 22: Audit logging behavior for credential leaks
+
+`httpx` (and the `anthropic` SDK on top of it) logs full URLs at INFO by default. Polygon passes its API key as a URL query param. The `setup_logging` block forcing `httpx, httpcore, aiohttp, anthropic, urllib3` loggers to `WARNING` MUST stay in place — removing it leaks credentials into journalctl on the next deploy. Any new HTTP-client dependency triggers a fresh audit of its default logging behavior before the deploy that introduces it ships.
+
+### Rule 23: Verify actual system date/time before any time-anchored claim
+
+Before ANY statement that includes "today", "tomorrow", "this morning", "market is open/closed", "we have N hours", a deadline, or a market-session reference, run `date && TZ=America/New_York date` and reason from the fresh values. Session env headers drift over long sessions; remembered framing from earlier in the conversation goes stale. State the verified time inline so the claim is auditable: e.g., "It is now Tue 10:33 AM EDT; market has been open for 1h 3m." Trading-platform market hours are 09:30–16:00 ET on weekdays excluding US market holidays.
+
+---
 
 ## What this repo is
 
