@@ -749,23 +749,33 @@ class FinalTradeDecision:
 3. If clamp_anomaly == True → Hold (rejection_reason="clamp_anomaly")
 4. If advisory.action == "Hold" → Hold (consistent with LLM)
 
-5. Look up bucket_stats for (regime, cap, catalyst, time_of_day, long_short)
-6. If bucket_stats.sample_count < 30:
+5. Look up bucket_stats via HIERARCHICAL FALLBACK (Q1 resolution):
+       a. Try fully-granular bucket (regime, cap, catalyst, time_of_day, long_short).
+          If sample_count >= sample_min_for_normal_tier → use it.
+       b. Else collapse the lowest-information dimension (per nightly ANOVA
+          ranking; default order: time_of_day → cap → ...) and retry.
+       c. Continue collapsing until sample_count threshold met OR all
+          dimensions collapsed (fall back to global prior).
+       d. Record bucket_key_used in FinalTradeDecision for audit.
+6. If bucket_stats.sample_count < sample_min_for_normal_tier (even after full collapse):
        qty_tier = "tiny"   (paper-trading exploration only)
    Else if bucket_stats.expected_r_lower_ci <= 0:
        Hold (rejection_reason="bucket_negative_expectancy")
-   Else if bucket_stats.expected_r_lower_ci > 0.30 AND sample_count > 100:
+   Else if bucket_stats.expected_r_lower_ci > expected_r_for_max_tier
+           AND sample_count > sample_min_for_max_tier:
        qty_tier = "max"
    Else:
        qty_tier = "normal"
 
-7. If features.spread_bps > 50 OR features.rvol_percentile < 20:
+7. If features.spread_bps > spread_bps_red_flag
+       OR features.rvol_percentile < rvol_percentile_red_flag:
        qty_tier = downgrade by one tier (or Hold if already tiny)
 
 8. Stop / target multiples:
        Use advisory's stop_loss_atr_multiple and take_profit_atr_multiple,
-       BUT clamp to max 2.0 ATR stop in choppy regime,
-       BUT enforce minimum 1.5 reward-to-risk ratio (target/stop ≥ 1.5).
+       BUT clamp stop to stop_atr_clamp_choppy ATR in choppy regime,
+       BUT enforce reward-to-risk ratio >= min_reward_to_risk.
+       (All four threshold names are tunable per Q3; see policy.yaml.)
 
 9. Return FinalTradeDecision
 ```
@@ -788,11 +798,21 @@ entries.
 
 ## Bucket history calculation
 
+> **Updated 2026-05-12 (Q2 resolution).** The three-branch `CASE` formula
+> below is superseded for buckets where orders were placed; those are
+> computed from the `position_trace` event ledger per the Q2 resolution.
+> The legacy SQL is retained for non-deployed decisions (Holds + rejected
+> buckets) where no real position exists and counterfactual first-touch
+> simulation is the only signal available. The live aggregation is a
+> UNION of both sources, partitioned on `holding_day = 0` for entry
+> expectancy. See "Supporting schema" below for the full updated query.
+
 The `BucketStats` lookup table is built from historical decisions joined to
-`shadow_outcomes`:
+`shadow_outcomes` (legacy form shown for reference):
 
 ```sql
 -- Bucket expectancy (run nightly; cached in memory at trader boot)
+-- LEGACY shape — superseded by the UNION-based query in "Supporting schema"
 SELECT
     regime, cap_size, catalyst_quality, time_of_day_bucket, long_short,
     COUNT(*) as sample_count,
@@ -877,41 +897,538 @@ replay reveals; if no buckets show positive expectancy after 30 days of
 replay, that itself is a finding and the question becomes "is the LLM
 adding value at all, or do we need a different prompt / model?"
 
-## Open questions (need answers before implementation)
+## Open questions — resolved 2026-05-12
 
-1. **Bucket dimension count.** Five dimensions × default categorizations
-   produces 480 buckets; most will be empty. Should some dimensions
-   collapse (e.g. cap_size: just small_or_other vs mega_or_large)?
-   Initial proposal: keep all five but report by sample count and let the
-   data tell us which dimensions matter.
+Each question below retains its original framing for context, followed by
+the resolution agreed in the 2026-05-12 design session.
 
-2. **Realized R calculation when neither stop nor target hits.** The query
-   above falls back to `return_eod_pct / stop_loss_pct`. This assumes the
-   position was held to flatten. For overnight or multi_day suggestions
-   this is wrong, but those are out of scope today (system flattens at
-   15:55 ET for all positions). Revisit when overnight is enabled.
+### Q1. Bucket dimension count
 
-3. **TradePolicy parameter tuning approach.** The thresholds (30 samples
-   minimum, 0.30 expected_r for max tier, 50 bps spread red flag) are
-   pulled from intuition. After M2 replay we should grid-search these
-   against historical buckets and pick the values that maximize
-   out-of-sample Sharpe. Until then, document the hand-picked values and
-   review monthly.
+**Original framing.** Five dimensions × default categorizations produces
+480 buckets; most will be empty. Should some dimensions collapse
+(e.g. cap_size: just small_or_other vs mega_or_large)? Initial proposal:
+keep all five but report by sample count and let the data tell us which
+dimensions matter.
 
-4. **Policy versioning lifecycle.** When we change a TradePolicy
-   threshold, every prior decision's recorded `policy_version` becomes
-   ambiguous: was it produced by the old or new policy? Proposal: bump
-   the policy_version string and treat it as a backtest cutover boundary.
-   Decisions before the bump are evaluated against old policy expectancy;
-   after, against new.
+**Resolution.** Hierarchical bucket lookup at decision time; all 5
+dimensions retained in storage (no info loss).
 
-5. **LLM classification ground-truth.** How do we measure whether the
-   LLM is correctly classifying catalyst_quality? Options:
-   - Human spot-check 50 random LLM classifications per week
-   - Cross-check against Tier 3 Opus on the same context
-   - Use the realized P&L of "MAJOR catalyst" decisions as a proxy
-     (true MAJORs should outperform true MINORs systematically)
-   Initial proposal: do all three.
+1. Store all 5 dimensions per decision row.
+2. At decision time, look up the fully-granular bucket. If
+   `sample_count >= 30`, use it.
+3. Else, collapse the lowest-information dimension and retry. Continue
+   until 30 samples or fall back to global prior.
+4. Refresh the "which dim collapses first" ordering nightly via one-way
+   ANOVA on realized R per dimension.
+
+Precompute the 32 bucket-subset tables nightly; runtime is dictionary
+walks. Default collapse priorities until data overrides:
+
+1. `time_of_day`: collapse 5 → 3 (morning_open / midday / afternoon_close)
+2. `cap_size`: collapse 4 → 2 (mega_large / mid_small) — liquidity is
+   already captured by RVOL/spread features
+3. Keep `catalyst_quality` at 4 (collapsing defeats the LLM's
+   classification value)
+4. Keep `regime` at 3, `long_short` at 2
+
+Max-granular bucket count drops from 480 → 144. The `bucket_key` recorded
+in `FinalTradeDecision` makes the inheritance chain auditable.
+
+### Q2. Realized R calculation when neither stop nor target hits
+
+**Original framing.** The query above falls back to
+`return_eod_pct / stop_loss_pct`. This assumes the position was held to
+flatten. For overnight or multi_day suggestions this is wrong, but those
+are out of scope today (system flattens at 15:55 ET for all positions).
+Revisit when overnight is enabled.
+
+**Resolution.** Event-trace ledger, not branched SQL. Multi-day holds
+allowed up to 3 trading days from this point forward (the "out of scope"
+caveat in the original framing is rescinded). The schema and formula
+described below handle both intraday and multi-day uniformly.
+
+Realized R per decision is a position-weighted sum over the event ledger:
+
+```
+realized_r = SUM(qty_delta × (fill_price - entry_price))
+             / (initial_qty × stop_distance_at_entry)
+```
+
+- `entry_price`: position-weighted average of ENTRY + SCALE_UP fills
+- `stop_distance_at_entry`: original (not ratcheted) distance, so R is
+  comparable across decisions
+
+Event types in `position_trace`:
+
+| Event | When emitted |
+|---|---|
+| ENTRY | Initial bracket fill |
+| SCALE_UP | Additional qty added to a working position |
+| TAKE_PARTIAL | Profit-banking sell of a fraction (intent=profit_banking) |
+| TRIM | Defensive sell of a fraction (intent=defensive) |
+| STOP_RATCHET | Trailing stop replaced; no fill, marker only |
+| MORNING_BRACKET_REFRESH | 09:30 cancel-and-replace of bracket children on a multi-day hold; no fill, marker only |
+| CARRY_OVERNIGHT | 15:55 carry decision for a position with trading_days_held < 3; no fill, marker only |
+| STOP_HIT | Stop child filled (fill_price captures gap fills accurately) |
+| TARGET_HIT | Take-profit child filled |
+| EXIT_LLM | LLM-driven market close (intent=thesis_break or similar) |
+| FLATTEN_1555 | Default 15:55 intraday flatten |
+| MAX_DURATION_FLATTEN | Forced flatten at 15:55 on day 3 (trading_days_held >= 3) |
+
+**Multi-day hard cap.** `trading_days_held >= 3` at the 15:55 routine
+forces `MAX_DURATION_FLATTEN`, never a 4th-day open. The cap is
+implementation-enforced, not LLM-discretionary.
+
+**Carry gate.** A position is carried overnight only if all of:
+
+- `suggested_horizon ∈ {intraday, multi_day}` is multi_day (note: collapse
+  the v1 3-value horizon to 2 values: `intraday` and `multi_day`; the
+  `overnight` value is redundant since the position-mgmt LLM re-evaluates
+  each session anyway)
+- `policy.allows_carry(bucket_key, position_state)` returns true (bucket
+  has positive expectancy with sample_count >= 30 specifically for
+  multi_day-tagged decisions; no operational red flags)
+- `trading_days_held < 3` (hard cap)
+
+**Bracket refresh.** At 09:30 each session for held positions, cancel
+yesterday's stop+target children and re-place at current (post-ratchet)
+levels. Use the same DELETE-then-POST pattern as the deterministic
+trailing-stop logic. GTC OTOCO is deliberately avoided because of known
+single-leg cancellation bugs.
+
+**Gap risk captured automatically.** Pre-market gaps past the stop fill
+at the open print; the event records actual `fill_price`, so realized R
+yields the true outcome (e.g., -1.5R rather than the planned -1.0R).
+No special handling required.
+
+**`holding_day` column on decisions.** A new column distinguishes:
+
+- `holding_day = 0`: fresh entry decision; opens a position; feeds
+  BucketStats
+- `holding_day = 1 / 2 / 3`: position-management decision on an
+  already-held position; logged for analytics; does NOT feed BucketStats
+  for entry expectancy
+
+**T2 escalation cap per multi-day position.** Default 5 escalations per
+position lifetime. After cap, T1 alone decides position-management calls
+until the position closes. Prevents one sticky 3-day position from
+consuming the daily T2 budget.
+
+**Two-regime BucketStats aggregation.** The bucket-expectancy query
+unions:
+
+| Source | Used for | Realized R formula |
+|---|---|---|
+| `position_trace` | Buckets where orders were placed | Event-weighted sum above |
+| `shadow_outcomes` | Hold decisions + rejected-bucket decisions | Simulated first-touch (legacy SQL retained for non-deployed decisions) |
+
+`shadow_outcomes` is extended with `day_1_eod_pct`, `day_2_eod_pct`,
+`day_3_eod_pct` to support counterfactual multi-day analysis on
+non-deployed decisions.
+
+### Q3. TradePolicy parameter tuning approach
+
+**Original framing.** Thresholds (30 samples minimum, 0.30 expected_r for
+max tier, 50 bps spread red flag) are pulled from intuition. After M2
+replay we should grid-search these against historical buckets and pick
+the values that maximize out-of-sample Sharpe. Until then, document the
+hand-picked values and review monthly.
+
+**Resolution.** Two corrections to the original framing, then the
+implementation shape:
+
+1. **Tune Calmar, not Sharpe.** Section 0 of this doc defines Calmar as
+   the primary objective; the original Q3 framing slipped to Sharpe.
+2. **Bayesian optimization via Optuna (TPE sampler), not grid search.**
+   The 10-param tuning surface is non-convex and noisy; BayesOpt finds
+   good regions in ~200 trials.
+
+**Two-tier parameter classification.**
+
+Tunable policy parameters (10), with bounds:
+
+| Param | Current | Bounds |
+|---|---|---|
+| `sample_min_for_normal_tier` | 30 | [20, 100] |
+| `sample_min_for_max_tier` | 100 | [50, 200] |
+| `expected_r_for_max_tier` | 0.30 | [0.20, 1.00] |
+| `spread_bps_red_flag` | 50 | [25, 200] |
+| `rvol_percentile_red_flag` | 20 | [10, 40] |
+| `stop_atr_clamp_choppy` | 2.0 | [1.5, 3.0] |
+| `min_reward_to_risk` | 1.5 | [1.2, 2.5] |
+| `escalation_confidence_low` | 50 | [40, 60] |
+| `escalation_confidence_high` | 75 | [65, 85] |
+| `trim_pct_default` | 0.5 | [0.33, 0.67] |
+
+Untunable risk constraints (5) — never touched by the tuner:
+
+| Constraint | Value | Why fixed |
+|---|---|---|
+| `risk_per_trade_pct` | 1.0% | Account-protection rule |
+| `max_drawdown_pct` | 15% | Hard stop |
+| `single_day_loss_pct` | 5% | Hard stop |
+| `total_exposure_pct` | 90% | Hard constraint |
+| `max_holding_days` | 3 | Q2 hard cap |
+
+**Walk-forward validation methodology.**
+
+```
+Rolling 60-day train / 15-day validate / 15-day test
+Window advances 15 days per fold across available history.
+```
+
+Acceptance criteria for a tune:
+
+1. Mean OOS Calmar across folds > current Calmar
+2. Variance of OOS Calmar not materially worse (within 1.5x)
+3. No parameter pegged at its boundary (boundary hit ⇒ human review)
+
+**Cadence.** Quarterly. Monthly is overfit-prone at our sample volume;
+quarterly gives ~300 trades per bucket per tune.
+
+**No-peek discipline.** New thresholds apply to decisions from
+activation_date onward; bucket stats they influence are measured from
+activation_date forward. Implementation: `policy_tuning_history` table
+records activation_date; aggregation queries filter
+`WHERE decision_date >= activation_date` when measuring policy-version
+performance.
+
+**Output of a tune is a PR, not a live config write.**
+`scripts/tune_policy.py` reads from M2 replay, writes to
+`config/policy_candidate.yaml`. Human reviews the diff, runs the smoke
+verification, commits to `config/policy.yaml`. Trader only reads from
+`policy.yaml`. Aligns with Rule 18 (fail loud) and existing deploy gate
+culture.
+
+**Bridge plan until M2 replay completes.** Hand-picked values stay.
+Logged in `policy_tuning_history` with `method='hand_pick'`. Tuning is
+gated on having 60+ days of M2 replay output with `holding_day=0`
+decisions across at least 5 buckets, each with `sample_count >= 30`.
+
+### Q4. Policy versioning lifecycle
+
+**Original framing.** When we change a TradePolicy threshold, every
+prior decision's recorded `policy_version` becomes ambiguous: was it
+produced by the old or new policy? Proposal: bump the policy_version
+string and treat it as a backtest cutover boundary.
+
+**Resolution.** SemVer with explicit change-class semantics, plus
+hard separation between policy versioning and prompt/schema/code
+versioning.
+
+`policy_version` follows `MAJOR.MINOR.PATCH`:
+
+| Bump type | What changed | Comparability of old data |
+|---|---|---|
+| PATCH (1.2.3 → 1.2.4) | Threshold value(s) only — any of the 10 tunable params | Fully comparable. Bucket stats roll forward unchanged. |
+| MINOR (1.2.x → 1.3.0) | New policy param or new bucket dimension added; old logic preserved | Partially comparable. Old decisions null on new dim; backfill or treat as default subgroup. |
+| MAJOR (1.x.y → 2.0.0) | Structural change: new realized-R formula, new bucket dimension scheme, new event types in position_trace, new fail-mode hierarchy | Not comparable. Bucket stats restart from bump date. Pre-bump decisions stay queryable for audit; do not feed live BucketStats. |
+
+The first MAJOR bump landing v2 changes is `2.0.0`. Everything before is
+`1.x.y` legacy.
+
+**Four version fields per decision row.**
+
+```sql
+ALTER TABLE decisions ADD COLUMN policy_version TEXT NOT NULL DEFAULT '0.0.0';
+ALTER TABLE decisions ADD COLUMN prompt_version TEXT NOT NULL DEFAULT '0.0.0';
+ALTER TABLE decisions ADD COLUMN schema_version TEXT NOT NULL DEFAULT '0.0.0';
+ALTER TABLE decisions ADD COLUMN code_sha TEXT NOT NULL;
+```
+
+Why separate: prompt changes affect LLM classification of the same
+market; policy changes affect how classifications convert to trades;
+schema changes affect what fields exist; code_sha pins the exact running
+build. Bucket expectancy is mostly a market property (policy-invariant
+for PATCH; cross-prompt-version requires soft cutover).
+
+**Enforcement: CI-blocked silent bumps.**
+
+A pre-deploy gate (`scripts/check_version_bumps.py`) blocks commits that
+modify `strategy/llm/policy.py` or `config/policy.yaml` without bumping
+`POLICY_VERSION`. Same pattern for prompt and schema. Added to
+`WAVE_DEPLOY_CHECKLIST`.
+
+**Rollback semantics: rollback is just another version bump.**
+
+Reverting from `2.1.0` to the previous `stop_atr_clamp` value produces a
+new `2.1.1`, never reuses `2.0.0`. Recorded as `method='rollback'` in
+`policy_tuning_history`. The audit trail is monotonic.
+
+**No-peek validation under versioning.** A tune candidate that proposes
+a MINOR or MAJOR change must extend M2 replay for 30 days under the
+candidate policy in shadow mode before tuning is accepted. PATCH
+candidates may tune against existing data because the bucket population
+is unaffected.
+
+**Bucket expectancy filtering.** Default `BucketStats` aggregation
+filters `policy_version >= current_major_version`. Pre-MAJOR-bump
+decisions become audit-only. PATCH/MINOR include all data, optionally
+stratified by version.
+
+### Q5. LLM classification ground-truth
+
+**Original framing.** How do we measure whether the LLM is correctly
+classifying catalyst_quality? Options: human spot-check 50 random per
+week, Opus cross-check, realized P&L proxy. Initial proposal: do all
+three.
+
+**Resolution.** Three-layer protocol, each layer scoped to its
+strengths. The original "50 random human reviews per week" is replaced
+by a triggered review queue (~10-15/week) targeting only edge cases.
+
+| Layer | Method | Cadence | Volume | Cost |
+|---|---|---|---|---|
+| 1. Realized P&L proxy | Nightly aggregation from `position_trace`-derived realized R | Continuous | All decisions | $0 |
+| 2. Opus cross-check | Random-sample re-classification | Daily | 30/day | ~$60-90/month |
+| 3. Human review | Queue fed by anomaly triggers | As-needed | 10-15/week | Operator time on edge cases only |
+
+**Layer 1 — realized P&L is the primary truth signal.**
+
+Computed nightly, post-v2-launch decisions only
+(`policy_version >= '2.0.0'`, `holding_day = 0`, last 90 days):
+
+```sql
+SELECT 
+    catalyst_quality,
+    COUNT(*) as sample_count,
+    AVG(realized_r) as mean_r,
+    STDDEV(realized_r) / SQRT(COUNT(*)) as sem_r
+FROM decisions d
+JOIN position_trace_realized_r r ON r.decision_id = d.id
+WHERE d.holding_day = 0
+  AND d.policy_version >= '2.0.0'
+  AND d.created_at >= date('now', '-90 days')
+GROUP BY catalyst_quality;
+```
+
+**Acceptance test.** At `sample_count >= 100` per class, ordering must
+be `mean_r(MAJOR) > MATERIAL > MINOR > AMBIGUOUS ≈ NONE` with at least
+one pairwise gap statistically significant (95% CI separated).
+
+**Failure mode.** If MAJOR and MINOR mean R are within 1 sigma of each
+other at 100+ samples each, halt new deployments to MAJOR-flagged
+buckets pending investigation.
+
+**No-leak guard.** Only count realized R from buckets that passed the
+deployment gate. Shadow-mode buckets are confounded by policy's
+reluctance to size them and bias the proxy downward.
+
+**Layer 2 — Opus cross-check.**
+
+Random sample of 30 T1 classifications per day, re-run through Opus
+offline with the **same T1 prompt template** (not the T3 replay-harness
+prompt; the comparison is "what would a stronger model say with the same
+inputs").
+
+Acceptance: agreement >= 80% on `catalyst_quality`, >= 75% on
+`setup_type`. Drift below those bands escalates to investigation.
+
+Caveat: Opus and Haiku share Claude family biases; "both Claudes agreed"
+is weaker evidence than "Claude and a human agreed." This is why Layer 3
+exists for the residual cases.
+
+**Layer 3 — Human review, triggered queue.**
+
+| Trigger | Volume estimate |
+|---|---|
+| Haiku-Opus disagreement on catalyst_quality | ~6/day |
+| `clamp_anomaly` fires | <1/day in healthy state |
+| Realized R outlier (>2 sigma from bucket mean) | ~5/week |
+| Rejected-bucket decision with strongly-positive forward returns (missed opportunity) | ~5/week |
+
+Verdict drives action:
+
+- `haiku_wrong` (pattern of 3+ on same setup_type in 14 days) → prompt
+  iteration with added worked example
+- `opus_wrong` → log; rare in expectation
+- `both_correct_market_surprise` → regime-shift evidence; classifier was
+  fine, market did something unexpected
+
+**Weekly Classifier Health Report** written to
+`journal/classifier_health_YYYY-WNN.md` every Sunday night:
+
+1. Per-class agreement rate trend (90 days, daily)
+2. Per-class realized R trend (90 days, weekly)
+3. Top 10 human-reviewed cases with verdicts
+4. Active alerts (agreement < 75%, realized R separation collapsed, etc.)
+5. Bucket halts in effect
+
+**Trigger-to-action mapping.**
+
+| Signal | Threshold | Action |
+|---|---|---|
+| Agreement rate drift | -10 pp in 30 days | Halt new bucket-deployment promotions; investigate prompt |
+| Realized R separation collapse | MAJOR-MINOR CI overlaps zero (n >= 100 each) | Halt MAJOR-bucket deployments; reclassify backlog |
+| Human verdicts of "haiku_wrong" | 3+ on same setup_type in 14 days | Schedule prompt review |
+| Sustained clamp_anomaly rate | >2% over 100 calls | Already triggers Hold-only per B.3 |
+
+## Supporting schema (added by 2026-05-12 resolutions)
+
+New tables and columns introduced by the Q1-Q5 resolutions. All schema
+landed in a single `2.0.0` MAJOR policy_version bump (Q4 semantics).
+
+### New columns on `decisions`
+
+```sql
+ALTER TABLE decisions ADD COLUMN holding_day INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE decisions ADD COLUMN policy_version TEXT NOT NULL DEFAULT '0.0.0';
+ALTER TABLE decisions ADD COLUMN prompt_version TEXT NOT NULL DEFAULT '0.0.0';
+ALTER TABLE decisions ADD COLUMN schema_version TEXT NOT NULL DEFAULT '0.0.0';
+ALTER TABLE decisions ADD COLUMN code_sha TEXT NOT NULL;
+ALTER TABLE decisions ADD COLUMN bucket_key_used TEXT;
+-- bucket_key_used records the actual (possibly collapsed) bucket the
+-- hierarchical lookup landed on; differs from the entry-time bucket_key
+-- when fallback fired.
+```
+
+### `position_trace` (Q2)
+
+```sql
+CREATE TABLE position_trace (
+    trace_id INTEGER PRIMARY KEY,
+    decision_id INTEGER NOT NULL,
+    event_time TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    -- ENTRY | SCALE_UP | TAKE_PARTIAL | TRIM | STOP_RATCHET
+    -- | MORNING_BRACKET_REFRESH | CARRY_OVERNIGHT
+    -- | STOP_HIT | TARGET_HIT | EXIT_LLM | FLATTEN_1555
+    -- | MAX_DURATION_FLATTEN
+    qty_delta INTEGER,           -- + for entry/scale_up, - for partial/exit
+    fill_price REAL,             -- actual fill; null for marker events
+    new_stop_price REAL,         -- only for STOP_RATCHET
+    intent TEXT,                 -- "profit_banking" | "defensive" | "thesis_break" | null
+    FOREIGN KEY (decision_id) REFERENCES decisions(id)
+);
+```
+
+### `shadow_outcomes` extension (Q2)
+
+```sql
+ALTER TABLE shadow_outcomes ADD COLUMN day_1_eod_pct REAL;
+ALTER TABLE shadow_outcomes ADD COLUMN day_2_eod_pct REAL;
+ALTER TABLE shadow_outcomes ADD COLUMN day_3_eod_pct REAL;
+```
+
+### `policy_tuning_history` (Q3, Q4)
+
+```sql
+CREATE TABLE policy_tuning_history (
+    tuning_id INTEGER PRIMARY KEY,
+    param_name TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT NOT NULL,
+    set_at TEXT NOT NULL,
+    method TEXT NOT NULL,        -- "hand_pick" | "optuna_tune" | "rollback"
+    rationale TEXT,
+    oos_calmar_train REAL,       -- null for hand_pick / rollback
+    oos_calmar_validate REAL,
+    oos_calmar_test REAL,
+    set_by TEXT NOT NULL,
+    policy_version_after TEXT NOT NULL  -- the SemVer this change landed at
+);
+```
+
+### `opus_crosscheck` (Q5)
+
+```sql
+CREATE TABLE opus_crosscheck (
+    decision_id INTEGER PRIMARY KEY,
+    haiku_catalyst_quality TEXT,
+    opus_catalyst_quality TEXT,
+    haiku_setup_type TEXT,
+    opus_setup_type TEXT,
+    haiku_trade_readiness TEXT,
+    opus_trade_readiness TEXT,
+    agree_catalyst BOOLEAN,
+    agree_setup BOOLEAN,
+    agree_readiness BOOLEAN,
+    checked_at TEXT NOT NULL,
+    opus_response_raw TEXT,
+    FOREIGN KEY (decision_id) REFERENCES decisions(id)
+);
+```
+
+### `human_review_queue` (Q5)
+
+```sql
+CREATE TABLE human_review_queue (
+    review_id INTEGER PRIMARY KEY,
+    decision_id INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    -- "opus_disagree" | "clamp_anomaly" | "realized_r_outlier" | "missed_opportunity"
+    enqueued_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    verdict TEXT,
+    -- "haiku_wrong" | "opus_wrong" | "both_correct_market_surprise" | "ambiguous"
+    reviewer TEXT,
+    notes TEXT,
+    FOREIGN KEY (decision_id) REFERENCES decisions(id)
+);
+```
+
+### Updated BucketStats aggregation (Q1, Q2, Q4)
+
+```sql
+-- Two-regime UNION: deployed buckets use position_trace event-trace
+-- realized R; non-deployed (Hold + rejected) use shadow_outcomes
+-- simulated first-touch. Only holding_day=0 feeds entry expectancy.
+-- Policy_version filter applies the Q4 cutover semantics.
+
+WITH realized AS (
+    -- Deployed: event-trace realized R
+    SELECT 
+        d.id, d.regime, d.cap_size, d.catalyst_quality,
+        d.time_of_day_bucket, d.long_short,
+        SUM(p.qty_delta * (p.fill_price - first_entry.fill_price))
+            / (first_entry.qty_delta * d.stop_distance_pct * first_entry.fill_price)
+            AS realized_r
+    FROM decisions d
+    JOIN position_trace p ON p.decision_id = d.id
+    JOIN position_trace first_entry 
+         ON first_entry.decision_id = d.id 
+         AND first_entry.event_type = 'ENTRY'
+    WHERE d.action != 'Hold'
+      AND d.holding_day = 0
+      AND d.policy_version >= '2.0.0'
+      AND d.created_at > date('now', '-90 days')
+    GROUP BY d.id
+
+    UNION ALL
+
+    -- Non-deployed: simulated first-touch from shadow_outcomes
+    SELECT 
+        d.id, d.regime, d.cap_size, d.catalyst_quality,
+        d.time_of_day_bucket, d.long_short,
+        CASE
+            WHEN s.stop_would_hit AND s.first_touch = 'stop' THEN -1.0
+            WHEN s.target_would_hit AND s.first_touch = 'target' THEN
+                d.take_profit_atr_multiple / d.stop_loss_atr_multiple
+            ELSE s.return_eod_pct / d.stop_loss_pct
+        END as realized_r
+    FROM decisions d
+    JOIN shadow_outcomes s ON s.decision_id = d.id
+    WHERE d.action = 'Hold'  -- or rejected by policy
+      AND d.holding_day = 0
+      AND d.policy_version >= '2.0.0'
+      AND d.created_at > date('now', '-90 days')
+)
+SELECT 
+    regime, cap_size, catalyst_quality, time_of_day_bucket, long_short,
+    COUNT(*) as sample_count,
+    AVG(realized_r) as expected_r,
+    AVG(realized_r) - 1.96 * STDDEV(realized_r) / SQRT(COUNT(*)) as expected_r_lower_ci,
+    AVG(CASE WHEN realized_r > 0 THEN 1.0 ELSE 0.0 END) as win_rate,
+    AVG(CASE WHEN realized_r > 0 THEN realized_r END) as avg_win_r,
+    AVG(CASE WHEN realized_r <= 0 THEN realized_r END) as avg_loss_r
+FROM realized
+GROUP BY regime, cap_size, catalyst_quality, time_of_day_bucket, long_short
+HAVING COUNT(*) >= 5;
+```
+
+The 32 hierarchical-fallback variants are precomputed nightly as
+separate cached tables (one per dimension-subset), each populated by
+re-running the above with the relevant `GROUP BY` columns dropped.
 
 ## Out of scope (preserved from v1)
 
@@ -921,6 +1438,21 @@ adding value at all, or do we need a different prompt / model?"
   not substitute)
 - Position management beyond the cadence specified in B.1 (no continuous
   trailing stops, no percentage-based take-profits)
+- **Active trading during extended hours** (pre-market 04:00-09:30 ET,
+  after-hours 16:00-20:00 ET). Earnings-spike capture is handled via the
+  EH-informed RTH path: earnings calendar + Phase B watchlist + Phase C
+  PM RVOL feed the LLM context at the 09:30 RTH open with full bracket
+  protection. Active EH trading requires software-side stops and is
+  deferred to a separate Phase E design.
+
+## In scope, added by 2026-05-12 resolutions
+
+- **Multi-day holds up to 3 trading days** (Q2). Hard cap enforced at
+  the 15:55 routine on day 3 (`MAX_DURATION_FLATTEN`). Carry gated by
+  bucket expectancy and operational state via
+  `policy.allows_carry(bucket_key, position_state)`.
+- **EH-informed RTH earnings trading** via Finnhub calendar + Phase B
+  watchlist + Phase C PM RVOL extensions (no active EH execution).
 
 ## Status
 
@@ -937,5 +1469,15 @@ This is the design contract for v2. Sign-off here means we agree on:
 - Late-day exit bias modifier in TradePolicy
 - Sequencing: Layer 1 hotfix immediately → shadow analytics → schema → policy → M2 replay → Tier B/C → live
 
+**Resolutions added 2026-05-12 (sign-off extends to):**
+
+- Hierarchical bucket lookup (Q1): all 5 dims stored, runtime fallback collapses lowest-information dim until sample_count >= threshold; 144 max-granular buckets after default time_of_day and cap_size collapses
+- Event-trace realized R via `position_trace` table (Q2); multi-day holds up to 3 trading days with `MAX_DURATION_FLATTEN` hard cap at day-3 close; morning bracket refresh at 09:30; `holding_day` column distinguishes entry from position-management decisions
+- Calmar-optimized BayesOpt via Optuna with walk-forward validation (Q3); quarterly cadence; 10 tunable policy params, 5 untunable risk constraints; PR-style human review on every change
+- SemVer policy_version with PATCH/MINOR/MAJOR semantics (Q4); four version fields per decision (policy, prompt, schema, code_sha); CI-blocked silent bumps; rollback = new version
+- Three-layer classifier ground-truth protocol (Q5): nightly realized R proxy, daily Opus cross-check (30/day), triggered human review queue (10-15/week); weekly Classifier Health Report; explicit halt triggers
+- Active EH trading remains out of scope; EH-informed RTH path wires Finnhub earnings calendar into Phase B watchlist and Phase C PM RVOL for the 09:30 RTH open
+
 After sign-off, implementation work begins on Layer 1 (take-profit hotfix)
-in parallel with A.2 (shadow analytics).
+in parallel with A.2 (shadow analytics). The MAJOR `2.0.0` policy_version
+lands when the schema additions above ship together.
