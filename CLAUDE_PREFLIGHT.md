@@ -410,3 +410,33 @@ Before any statement that includes phrases like "today", "tomorrow", "this morni
 - For long sessions specifically, recheck the time periodically — what was "evening" when the session started may be "morning" hours later.
 - If a user reports an unexpected state ("the service isn't trading"), the FIRST diagnostic is `date` followed by `systemctl is-active` or equivalent. Don't theorize from stale time-context.
 - Phrase time-anchored statements with the verified value embedded. The embedded timestamp makes the claim auditable and forces the verification step to actually happen.
+
+## Rule 24: The Cowork bash mount can serve stale snapshots of Windows-side files; verification of "did the edit reach disk" must come from PowerShell on the host
+
+The Cowork session exposes two file-access surfaces for files under `C:\trading\LLM model\`: the file tools (`Read`/`Write`/`Edit`) and the bash sandbox mount at `/sessions/<session-id>/mnt/LLM model/`. The system prompt says these are the same files. In practice they can drift: the file tools' view can be hours ahead of what the bash mount serves, even after a successful `Edit` call that reports "file updated successfully." Verifying file content via the bash mount is NOT equivalent to verifying it on the actual Windows disk that git, the trader, and any deploy tool will read.
+
+**The rule, hard:**
+
+1. **For Windows-side files (anything under `C:\trading\LLM model\`), the bash mount is best-effort cache, not ground truth.** Treat its `cat`/`wc -l`/`tail`/`md5sum` output as informational only when reconciling with `Edit`/`Read`.
+2. **Never claim "file edits verified" based on a Read-tool spot-check alone.** Read and Edit share the same in-process view. A clean Read after a clean Edit proves the in-process buffer is internally consistent. It does NOT prove the Windows disk received the write.
+3. **Never run `git add`/`git commit`/`git push` from the bash sandbox against Windows-side files.** If the mount is stale, git will stage stale content; if the mount is fresh, you'd still be working around a 0-byte `.git/index.lock` that bash cannot unlink (separate Cowork sandbox limitation, observed same day as Rule 24's trap).
+4. **`sync` from inside the bash sandbox does not force the mount to refresh.** Verified 2026-05-12: `sync && sleep 2 && wc -l` returned the same stale line count.
+5. **The authoritative verification for Windows-side files runs from PowerShell on the user's workstation, not from any tool in the Cowork session.** Use:
+   ```powershell
+   # In a normal PowerShell window on your Windows machine, from C:\trading\LLM model\:
+   (Get-Item docs\<file>.md).Length
+   (Get-Content docs\<file>.md | Measure-Object -Line).Lines
+   Get-Content docs\<file>.md -Tail 5
+   ```
+   Compare expected (from the Edit-tool view) against actual (from PowerShell). If they disagree, the edits did not persist; regenerate. If they agree, proceed.
+6. **Git operations on Windows-side files go through PowerShell, not bash.** The deploy/commit/push path for this project is Windows-PowerShell-native. The bash sandbox is for sandboxed scripts and remote SSH, not for `git` on the local repo.
+
+**Specific trap already fallen into (2026-05-12):** During the Q1-Q5 design-question resolution session, five `Edit` calls landed against `docs/LLM_MODEL_V2_REFINEMENTS.md`, expanding it from 942 lines to 1484 lines. Each `Edit` call returned "file updated successfully." A final `Read` of the file showed 1484 lines, ending cleanly with the expected last paragraph. I marked the verification task complete and told the user "doc updates landed and verified." The user then asked if I had pushed to GitHub. I had not, and went to check via bash. Bash showed `wc -l docs/LLM_MODEL_V2_REFINEMENTS.md` = 941 lines, file size 43141 bytes, modify time May 11 20:27 UTC (yesterday evening, BEFORE any of today's edits), and `tail` cut off mid-sentence at "are out of scope today (system flattens at 15:55 ET for all posi". `sync && sleep 2` did not change the result. md5sum on the bash side did not match what a 1484-line file would have produced. The in-process Edit/Read view and the bash mount were showing different files for the same path. The user verified from PowerShell that the Windows disk had the full 1484-line file with all edits intact, and then committed and pushed from PowerShell. The bash mount was simply stale. The Rule 14 violation was real: I had declared verification complete based on a Read-tool spot-check that proved nothing about disk state. Direct cost: a sequence of alarming false-positive "the edits may not have reached disk" messages the user had to resolve before being able to commit.
+
+**How to apply:**
+
+- After any `Edit`/`Write` of a Windows-side file that matters operationally (gets committed, deployed, or shipped), the next message to the user should include the verification commands above, run from PowerShell, with expected values. Do not declare "verified" based on Read alone.
+- If the user asks "did you push to git" or any equivalent question about disk-side state, the honest answer is "I edited the file via the Edit tool. To confirm it's on disk, please run these PowerShell commands..." Do NOT answer "yes, all changes are on disk" without seeing PowerShell-side confirmation.
+- If you observe a bash-vs-Edit discrepancy (different line counts, different content, different timestamps for the same file path), state it explicitly to the user as a discrepancy, mark prior "verified" claims as `UNVERIFIED:` per Rule 14, and let the user adjudicate from PowerShell. Do not silently re-edit hoping it will resolve, do not retry sync, and do not commit from bash.
+- This rule is distinct from the OneDrive `.git/index.lock` trap. That one is about git locking; this one is about general file content. Both can fire in the same session.
+- When the user wants commit + push, hand them a PowerShell command block (with Rule 16 labelling) that includes a `Remove-Item .git\index.lock -ErrorAction SilentlyContinue` line, because the bash sandbox often leaves a 0-byte index.lock that blocks Windows-side git operations until cleared.
