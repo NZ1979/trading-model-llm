@@ -51,3 +51,8 @@ gap-and-go.tar.gz
 
 # Pytest tempdir artifacts (created by --basetemp option)
 pytest-cache-files-*/
+
+
+# Dynamic watchlist — generated daily by data/watchlist_builder.py
+# or pulled from the VPS. Per-environment, not source.
+config/watchlist_dynamic.json
