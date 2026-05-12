@@ -158,20 +158,29 @@ def main() -> int:
             f"{str(exc)[:100]}",
         )
 
-    # ---- qwen_local raises NotImplementedError (placeholder) ----
+    # ---- qwen_local constructs a real LocalClient (LM Studio reachable
+    # or not; construction is cheap and does NOT contact the network) ----
     cfg_local = _enabled_default_config()
     cfg_local["t1"]["backend"] = "qwen_local"
-    cfg_local["t1"]["model_id"] = "qwen3.6-27b-instruct-q4"
+    cfg_local["t1"]["model_id"] = "qwen/qwen3.6-27b"
     try:
-        build_tier_clients(cfg_local)
-        all_ok &= _print(
-            "qwen_local placeholder raises", False, "no exception"
+        tcs = build_tier_clients(cfg_local)
+        ok = (
+            tcs.t1 is not None
+            and tcs.t1.backend == "lm_studio_local"
+            and tcs.t1.model_id == "qwen/qwen3.6-27b"
         )
-    except NotImplementedError as exc:
         all_ok &= _print(
-            "qwen_local placeholder raises NotImplementedError",
-            "workstation" in str(exc).lower(),
-            f"{str(exc)[:80]}",
+            "qwen_local constructs LocalClient (workstation-online state)",
+            ok,
+            f"backend={tcs.t1.backend if tcs.t1 else None} "
+            f"model_id={tcs.t1.model_id if tcs.t1 else None}",
+        )
+    except Exception as exc:
+        all_ok &= _print(
+            "qwen_local constructs LocalClient",
+            False,
+            f"unexpected {type(exc).__name__}: {str(exc)[:80]}",
         )
 
     # ---- Unknown backend rejected ----

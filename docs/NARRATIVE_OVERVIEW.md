@@ -199,4 +199,4 @@ Tracked in the project task list:
 - VPS: 5.161.199.155, user `root`, service `trader.service`, code `/opt/trader/app/`
 - Primary docs: `docs/finnhub_api_compiled.md` (full API reference), `docs/finnhub_gap_and_go_evaluation.md` (gap-and-go-specific endpoint scoring), `docs/audits/EMPIRICAL_AUDIT_2026-04-29.md` (post-Bug-A/B audit)
 - Per-deploy patches: `docs/patches/<YYYY-MM-DD>-*.md`
-- Operational rules and lessons: `CLAUDE_PREFLIGHT.md` (currently 21 rules, last addition 2026-05-03 — never request command output that would expose credentials)
+- Operational rules and lessons: `CLAUDE_PREFLIGHT.md` (currently 23 rules, last addition 2026-05-12 — verify actual system date/time before any time-anchored claim)

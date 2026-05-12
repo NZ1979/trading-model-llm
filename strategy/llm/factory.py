@@ -14,8 +14,12 @@ Backend mapping:
   Tier 1 path.
 - ``anthropic``: real Anthropic API call with whatever ``model_id`` the
   config specifies (used by Tier 2 Sonnet, Tier 3 Opus).
-- ``qwen_local``: ``LocalClient`` (LM Studio). Currently raises
-  ``NotImplementedError`` on construction until the workstation arrives.
+- ``qwen_local``: ``LocalClient`` (LM Studio). Calls LM Studio's
+  OpenAI-compatible endpoint at ``base_url`` (default
+  ``localhost:1234/v1``); production Tier 1 backend with Qwen 3.6-27B
+  loaded on the workstation. Construction is cheap and does not
+  contact the network; failures surface at evaluate-time as
+  ``APIUnavailableError`` (after retries) or ``SchemaInvalidError``.
 """
 from __future__ import annotations
 
@@ -115,10 +119,17 @@ def _build_tier_client(
         )
 
     if backend == "qwen_local":
-        # Constructor raises NotImplementedError until the workstation
-        # is online with LM Studio reachable. Surfacing that error from
-        # the factory rather than silently substituting Anthropic is
-        # deliberate: misconfigured local deployment should fail loud.
-        return LocalClient(model_id=model_id)
+        # Constructs a LocalClient pointed at LM Studio's OpenAI-
+        # compatible endpoint (default base_url localhost:1234/v1).
+        # Construction does not contact the network; failures surface
+        # at evaluate-time. Not silently substituting Anthropic on
+        # failure is deliberate (Rule 18 fail-loud): a misconfigured
+        # or unreachable local deployment must fail loud, not pretend
+        # to work via cloud fallback.
+        return LocalClient(
+            model_id=model_id,
+            max_tokens=max_tokens,
+            timeout_s=timeout_s,
+        )
 
     raise ValueError(f"unknown backend: {backend!r}")

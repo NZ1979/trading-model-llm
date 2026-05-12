@@ -456,7 +456,7 @@ Tier 3 (Opus 4.6 weekly audit): ~$15-30/audit; amortizes to ~$2-5/day.
 
 | Model | 4-bit VRAM | Throughput | $/call | Per-call latency (250 out) |
 |---|---|---|---|---|
-| **Qwen 3.6-27B (production target)** | ~17GB | ~120-180 tok/s | ~$0 | ~1.5-2.5s |
+| **Qwen 3.6-27B (production target)** | ~17GB | ~45-50 tok/s (measured 2026-05-12) | ~$0 | ~5.5s |
 | Qwen 3.6-35B-A3B (MoE) | ~24GB | ~150+ tok/s | ~$0 | ~1.5-2s |
 | Llama 3.3 70B (larger comparison) | ~38GB | 50-80 tok/s | ~$0 | 3-5s |
 
@@ -470,7 +470,7 @@ cycle budget.
 
 1. **Pre-filter from cost-driven (≤30 candidates) → quality-driven (relax to 100-200, or full watchlist if model throughput allows).** The narrower limit was a budget constraint that no longer applies. Initial M2 keeps the conservative pre-filter; M3+ may relax it after measuring whether it costs us setups.
 
-2. **Per-call latency is comparable on Tier 1 local (~1.5-2.5s for Qwen 3.6-27B vs 700ms cloud).** Offset by absence of per-call dollar pressure; we just call concurrently with 16-32 way batching support from LM Studio's API. Tier 2 escalations add ~1-2s on the candidates that fire them, but only ~5-15/day, so net impact on cycle time is minimal.
+2. **Per-call latency on Tier 1 local: ~5.5s for Qwen 3.6-27B (measured 2026-05-12) vs 700-1500ms cloud.** Slower per call than Anthropic, but free and private. Per-call cost is irrelevant; we just call concurrently with 16-32 way batching support from LM Studio's API. Effective full-watchlist cycle time depends on batching efficiency (TBD via M2 replay measurement). Tier 2 escalations add ~1-2s on the candidates that fire them, but only ~5-15/day, so net impact on cycle time is minimal.
 
 3. **Cloud backend has two roles, not one.** Tier 2 selective escalation (in-cycle) and Tier 3 weekly audit (offline). Plus a fallback role if LM Studio is offline (workstation down, model unloaded, etc.) — in that mode, Sonnet handles every call rather than just escalations, and we accept the cost for the duration of the outage.
 

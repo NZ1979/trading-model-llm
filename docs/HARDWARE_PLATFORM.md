@@ -30,7 +30,7 @@ This GPU runs models that previously required cloud APIs:
 | Model | Approx 4-bit VRAM | Throughput on RTX PRO 5000 (est.) | Quality estimate |
 |---|---|---|---|
 | Llama 3.3 70B Instruct | ~38GB | ~50-80 tok/s | Top open-source for general reasoning |
-| Qwen 3.6-27B Instruct (dense) | ~17GB | ~120-180 tok/s | **Production target** — flagship-tier 27B dense (Apr 2026), 262k native context, strong JSON discipline |
+| Qwen 3.6-27B Instruct (dense) | ~17GB | ~45-50 tok/s (measured 2026-05-12) | **Production target** — flagship-tier 27B dense (Apr 2026), 262k native context, strong JSON discipline. Pre-test estimate was 120-180 tok/s; real throughput at single-stream LM Studio + thinking-disabled tool-use prompt was 43.9 and 48.2 tok/s on two contexts. |
 | DeepSeek R1 Distill 70B | ~38GB | ~50-80 tok/s | Chain-of-thought reasoning specifically |
 | Llama 3.1 8B Instruct | ~5GB | ~150+ tok/s | Fast, less capable; useful for pre-filter or screening |
 | Qwen 2.5 32B Instruct | ~17GB | ~100 tok/s | Balanced; large headroom for batching |
@@ -116,15 +116,18 @@ operating cost.
 
 ### Latency model rewrite
 
-| Path | Old (Anthropic) | New (local Qwen 3.6-27B) |
+| Path | Old (Anthropic) | New (local Qwen 3.6-27B), measured 2026-05-12 |
 |---|---|---|
-| Single call | 700-1500ms (network + inference) | 1.5-2.5s (250 output tokens × 120-180 tok/s) |
-| 30-candidate cycle (concurrent) | ~2s (10-way concurrency) | ~2-4s (16-32 way batching) |
-| 500-candidate cycle | not feasible (cost) | 20-40s (depending on batching) |
+| Single call (250 output tokens) | 700-1500ms (network + inference) | ~5.5s (43-50 tok/s) |
+| Single call (500 output tokens, long reasoning) | 1-2s | ~11s |
+| 30-candidate cycle (concurrent) | ~2s (10-way concurrency) | ~10-30s (16-32 way batching, est.) |
+| 500-candidate cycle | not feasible (cost) | ~60-180s (est.; batching efficiency to be measured during M2 replay) |
 
-Local at 27B is *comparable per call* to Anthropic with substantially
-larger batching headroom on the 48GB GPU. A 20-40s full-watchlist sweep
-leaves substantial cycle-time margin — we have 300s before the next bar.
+Local at 27B is slower per call than Anthropic but free and private,
+and the 48GB card has the VRAM for substantial batching. A 60-180s
+full-watchlist sweep is well within the 300s cycle budget; batching
+efficiency is the main unknown and will be characterized when the M2
+replay harness runs multi-candidate batches against historical contexts.
 
 ### Live trading deployment options
 
