@@ -31,7 +31,14 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-DEFAULT_BASE_URL = "http://localhost:1234/v1"
+DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
+# 127.0.0.1 not "localhost": on Windows, Python's urllib resolves
+# "localhost" to IPv6 (::1) first via dual-stack DNS. LM Studio binds
+# only to IPv4 by default, so a localhost-based request gets
+# "WinError 10061 actively refused" before falling back to IPv4.
+# Verified 2026-05-12: identical script with localhost failed; with
+# 127.0.0.1 succeeded immediately. Override with --base-url if your
+# LM Studio is bound to a different interface.
 DEFAULT_MODEL = "qwen/qwen3.6-27b"
 
 TEST_PROMPT = (
