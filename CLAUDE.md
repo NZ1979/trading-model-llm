@@ -86,6 +86,11 @@ python -m scripts.verify_prompts
 python -m scripts.verify_llm_factory
 python -m scripts.verify_anthropic_client
 python -m scripts.verify_metrics
+
+# verify_alpaca.py makes a REAL network call to paper-api.alpaca.markets
+# Requires ALPACA_API_KEY and ALPACA_API_SECRET in the environment.
+# Use after rotating Alpaca credentials to prove the new pair works.
+python scripts/verify_alpaca.py
 ```
 
 VPS deploy is a separate workflow — see `docs/WAVE_DEPLOY_CHECKLIST.md` for the gated procedure (code review → logging audit → credential surface audit → execution-context label audit → placeholder audit → pre-flight → atomic deploy with `py_compile` ON the VPS → post-restart credential-leak grep → 24h soak). Production lives at `5.161.199.155` (`/opt/trader/app/`, systemd unit `trader.service`).
