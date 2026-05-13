@@ -20,19 +20,16 @@ def test_alpaca_api_error_parses_json_body():
     e = AlpacaAPIError(422, "POST", "/v2/orders", body)
     assert e.code == 40010001
     assert "code=40010001" in str(e) and "take_profit.limit_price" in str(e)
-    return "AlpacaAPIError parses JSON body"
 
 
 def test_alpaca_api_error_handles_non_json_body():
     e = AlpacaAPIError(503, "GET", "/v2/account", "<html>oops</html>")
     assert e.code is None and "HTTP 503" in str(e)
-    return "non-JSON body handled"
 
 
 def test_alpaca_api_error_handles_empty_body():
     e = AlpacaAPIError(500, "POST", "/v2/orders", "")
     assert e.code is None
-    return "empty body handled"
 
 
 # ---- Bug E ----
@@ -45,7 +42,6 @@ def test_split_multistatus_mixed():
     ]
     ok, bad = _split_multistatus(items, key="symbol")
     assert len(ok) == 2 and len(bad) == 1 and bad[0]["symbol"] == "CLX"
-    return "2 success + 1 fail split"
 
 
 def test_split_multistatus_edge_cases():
@@ -53,7 +49,6 @@ def test_split_multistatus_edge_cases():
     assert _split_multistatus(None, key="symbol") == ([], [])
     ok, bad = _split_multistatus(["str", {"symbol": "X", "status": 200}], key="symbol")
     assert len(ok) == 1 and len(bad) == 1
-    return "edge cases (empty/non-list/non-dict-items) handled"
 
 
 # ---- Bug F: close_all_positions ----
@@ -78,7 +73,6 @@ async def test_full_success_first_try():
     assert len(r["cancelled_orders"]) == 1
     assert len(r["closed_positions"]) == 1 and r["closed_positions"][0]["retries"] == 0
     assert r["errors"] == []
-    return "full success on first try"
 
 
 async def test_empty_account():
@@ -90,7 +84,6 @@ async def test_empty_account():
     client._get, client._delete = fake_get, fake_delete
     r = await client.close_all_positions(cancel_orders=True)
     assert r["cancelled_orders"] == [] and r["closed_positions"] == [] and r["errors"] == []
-    return "empty account: no-op clean"
 
 
 async def test_retry_on_insufficient_qty_succeeds():
@@ -132,7 +125,6 @@ async def test_retry_on_insufficient_qty_succeeds():
     assert r["closed_positions"][0]["retries"] == 1, f"expected 1 retry, got {r['closed_positions'][0]['retries']}"
     assert r["errors"] == []
     assert delete_attempts["n"] == 2, f"expected 2 attempts, got {delete_attempts['n']}"
-    return "403 + 40310000 triggers retry, 2nd attempt succeeds"
 
 
 async def test_retry_exhausts_to_failure():
@@ -150,7 +142,6 @@ async def test_retry_exhausts_to_failure():
     assert cr["ok"] is False
     assert cr["retries"] == 3
     assert "40310000" in cr["error"]
-    return "retries exhausted, failure reported with error"
 
 
 async def test_non_retriable_error_no_retry():
@@ -165,7 +156,6 @@ async def test_non_retriable_error_no_retry():
     client._delete = one_404
     cr = await client._close_position_with_retry("X", max_retries=5, backoff_sec=0.005)
     assert cr["ok"] is False and cr["retries"] == 0 and n["calls"] == 1
-    return "404 does not trigger retry"
 
 
 async def test_wait_for_release_exits_when_ready():
@@ -179,7 +169,6 @@ async def test_wait_for_release_exits_when_ready():
     client._get = fake_get
     wr = await client._wait_for_release(max_wait_sec=5.0, poll_interval_sec=0.005)
     assert poll["n"] >= 2 and wr["still_held"] == [] and wr["wait_sec"] < 1.0
-    return f"poll loop exits when released ({poll['n']} polls)"
 
 
 async def test_wait_for_release_times_out():
@@ -189,7 +178,6 @@ async def test_wait_for_release_times_out():
     client._get = held
     wr = await client._wait_for_release(max_wait_sec=0.05, poll_interval_sec=0.01)
     assert len(wr["still_held"]) == 1 and wr["wait_sec"] >= 0.05 and wr["wait_sec"] < 0.5
-    return "poll loop times out cleanly"
 
 
 async def test_partial_failure_per_position():
@@ -231,7 +219,6 @@ async def test_partial_failure_per_position():
     closed = [c["symbol"] for c in r["closed_positions"]]
     assert "OK" in closed and "STUCK" not in closed
     assert len(r["errors"]) == 1 and "STUCK" in r["errors"][0]
-    return "partial: OK closed, STUCK in errors"
 
 
 async def test_no_wait_when_nothing_canceled():
@@ -247,7 +234,6 @@ async def test_no_wait_when_nothing_canceled():
     client._get, client._delete = fake_get, fake_delete
     await client.close_all_positions(cancel_orders=True)
     assert len(get_calls) == 1, f"expected 1 _get, got {len(get_calls)}"
-    return "no wait_for_release when no orders canceled"
 
 
 async def test_submit_bracket_order_catches_api_error():
@@ -264,7 +250,6 @@ async def test_submit_bracket_order_catches_api_error():
     )
     assert isinstance(r, OrderResult) and r.success is False
     assert "40010001" in r.error
-    return "bracket_order surfaces structured error"
 
 
 def main():
@@ -289,11 +274,15 @@ def main():
     ]
     results = []
     for t in sync:
-        try: results.append(("PASS", t.__name__, t()))
+        try:
+            t()
+            results.append(("PASS", t.__name__, ""))
         except AssertionError as e: results.append(("FAIL", t.__name__, str(e)))
         except Exception as e: results.append(("ERROR", t.__name__, f"{type(e).__name__}: {e}"))
     for t in asyncs:
-        try: results.append(("PASS", t.__name__, asyncio.run(t())))
+        try:
+            asyncio.run(t())
+            results.append(("PASS", t.__name__, ""))
         except AssertionError as e: results.append(("FAIL", t.__name__, str(e)))
         except Exception as e: results.append(("ERROR", t.__name__, f"{type(e).__name__}: {e}"))
     for s, n, m in results:

@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# pytest-asyncio mode. "auto" treats every `async def test_*` as an asyncio
+# test without needing an explicit @pytest.mark.asyncio decorator on each.
+# Without this, async tests fail with:
+#   "async def functions are not natively supported".
+# pytest-asyncio is installed via requirements-llm.txt (pinned >=0.23.0).
+asyncio_mode = "auto"
