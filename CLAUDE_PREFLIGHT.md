@@ -440,3 +440,32 @@ The Cowork session exposes two file-access surfaces for files under `C:\trading\
 - If you observe a bash-vs-Edit discrepancy (different line counts, different content, different timestamps for the same file path), state it explicitly to the user as a discrepancy, mark prior "verified" claims as `UNVERIFIED:` per Rule 14, and let the user adjudicate from PowerShell. Do not silently re-edit hoping it will resolve, do not retry sync, and do not commit from bash.
 - This rule is distinct from the OneDrive `.git/index.lock` trap. That one is about git locking; this one is about general file content. Both can fire in the same session.
 - When the user wants commit + push, hand them a PowerShell command block (with Rule 16 labelling) that includes a `Remove-Item .git\index.lock -ErrorAction SilentlyContinue` line, because the bash sandbox often leaves a 0-byte index.lock that blocks Windows-side git operations until cleared.
+
+## Rule 25: Verify session anchors at the start of every new chat or task
+
+Three anchors silently drift between sessions, and going in stale on any of them poisons every downstream instruction: current date/time, the user's project working directory, and which physical workstation the user is on. Verify all three before recommending any command, file edit, deploy step, or operational action.
+
+**The rule, hard:**
+
+At the start of every new chat or task — and again whenever a new operational action is about to be issued in a long session — confirm explicitly:
+
+1. **Current date/time.** Run `date && TZ=America/New_York date` (per Rule 23). State the verified ET time in the response. Do not rely on the session env header or on prior conversation framing.
+
+2. **Working directory is `C:\trading\LLM model`.** This is the LLM-fork project root and the only path under which this CLAUDE.md / CLAUDE_PREFLIGHT.md applies. All file paths, git operations, and PowerShell command blocks anchor here. If the user appears to be operating from a different path (`C:\trading\trading-platform` upstream base, `/opt/trader/app/` on the VPS, any other repo), surface the mismatch before continuing — the rule sets and the running fork are not the same.
+
+3. **Workstation is "Godzilla".** Godzilla is the user's new local workstation, intended to host the local Qwen 3.6-27B tier-1 LLM via LM Studio per `docs/LLM_MODEL_CHARTER.md` and the LLM signal generator architecture in CLAUDE.md. Godzilla is distinct from:
+   - The Hetzner VPS at `5.161.199.155` (`/opt/trader/app/`, `trader.service`, account `PA3REQ1LMPKO`) — currently runs the gap-and-go fork with `llm.enabled: false`, per Rule 20's project-specific corollary.
+   - Any prior laptop or workstation referenced in older transcripts.
+   
+   Recommendations involving local hardware (GPU, VRAM, LM Studio config, CUDA, local model file paths, `.venv` activation) apply to Godzilla. Recommendations involving systemd, journalctl, `/opt/trader/app/`, or `/etc/trading-platform/env` apply to the VPS. Never conflate them.
+
+State all three verifications inline in the first substantive response of the session, e.g.:
+
+> Verified: Wed 2026-05-13 09:21 EDT; working in `C:\trading\LLM model`; workstation Godzilla.
+
+**How to apply:**
+
+- The first tool calls of any new chat with operational intent are `date && TZ=America/New_York date` plus, when ambiguous, a quick directory/file existence check to confirm we're talking about the LLM fork and not the upstream base.
+- If the user references a path outside `C:\trading\LLM model`, pause and confirm which codebase the action targets before issuing commands.
+- For any recommendation involving local model execution, LM Studio, GPU memory, local CUDA, or workstation-side Python: assume Godzilla. For systemd / journalctl / VPS paths: that's the Hetzner box. If a step crosses both, label each command block per Rule 16 with which machine it runs on.
+- Cross-reference Rule 20: the Hetzner VPS is NOT the LLM model's deployment. Recommending an LLM-fork action on the VPS without an explicit migration plan is the trap Rule 20 was written to catch.
