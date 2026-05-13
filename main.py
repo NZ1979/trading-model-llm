@@ -152,6 +152,71 @@ def _require_env(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Schema migrations
+# ---------------------------------------------------------------------------
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Return True if `column` exists on `table` in the connected DB."""
+    cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r[1] == column for r in cols)
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, defn: str,
+) -> None:
+    """ALTER TABLE ADD COLUMN, but only if the column isn't already present.
+
+    SQLite has no `ALTER TABLE ADD COLUMN IF NOT EXISTS`. We synthesize it
+    via PRAGMA table_info introspection so re-running `init_v2_schema` on
+    an already-migrated DB is a no-op.
+    """
+    if not _column_exists(conn, table, column):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {defn}")
+
+
+def init_v2_schema(conn: sqlite3.Connection) -> None:
+    """Apply v2 schema migrations idempotently.
+
+    Per docs/LLM_MODEL_V2_REFINEMENTS.md § Supporting schema (Q2 + Q4).
+    Adds new columns to `decisions` and `shadow_outcomes`, creates the
+    `position_trace` event ledger, and indexes `position_trace.decision_id`.
+
+    Requires v1 tables (`decisions`, `shadow_outcomes`) to already exist;
+    Orchestrator._init_db creates those before calling this function.
+    """
+    # decisions (Q2: holding_day; Q4: four version fields; Q1: bucket_key_used)
+    _add_column_if_missing(conn, "decisions", "holding_day", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "decisions", "policy_version", "TEXT NOT NULL DEFAULT '0.0.0'")
+    _add_column_if_missing(conn, "decisions", "prompt_version", "TEXT NOT NULL DEFAULT '0.0.0'")
+    _add_column_if_missing(conn, "decisions", "schema_version", "TEXT NOT NULL DEFAULT '0.0.0'")
+    _add_column_if_missing(conn, "decisions", "code_sha", "TEXT NOT NULL DEFAULT 'unknown'")
+    _add_column_if_missing(conn, "decisions", "bucket_key_used", "TEXT")
+
+    # shadow_outcomes extension (Q2: multi-day holds up to 3 trading days)
+    _add_column_if_missing(conn, "shadow_outcomes", "day_1_eod_pct", "REAL")
+    _add_column_if_missing(conn, "shadow_outcomes", "day_2_eod_pct", "REAL")
+    _add_column_if_missing(conn, "shadow_outcomes", "day_3_eod_pct", "REAL")
+
+    # position_trace event ledger (Q2)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS position_trace ("
+        "trace_id INTEGER PRIMARY KEY, "
+        "decision_id INTEGER NOT NULL, "
+        "event_time TEXT NOT NULL, "
+        "event_type TEXT NOT NULL, "
+        "qty_delta INTEGER, "
+        "fill_price REAL, "
+        "new_stop_price REAL, "
+        "intent TEXT, "
+        "FOREIGN KEY(decision_id) REFERENCES decisions(id))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_position_trace_decision_id "
+        "ON position_trace(decision_id)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Trading platform
 # ---------------------------------------------------------------------------
 
@@ -275,6 +340,9 @@ class TradingPlatform:
                 "populated_at REAL NOT NULL, horizon_complete TEXT NOT NULL, "
                 "FOREIGN KEY(decision_id) REFERENCES decisions(id))"
             )
+            # v2 schema migrations (Q2 + Q4 in LLM_MODEL_V2_REFINEMENTS.md).
+            # Idempotent: re-running on a fully-migrated DB is a no-op.
+            init_v2_schema(conn)
 
     # ------------------------------------------------------------------
     # Boot
@@ -300,7 +368,7 @@ class TradingPlatform:
         )
 
         # 0b. Finnhub HTTP client (Wave 1A: earnings calendar veto for gap-and-go).
-        # No background task — used on-demand by the daily backfill at 8:30 ET
+        # No background task â€” used on-demand by the daily backfill at 8:30 ET
         # to populate the catalysts table.
         self.finnhub_client = FinnhubClient(api_key=secrets["finnhub_key"])
         await self.finnhub_client.__aenter__()
@@ -365,7 +433,7 @@ class TradingPlatform:
             self._daily_routine_loop(), name="DailyRoutine"
         ))
 
-        # 5. Task supervisor — watches the long-running tasks for silent death.
+        # 5. Task supervisor â€” watches the long-running tasks for silent death.
         # Background tasks created via asyncio.create_task() can complete or
         # raise without anyone noticing. The supervisor logs loudly if a task
         # exits unexpectedly and restarts the AlpacaBars task specifically
@@ -424,7 +492,7 @@ class TradingPlatform:
 
                     if exc is None:
                         logger.error(
-                            "Task %s exited cleanly (returned None) — this is "
+                            "Task %s exited cleanly (returned None) â€” this is "
                             "unexpected for a long-running task", name,
                         )
                     else:
@@ -500,7 +568,7 @@ class TradingPlatform:
             now_t = now_et.time()
             is_weekday = now_et.weekday() < 5  # Mon-Fri
 
-            # Backfill (08:30 ET, weekdays only — needs market data)
+            # Backfill (08:30 ET, weekdays only â€” needs market data)
             if is_weekday and backfill_done_for != today and now_t >= backfill_time:
                 try:
                     await self._run_baseline_backfill()
@@ -591,7 +659,7 @@ class TradingPlatform:
 
         Both phases run concurrently with Semaphore caps. Pre-fix this method
         looped sequentially fetching MINUTE bars over 450 days per ticker and
-        resampled to daily — silently failed on most of 503 tickers (only
+        resampled to daily â€” silently failed on most of 503 tickers (only
         loaded ~26). The fix uses Polygon's daily-bar endpoint and concurrency.
         """
         secrets = self.config["_secrets"]
@@ -620,7 +688,7 @@ class TradingPlatform:
         # compute_daily_context returns None (tickers with <200 daily bars,
         # e.g. recent spinoffs like SNDK). The DataFrame is still useful for
         # premarket ATR computation, and gap-and-go doesn't need daily_ctx
-        # — only the pullback path does.
+        # â€” only the pullback path does.
         n_daily_short_history = 0
         for ticker, daily in daily_dfs.items():
             try:
@@ -673,7 +741,7 @@ class TradingPlatform:
 
         Builds top-500-by-30D-ADV from Russell 2000 constituents and writes
         `config/watchlist_dynamic.json`. Runs daily at 08:30 ET including
-        weekends — no weekday gating.
+        weekends â€” no weekday gating.
 
         Does NOT update self.watchlist mid-run. The new list is picked up
         on next service restart, when __init__ reads watchlist_dynamic.json.
@@ -717,7 +785,7 @@ class TradingPlatform:
         excluded tickers with <200 daily bars (e.g. SNDK after the WD
         spinoff). Those tickers had daily_df available but were silently
         skipped, making gap-and-go unreachable for them. Now we gate on
-        daily_df instead — the only thing premarket_ctx actually needs.
+        daily_df instead â€” the only thing premarket_ctx actually needs.
         """
         for ticker, state in self.symbols.items():
             df = state.to_dataframe()
@@ -829,7 +897,7 @@ class TradingPlatform:
         # the strategy isn't designed for. Pullback path is unaffected
         # (mean-reversion can be valid signal even on earnings days).
         # NOTE: TechnicalSignal's field is `.signal` (Buy/Sell/Hold), not
-        # `.action` — TradeDecision uses `.action` but TechnicalSignal does
+        # `.action` â€” TradeDecision uses `.action` but TechnicalSignal does
         # not. Bug fix 2026-05-04 after AttributeError storm in production.
         if tech.signal != "Hold" and tech.setup == "gap_and_go":
             today_et = datetime.now(ET).date().isoformat()
@@ -942,7 +1010,7 @@ class TradingPlatform:
         )
         risk_per_trade = risk_cfg.get("risk_per_trade_pct", 0.5)
         logger.info(
-            "%s: ATR stop sizing — atr=%.3f stop_pct=%.2f%% (fallback=%.2f%%)",
+            "%s: ATR stop sizing â€” atr=%.3f stop_pct=%.2f%% (fallback=%.2f%%)",
             decision.ticker, daily_atr, stop_loss_pct, fallback_stop_pct,
         )
         qty = size_from_risk(
