@@ -469,3 +469,43 @@ State all three verifications inline in the first substantive response of the se
 - If the user references a path outside `C:\trading\LLM model`, pause and confirm which codebase the action targets before issuing commands.
 - For any recommendation involving local model execution, LM Studio, GPU memory, local CUDA, or workstation-side Python: assume Godzilla. For systemd / journalctl / VPS paths: that's the Hetzner box. If a step crosses both, label each command block per Rule 16 with which machine it runs on.
 - Cross-reference Rule 20: the Hetzner VPS is NOT the LLM model's deployment. Recommending an LLM-fork action on the VPS without an explicit migration plan is the trap Rule 20 was written to catch.
+
+## Rule 26: Hard partition between LLM-model (Godzilla) and gap-and-go (old laptop + VPS)
+
+The two forks of `trading-platform` running in this project operate on separate machines, separate Cowork sessions, and separate Alpaca accounts. They do not share operational threads, not even read-only ones. Rules 20 and 25 stated the separation at a planning level; this rule makes it operational and enforceable.
+
+**The two forks:**
+
+- **LLM-model fork**: Lives at `C:\trading\LLM model\` on workstation **Godzilla**. Future home of Qwen 3.6-27B tier-1 via LM Studio. Will eventually deploy to Alpaca paper account `PA3QAZ941NFN` (Large Cap) on infrastructure to be provisioned (Godzilla as runtime, or a separate VPS — TBD).
+- **Gap-and-go fork**: Lives on the user's **old laptop** as its development root, and is deployed to the **Hetzner VPS at `5.161.199.155`** (`/opt/trader/app/`, `trader.service`, account `PA3REQ1LMPKO`). Currently running paper trades; `llm.enabled: false`. Maintained independently from Godzilla.
+
+**The rule, hard:**
+
+From any session anchored in `C:\trading\LLM model\` on Godzilla (per Rule 25):
+
+1. Do NOT SSH to `5.161.199.155`. Do NOT use `scp` or `rsync` against it. Do NOT include its hostname or any path under `/opt/trader/app/` in any command block.
+2. Do NOT read, query, copy, or modify `/opt/trader/app/trading.db` or any file under `/opt/trader/app/`.
+3. Do NOT commit, push, pull, or fetch against the gap-and-go fork's repository. The LLM-model fork has its own remote (`https://github.com/NZ1979/trading-model-llm.git`); operations stay on that remote only.
+4. Do NOT reference gap-and-go operational state (decisions, orders, account balances, journalctl output, systemd status) as context for LLM-model work. Even quoting it for "baseline comparison" is a partition violation — use local test data, replay fixtures, or deliberately-curated sanitized snapshots if realistic data is needed.
+5. Do NOT recommend operational steps that take an LLM-fork script (anything under `C:\trading\LLM model\scripts\`, including `backfill_shadow_outcomes.py`, `analyze_shadow_outcomes.py`, the `verify_*.py` family) and run it against the VPS's data or codebase. LLM-fork scripts import from `strategy.llm.*` modules that do not exist in the gap-and-go fork; running them touches LLM-fork code paths against gap-and-go data, which is exactly the contamination this rule prevents.
+
+Symmetric prohibitions apply from gap-and-go sessions:
+
+6. From any session anchored in the gap-and-go fork on the old laptop: do NOT touch `C:\trading\LLM model\`, Godzilla, or the LLM-model repo. Do NOT pull LLM-model commits into the gap-and-go fork. Operational ops of the gap-and-go fork happen on the old laptop, in the gap-and-go fork's repo, in separate Cowork sessions on that machine.
+
+**The only legitimate crossing point** is the eventual migration when the LLM model deploys to its own account (`PA3QAZ941NFN`) on its own infrastructure. That deploy is a planned, documented event with its own checklist (analogous to `docs/WAVE_DEPLOY_CHECKLIST.md`), its own pre-flight audit, and its own atomic cutover. It happens in a dedicated session, NOT as a side effect of LLM-fork development work.
+
+**Detection and response:**
+
+Treat the following strings as **TRIPWIRES** inside an LLM-model session — their appearance in a command, file path, recommendation, or even an explanatory paragraph means a partition check is required before sending: `5.161.199.155`, `/opt/trader/app/`, `hetzner_trader`, `PA3REQ1LMPKO`, `trader.service`, `trader-prod`.
+
+If a request inside an LLM-model session implies touching the gap-and-go side — phrases like "backfill from production," "check the VPS logs," "use the prod decisions table as ground truth," "ssh to the trader server" — STOP and name the partition violation before doing anything. The right answer is almost always "operate within Godzilla on the LLM-model fork alone." If the user genuinely needs cross-fork data, that becomes its own scoped task with its own constraints, requested deliberately, not pulled in as ambient context.
+
+**Specific trap already fallen into (2026-05-13):** This session, anchored at `C:\trading\LLM model\` on Godzilla, repeatedly crossed the partition: (1) had the user SSH from Godzilla into the VPS to inspect `/opt/trader/app/trading.db`; (2) was about to recommend copying that DB down to Godzilla and running `scripts/backfill_shadow_outcomes.py` — an LLM-fork-specific script that imports `strategy.llm.metrics` — against the gap-and-go fork's decisions, which would have applied LLM-fork code paths to gap-and-go data and produced `shadow_outcomes` rows that conflate the two; (3) was treating gap-and-go decision counts as "useful baseline data for the LLM model," when they're separate-codebase, separate-account data that has no business being analyzed from an LLM-model session. The user caught the third violation explicitly: "is the LLM model actually trading, or just running data in the background? confirm this is not the gap-and-go model." Damage was zero (read-only queries, no writes, no LLM-fork scripts executed against VPS), but the trajectory was clearly toward contamination. The fix is this rule.
+
+**How to apply:**
+
+- Every session opens with Rule 25's anchor verification: date/time, working directory `C:\trading\LLM model`, workstation Godzilla. If the working directory is anywhere outside `C:\trading\LLM model`, this rule's session-side prohibitions do not apply (you may be in a gap-and-go session instead — apply the symmetric prohibitions there).
+- For LLM-model development that needs realistic data (testing shadow_outcomes scoring, validating `policy.py` against historical setups), use SYNTHESIZED fixtures or a deliberately-curated local SQLite DB that lives only inside the LLM-model repo (e.g., `tests/fixtures/` or a small committed sample DB). Do NOT pull from the gap-and-go production DB.
+- When the LLM model is ready to deploy, that's a planned cutover with its own session, its own account credentials (`PA3QAZ941NFN`), its own infrastructure decision (Godzilla as runtime vs a fresh VPS), and its own pre-flight gates. Not a "let's just borrow the existing VPS for a bit" move.
+- This rule supersedes any earlier conversational pattern in which an LLM-model session has discussed gap-and-go state. If you (Claude) find yourself reaching for VPS context inside an LLM-model session, that's the signal to stop and re-anchor.
