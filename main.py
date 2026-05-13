@@ -73,7 +73,11 @@ from data.pm_rvol_thresholds import (
     load_thresholds as pm_rvol_thresholds_load,
     get_threshold as pm_rvol_thresholds_get,
 )
-from data.watchlist_builder import read_watchlist_file, refresh_dynamic_watchlist
+from data.watchlist_builder import (
+    read_watchlist_file,
+    refresh_dynamic_watchlist,
+    default_small_cap_sources,
+)
 from execution.alpaca_orders import AlpacaOrderClient, OrderResult
 from scripts.build_pm_rvol_thresholds import refresh_pm_rvol_thresholds
 from strategy.risk import compute_atr_stop_pct, size_from_risk, validate_order
@@ -658,20 +662,30 @@ class TradingPlatform:
         )
 
     async def _run_dynamic_watchlist_refresh(self) -> None:
-        """Refresh the dynamic watchlist (Phase B).
+        """Refresh the dynamic watchlist (Phase B + fork override 2026-05-13 restored).
 
-        Builds top-500-by-30D-ADV from the union of S&P 500 + NASDAQ-100 +
-        DJIA constituents (sourced from Wikipedia) and writes
+        Gap-and-go fork override: passes ``sources=default_small_cap_sources()``
+        so the universe is the Russell 2000 (via iShares IWM holdings) instead
+        of the base's S&P 500 + NASDAQ + DJIA. This is the fork's primary
+        deviation from base; the upstream merge of 2026-05-12 auto-resolved
+        this line back to base and was restored 2026-05-13 after R2K trading
+        regressed to large-caps.
+
+        Builds top-500-by-30D-ADV from Russell 2000 constituents and writes
         `config/watchlist_dynamic.json`. Runs daily at 08:30 ET including
-        weekends — no weekday gating. Membership rarely changes, but ADV
-        ranking does shift slightly day-to-day.
+        weekends — no weekday gating.
 
         Does NOT update self.watchlist mid-run. The new list is picked up
         on next service restart, when __init__ reads watchlist_dynamic.json.
         """
         polygon_key = self.config["_secrets"]["polygon_key"]
         output_path = Path("config/watchlist_dynamic.json")
-        await refresh_dynamic_watchlist(polygon_key, output_path, top_n=500)
+        await refresh_dynamic_watchlist(
+            polygon_key,
+            output_path,
+            top_n=500,
+            sources=default_small_cap_sources(),
+        )
 
     async def _run_pm_rvol_thresholds_refresh(self) -> None:
         """Refresh per-ticker PM RVOL thresholds (Phase C, 2026-05-06).
@@ -901,6 +915,14 @@ class TradingPlatform:
             logger.warning("Skipping %s: equity unavailable", decision.ticker)
             return
 
+        # Bug I 2026-05-06 (restored 2026-05-13 after Layer 1 backport regression):
+        # _place_order needs the per-symbol state to read daily_ctx for ATR sizing,
+        # but the function only receives decision/price/id as parameters. Look it
+        # up here. If the symbol isn't in self.symbols (shouldn't happen since the
+        # decision came from a symbol we track), default daily_atr to 0.0 via the
+        # safety check below.
+        state = self.symbols.get(decision.ticker)
+
         # Bug H 2026-05-06: stop distance is now ATR-aware. Falls back to
         # the configured fixed pct when daily_atr_14 is missing (e.g. for
         # tickers with insufficient daily history).
@@ -908,7 +930,7 @@ class TradingPlatform:
         risk_cfg = self.config["risk"]
         daily_atr = (
             state.daily_ctx.daily_atr_14
-            if state.daily_ctx is not None else 0.0
+            if state is not None and state.daily_ctx is not None else 0.0
         )
         stop_loss_pct = compute_atr_stop_pct(
             entry_price=latest_price,
