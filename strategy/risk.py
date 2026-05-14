@@ -177,6 +177,63 @@ def _compute_stop(side: Side, entry_price: float, stop_pct: float) -> float:
     return round(entry_price - delta, 2) if side == "buy" else round(entry_price + delta, 2)
 
 
+def compute_take_profit_price(
+    side: Side,
+    entry_price: float,
+    daily_atr: float,
+    tp_atr_multiple: float,
+    enabled: bool,
+) -> float | None:
+    """Compute the take-profit limit price for a bracket order.
+
+    Layer 1 of v2 profit protection (see ``docs/LLM_MODEL_V2_REFINEMENTS.md``
+    § B.1). Pure function: extracted from the inline computation that
+    previously lived in ``main.py`` so the decision logic is unit-testable
+    independent of the orchestrator's full submit path.
+
+    Returns ``None`` in two scenarios — both correct and explicit:
+
+    1. ``enabled=False``: the operator has not turned on the TP leg.
+       The caller submits an OTO order (entry + stop only); v1 behavior
+       is preserved exactly.
+    2. ``daily_atr <= 0``: indicator warmup hasn't completed for the
+       ticker. We cannot compute a sensible TP distance from ATR, so
+       we degrade rather than fabricate one. Caller is expected to log
+       a warning so the gap is visible in operational logs (Rule 18).
+
+    Both fallbacks intentionally fail loud at the caller's log layer
+    rather than silently dropping the TP — the operator should see why
+    a particular order shipped without a TP leg.
+
+    Args:
+        side: "buy" or "sell". Determines the sign of the TP offset.
+        entry_price: limit price of the entry order. The TP is computed
+            relative to this, not to current mid.
+        daily_atr: 14-period daily ATR in price units (not %). 0 means
+            "not computed yet"; negative is treated the same.
+        tp_atr_multiple: how many daily ATRs above (long) or below
+            (short) entry to place the TP. Pinned 1.0..5.0 by the
+            LLMDecision Pydantic bounds and the config default of 2.0.
+        enabled: ``risk.take_profit_enabled`` from config. Defaults to
+            False historically; flipped to True activates the TP leg.
+
+    Returns:
+        The take-profit limit price rounded to 2 decimals when both
+        gates pass, otherwise ``None``. The price always points the
+        profitable direction (above entry for buy, below for sell);
+        the bracket submitter (``execution/alpaca_orders.py``) re-validates
+        this strict-inequality property as a defense-in-depth check.
+    """
+    if not enabled:
+        return None
+    if daily_atr <= 0:
+        return None
+    distance = tp_atr_multiple * daily_atr
+    if side == "buy":
+        return round(entry_price + distance, 2)
+    return round(entry_price - distance, 2)
+
+
 def _total_exposure_pct(positions: list[Position], equity: float) -> float:
     if equity <= 0:
         return 0.0

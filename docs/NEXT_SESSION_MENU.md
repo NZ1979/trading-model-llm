@@ -20,9 +20,12 @@ Seeds the analytics table from existing v1 decisions. Explicit precondition for 
 
 ## Phase 1 build tasks
 
-- **"Build `strategy/llm/policy.py` (TradePolicy module)."** The largest single Phase 1 task. Implements Q1's hierarchical bucket lookup + the decision logic. Pure-deterministic, unit-testable. ~2 days.
+- **"Build `strategy/llm/policy.py` (TradePolicy module)."** The largest single Phase 1 task. Implements Q1's hierarchical bucket lookup + decision logic + liquidity gate + cross-sectional ranking + EV scoring (review #2 integration). Pure-deterministic, unit-testable. ~2.5 days.
 - **"Build `strategy/llm/analysis.py` (LLMAnalysis schema)."** Q-resolution A.1: Pydantic LLMAnalysis class + LLMOutput wrapper + prompt template additions. ~2 days.
 - **"Add `position_trace` table and the schema additions on `decisions`."** Per Q2 + Q4 resolutions: holding_day, four version fields, bucket_key_used. ~1 day.
+- **"Build `analysis/regime.py` (regime classifier)."** New deterministic 3-bucket classifier (SPY return + VIX + breadth). Populates `LLMContext.market_regime_label`. ~1 day. Review #2 integration. Self-contained, no dependencies.
+- **"Build `analysis/calibration.py` (confidence calibrator)."** Isotonic regression on shadow_outcomes mapping (T1 confidence, setup, regime) → calibrated win rate. Reliability diagram + ECE reporting. ~2 days. **Blocked on populated shadow_outcomes + regime classifier.** Review #2 integration.
+- **"Add `expected_move_pct` and `expected_holding_minutes` to `LLMDecision`."** Schema + prompt + interface doc updates; bump `prompt_version`. ~0.5 day. Review #2 integration; required by EV scoring in policy.py.
 
 ## Parallel track
 
@@ -34,10 +37,15 @@ Seeds the analytics table from existing v1 decisions. Explicit precondition for 
 
 ## Suggested order if executing top-to-bottom
 
-1. Shadow backfill (precondition)
+1. Shadow backfill (precondition; seeds data the calibrator needs)
 2. Qwen verify (smoke check, ~minutes)
-3. Take-profit activation (~0.5 day)
-4. `position_trace` + schema additions (~1 day, unblocks the next two)
-5. `strategy/llm/analysis.py` (~2 days)
-6. `strategy/llm/policy.py` (~2 days, uses shadow data + analysis schema)
-7. EH-informed RTH earnings wiring (~1-2 days, parallelizable)
+3. Regime classifier `analysis/regime.py` (~1 day, self-contained, unblocks calibrator + populates `LLMContext`)
+4. Take-profit activation (~0.5 day)
+5. `position_trace` + schema additions (~1 day, unblocks analysis.py + policy.py)
+6. LLMDecision schema additions: `expected_move_pct` + `expected_holding_minutes` (~0.5 day, before policy.py)
+7. `strategy/llm/analysis.py` (~2 days)
+8. `strategy/llm/policy.py` with liquidity gate + ranking + EV scoring (~2.5 days)
+9. Wire `signal_engine.evaluate` into `main.py` (~0.5 day)
+10. M2 replay with slippage simulator (~3.5 days)
+11. `analysis/calibration.py` (~2 days, runs against M2 output + live shadow rows)
+12. EH-informed RTH earnings wiring (~1-2 days, parallelizable anywhere)

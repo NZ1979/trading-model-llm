@@ -294,6 +294,9 @@ when invoked via a tool definition).
   "take_profit_atr_multiple": 1.0-5.0,
   "time_horizon": "intraday" | "overnight" | "multi_day",
 
+  "expected_move_pct": -20.0-20.0,
+  "expected_holding_minutes": 0-390,
+
   "concerns": ["string", "string"],
   "alternative_view": "string, max 140 chars"
 }
@@ -308,6 +311,8 @@ when invoked via a tool definition).
 - **stop_loss_atr_multiple**: only meaningful if action != Hold. Validates against `stop_atr_min_pct` and `stop_atr_max_pct` config from the base; clamped if out of range.
 - **take_profit_atr_multiple**: not currently used by the base order placement (no TP leg in the OTO bracket), but recorded for future use and for backtesting "what would have happened if we'd taken profit at N×ATR."
 - **time_horizon**: "intraday" is the default; "overnight" or "multi_day" implies the trade should not be flattened at 15:55 ET. The base flatten routine doesn't currently honor this; recording it now lets us evaluate whether the LLM's overnight calls would have been profitable post-hoc.
+- **expected_move_pct**: LLM's point estimate of price move from entry over the trade horizon, signed percent. Positive for Buy, negative for Sell. Required input to EV scoring in `policy.py` (`EV ≈ p_win × expected_move_pct − (1 − p_win) × stop_distance_pct`). Out-of-range values are clamped permissively at parse time; 0.0 = "no opinion" (the default, and the correct value for Hold actions). Added 2026-05-13 (ChatGPT review #2 integration).
+- **expected_holding_minutes**: LLM's estimate of how long the trade should hold before re-evaluation, in minutes. 0 = no opinion. 390 = full RTH session. Used by `policy.py` to set re-evaluation cadence per position and to cross-check `time_horizon` (a 30-min holding estimate paired with a `multi_day` horizon gets logged as inconsistent). Added 2026-05-13 (ChatGPT review #2 integration).
 - **concerns**: list of strings flagging risks ("low_liquidity", "earnings_within_3d", "counter_trend_to_daily_regime"). The LLM populates these; we use them as audit fields.
 - **alternative_view**: 1 sentence stating the opposite-side argument. Forces the LLM to consider the bear case for Buy / bull case for Sell. Recorded for post-hoc review.
 
@@ -415,6 +420,8 @@ In gap-and-go window: True.
   "stop_loss_atr_multiple": 1.5,
   "take_profit_atr_multiple": 2.5,
   "time_horizon": "intraday",
+  "expected_move_pct": 2.5,
+  "expected_holding_minutes": 90,
   "concerns": ["mega_cap_gaps_often_fade", "VIX_low_so_breakouts_have_less_extension"],
   "alternative_view": "Mega-cap gaps frequently fade after the first 30 min as institutional sellers fade retail enthusiasm; if VIX picks up the trend can reverse fast."
 }

@@ -163,6 +163,13 @@ class AlpacaOrderClient:
         self.base_url = PAPER_BASE_URL if paper else LIVE_BASE_URL
         self._session: aiohttp.ClientSession | None = None
         self._equity_cache: tuple[float, float] | None = None  # (equity, fetched_at)
+        # (tickers-with-active-stop, fetched_at). Cached the same 30s
+        # as equity so multiple shadow-path symbols on the same bar
+        # share a single Alpaca round-trip. Set is empty on API error
+        # (conservative: policy then treats every position as having
+        # no active stop, which is the safer branch for position-
+        # management decisions in shadow mode).
+        self._stop_orders_cache: tuple[set[str], float] | None = None
         self._lock = asyncio.Lock()
 
     async def __aenter__(self) -> AlpacaOrderClient:
@@ -209,6 +216,50 @@ class AlpacaOrderClient:
                 if self._equity_cache is not None:
                     return self._equity_cache[0]
                 return 0.0
+
+    async def get_active_stop_orders(self) -> set[str]:
+        """Return the set of tickers with at least one open stop-type order.
+
+        Cached for the same 30s as equity. The LLM shadow path's
+        ``has_active_stop`` flag reads this so the policy's
+        TIGHTEN_STOP / FREEZE_STOP branches see real stop-leg state
+        rather than the previous False stub.
+
+        Counts orders of type ``stop``, ``stop_limit``, and
+        ``trailing_stop``. Bracket-order children appear at the top
+        level once the parent fills (so this catches the standard
+        bracket stop_loss leg without needing ``?nested=true``).
+
+        On API failure: returns the previous cached set if available;
+        empty set otherwise. Empty is the conservative fallback for
+        the shadow path (policy treats positions as un-stopped, which
+        biases the position-management mapping toward TIGHTEN_STOP-
+        type recommendations rather than FREEZE_STOP — safer in
+        shadow analysis since the live broker stop, if it exists,
+        is the actual risk control).
+        """
+        async with self._lock:
+            if self._stop_orders_cache is not None:
+                tickers, fetched_at = self._stop_orders_cache
+                if time.monotonic() - fetched_at < EQUITY_CACHE_TTL_SEC:
+                    return tickers
+            try:
+                data = await self._get("/v2/orders?status=open")
+                tickers: set[str] = set()
+                for order in data:
+                    if order.get("type") in (
+                        "stop", "stop_limit", "trailing_stop",
+                    ):
+                        sym = order.get("symbol")
+                        if sym:
+                            tickers.add(sym)
+                self._stop_orders_cache = (tickers, time.monotonic())
+                return tickers
+            except Exception as e:
+                logger.error("get_active_stop_orders failed: %s", e)
+                if self._stop_orders_cache is not None:
+                    return self._stop_orders_cache[0]
+                return set()
 
     async def get_open_positions(self) -> list[Position]:
         """Fetch all open positions. Always fresh (no cache).

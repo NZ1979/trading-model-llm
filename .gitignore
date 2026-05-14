@@ -56,3 +56,4 @@ pytest-cache-files-*/
 # Dynamic watchlist — generated daily by data/watchlist_builder.py
 # or pulled from the VPS. Per-environment, not source.
 config/watchlist_dynamic.json
+boot_*.log

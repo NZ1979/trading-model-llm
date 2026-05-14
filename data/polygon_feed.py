@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,35 @@ from zoneinfo import ZoneInfo
 import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+
+# ---------------------------------------------------------------------------
+# Credential-leak guard (Rule 22 in CLAUDE_PREFLIGHT.md).
+#
+# Polygon authenticates via the ``apiKey`` query parameter. httpx's default
+# HTTPStatusError message includes the full constructed URL, which puts
+# the live API key into any traceback that bubbles up to a logger,
+# stderr, or a pasted user-bug-report. This regex + helper scrub the key
+# value before any URL string is included in an exception message we
+# raise. Applies to:
+#   - the HTTPStatusError re-raise path in _get_with_retry
+#   - the RuntimeError "failed after N retries" fallback
+# Defense-in-depth only — the proper place for full URL-redaction is in
+# whichever logger handler is configured. This module owns the raise
+# paths it controls.
+# ---------------------------------------------------------------------------
+
+_APIKEY_RE = re.compile(r"(apiKey=)[^&\s'\"]+", re.IGNORECASE)
+
+
+def _scrub_apikey(s: str) -> str:
+    """Replace any apiKey=<value> in s with apiKey=<redacted>.
+
+    Operates on plain strings. Idempotent. Safe to call on already-clean
+    strings. Used wherever we construct an error message that might
+    contain a Polygon URL with credentials embedded.
+    """
+    return _APIKEY_RE.sub(r"\1<redacted>", s)
 
 from data.bar_types import MinuteBar
 
@@ -114,8 +144,21 @@ class PolygonRESTClient:
                     await asyncio.sleep(backoff)
                     backoff *= 2
                     continue
-                raise
-        raise RuntimeError(f"Polygon GET {url} failed after {max_retries} retries")
+                # Rule 22 guardrail. httpx's default message embeds the
+                # full URL — including the apiKey query parameter — into
+                # the exception. Re-raise as a RuntimeError with the URL
+                # scrubbed; ``from None`` suppresses the original chain
+                # so the leaky message can't propagate.
+                safe_url = _scrub_apikey(str(e.response.url))
+                raise RuntimeError(
+                    f"Polygon HTTP {e.response.status_code} for {safe_url}"
+                ) from None
+        # The relative ``url`` argument passed in is just the path
+        # (no apiKey), but scrub defensively in case a caller ever
+        # constructs an absolute URL with credentials.
+        raise RuntimeError(
+            f"Polygon GET {_scrub_apikey(url)} failed after {max_retries} retries"
+        )
 
     async def get_minute_aggregates(
         self,

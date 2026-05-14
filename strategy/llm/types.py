@@ -135,6 +135,31 @@ class LLMDecision(BaseModel):
     take_profit_atr_multiple: float = Field(ge=1.0, le=5.0, default=2.0)
     time_horizon: Literal["intraday", "overnight", "multi_day"] = "intraday"
 
+    # ---- Forward predictions (added 2026-05-13, ChatGPT review #2) ----
+    # Required by EV scoring in policy.py:
+    #   EV ≈ calibrated_pwin × expected_move_pct
+    #        − (1 − calibrated_pwin) × stop_distance_pct
+    # Both default to 0.0 / 0 = "no opinion" so a Hold decision (which has
+    # no forward move or holding-time prediction by construction) doesn't
+    # need to populate them. The system prompt directs the LLM to fill
+    # these for Buy / Sell decisions; a 0 expected_move_pct on a non-Hold
+    # action is treated by policy.py as a missing prediction and will
+    # downweight the decision in cross-sectional ranking rather than be
+    # mis-read as "predicted flat."
+    expected_move_pct: float = Field(ge=-20.0, le=20.0, default=0.0)
+    """LLM's point estimate of price move from entry over the trade
+    horizon, as a signed percent. Positive = up, negative = down. The
+    sign should agree with action (Buy → positive, Sell → negative);
+    a sign disagreement gets logged by policy.py as a sanity flag."""
+
+    expected_holding_minutes: int = Field(ge=0, le=390, default=0)
+    """LLM's estimate of how long the trade should hold before
+    re-evaluation, in minutes. 0 = no opinion (defaults to time_horizon
+    semantics). 390 = full RTH session. Used by policy.py to set
+    re-evaluation cadence per position and to flag trades whose horizon
+    exceeds their stated time_horizon (e.g., 30-min for an 'overnight'
+    label is inconsistent)."""
+
     concerns: list[str] = Field(default_factory=list)
     alternative_view: str = Field(default="", max_length=140)
 
@@ -205,6 +230,24 @@ class LLMDecision(BaseModel):
             return v
         if isinstance(v, (int, float)):
             return max(1.0, min(5.0, float(v)))
+        return v
+
+    @field_validator("expected_move_pct", mode="before")
+    @classmethod
+    def _clamp_expected_move(cls, v: Any) -> Any:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return max(-20.0, min(20.0, float(v)))
+        return v
+
+    @field_validator("expected_holding_minutes", mode="before")
+    @classmethod
+    def _clamp_expected_holding(cls, v: Any) -> Any:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return max(0, min(390, int(v)))
         return v
 
     @field_validator("setup_label", mode="before")

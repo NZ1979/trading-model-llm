@@ -48,6 +48,17 @@ Decision criteria:
 - Stop and take-profit are expressed as multiples of daily ATR(14);
   the platform applies them at execution.
 
+Forward predictions (Buy/Sell only — leave at default 0 for Hold):
+- expected_move_pct: your point estimate of the price move from
+  entry over the trade horizon, as a signed percent. Positive for
+  Buy, negative for Sell. Be honest; the calibrator will catch
+  systematic over/under-prediction over time. Typical intraday
+  range is +/- 1% to +/- 5%; +/- 10% is exceptional.
+- expected_holding_minutes: how long you expect the trade to take
+  to play out. 0 means "no opinion." 30-120 min is typical for
+  intraday momentum; 5-15 min for scalps; >180 only if time_horizon
+  is overnight or multi_day.
+
 Output discipline:
 - ALWAYS submit your decision via the submit_decision tool.
 - NEVER respond with prose outside the tool call.

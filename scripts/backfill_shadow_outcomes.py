@@ -236,6 +236,128 @@ def _persist_outcome(db_path: Path, outcome: ShadowOutcome) -> None:
         conn.close()
 
 
+async def run_backfill(
+    db_path: Path,
+    polygon_key: str,
+    tp_atr: float,
+    stop_atr: float,
+    *,
+    since: str | None = None,
+    limit: int | None = None,
+    dry_run: bool = False,
+    log_via_print: bool = True,
+) -> dict[str, int]:
+    """Programmatic entry point. Used by both the CLI ``main()`` and
+    ``main.py``'s daily routine follower.
+
+    Returns a dict with keys ``candidates``, ``success``, ``skipped``,
+    ``failed`` so callers can log a one-line summary without scraping
+    print output.
+
+    ``log_via_print``: when True (CLI), per-row progress goes through
+    ``print()``. When False (daily-routine follower), per-row progress
+    is suppressed and only the summary numbers are surfaced via the
+    return value. The CLI keeps its existing tone; the daemon stays
+    quiet on a healthy day and lets the summary line speak for itself.
+    """
+    _ensure_schema(db_path)
+    decisions = _read_decisions_to_backfill(db_path, since, limit)
+    if not decisions:
+        if log_via_print:
+            print(
+                "No Buy/Sell decisions to backfill (table empty, all already "
+                "populated, or filter excluded all rows)."
+            )
+        return {"candidates": 0, "success": 0, "skipped": 0, "failed": 0}
+
+    if log_via_print:
+        print(f"Found {len(decisions)} decisions to backfill")
+    grouped = _group_by_ticker_date(decisions)
+    if log_via_print:
+        print(f"Grouped into {len(grouped)} (ticker, date) fetches")
+
+    success = 0
+    skipped = 0
+    failed = 0
+
+    polygon = PolygonRESTClient(api_key=polygon_key)
+    try:
+        for (ticker, date_str), day_decisions in sorted(grouped.items()):
+            try:
+                raw_bars = await polygon.get_minute_aggregates(
+                    ticker, date_str, date_str
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Polygon fetch failed for %s on %s", ticker, date_str
+                )
+                if log_via_print:
+                    print(f"  FAIL fetch {ticker} {date_str}: {exc}")
+                failed += len(day_decisions)
+                continue
+
+            if not raw_bars:
+                if log_via_print:
+                    print(f"  SKIP {ticker} {date_str}: Polygon returned 0 bars")
+                skipped += len(day_decisions)
+                continue
+
+            bars = [_polygon_to_bar(b) for b in raw_bars]
+            eod_ts = _eod_ts_for(date_str)
+
+            for d in day_decisions:
+                relevant = [b for b in bars if b.ts >= d["ts"]]
+                if not relevant:
+                    if log_via_print:
+                        print(
+                            f"  SKIP decision {d['decision_id']} ({ticker} @ "
+                            f"{date_str}): no bars after decision_ts"
+                        )
+                    skipped += 1
+                    continue
+
+                target_price = _compute_target_price(
+                    d["side"], d["limit_price"], d["stop_price"],
+                    tp_atr, stop_atr,
+                )
+
+                outcome = compute_outcome(
+                    decision_id=d["decision_id"],
+                    decision_ts=d["ts"],
+                    decision_price=d["limit_price"],
+                    side=d["side"],
+                    stop_price=d["stop_price"],
+                    target_price=target_price,
+                    bars=relevant,
+                    eod_ts=eod_ts,
+                )
+
+                if dry_run:
+                    if log_via_print:
+                        print(
+                            f"  DRY decision {d['decision_id']} ({ticker} "
+                            f"{d['side']} @ ${d['limit_price']:.2f}): "
+                            f"first_touch={outcome.first_touch} "
+                            f"5m={_fmt(outcome.return_5m_pct)} "
+                            f"60m={_fmt(outcome.return_60m_pct)} "
+                            f"eod={_fmt(outcome.return_eod_pct)} "
+                            f"mae={_fmt(outcome.mae_pct)} "
+                            f"mfe={_fmt(outcome.mfe_pct)}"
+                        )
+                else:
+                    _persist_outcome(db_path, outcome)
+                success += 1
+    finally:
+        await polygon.aclose()
+
+    return {
+        "candidates": len(decisions),
+        "success": success,
+        "skipped": skipped,
+        "failed": failed,
+    }
+
+
 async def main() -> int:
     args = _parse_args()
     logging.basicConfig(
@@ -259,82 +381,25 @@ async def main() -> int:
         print("ERROR: POLYGON_API_KEY not set in environment")
         return 1
 
-    _ensure_schema(db_path)
-
-    decisions = _read_decisions_to_backfill(db_path, args.since, args.limit)
-    if not decisions:
-        print("No Buy/Sell decisions to backfill (table empty, all already populated, or filter excluded all rows).")
-        return 0
-
-    print(f"Found {len(decisions)} decisions to backfill")
-    grouped = _group_by_ticker_date(decisions)
-    print(f"Grouped into {len(grouped)} (ticker, date) fetches")
-
-    success = 0
-    skipped = 0
-    failed = 0
-
-    polygon = PolygonRESTClient(api_key=polygon_key)
-    try:
-        for (ticker, date_str), day_decisions in sorted(grouped.items()):
-            try:
-                raw_bars = await polygon.get_minute_aggregates(ticker, date_str, date_str)
-            except Exception as exc:
-                logger.exception("Polygon fetch failed for %s on %s", ticker, date_str)
-                print(f"  FAIL fetch {ticker} {date_str}: {exc}")
-                failed += len(day_decisions)
-                continue
-
-            if not raw_bars:
-                print(f"  SKIP {ticker} {date_str}: Polygon returned 0 bars")
-                skipped += len(day_decisions)
-                continue
-
-            bars = [_polygon_to_bar(b) for b in raw_bars]
-            eod_ts = _eod_ts_for(date_str)
-
-            for d in day_decisions:
-                relevant = [b for b in bars if b.ts >= d["ts"]]
-                if not relevant:
-                    print(f"  SKIP decision {d['decision_id']} ({ticker} @ {date_str}): no bars after decision_ts")
-                    skipped += 1
-                    continue
-
-                target_price = _compute_target_price(
-                    d["side"], d["limit_price"], d["stop_price"], tp_atr, stop_atr
-                )
-
-                outcome = compute_outcome(
-                    decision_id=d["decision_id"],
-                    decision_ts=d["ts"],
-                    decision_price=d["limit_price"],
-                    side=d["side"],
-                    stop_price=d["stop_price"],
-                    target_price=target_price,
-                    bars=relevant,
-                    eod_ts=eod_ts,
-                )
-
-                if args.dry_run:
-                    print(
-                        f"  DRY decision {d['decision_id']} ({ticker} {d['side']} @ ${d['limit_price']:.2f}): "
-                        f"first_touch={outcome.first_touch} "
-                        f"5m={_fmt(outcome.return_5m_pct)} "
-                        f"60m={_fmt(outcome.return_60m_pct)} "
-                        f"eod={_fmt(outcome.return_eod_pct)} "
-                        f"mae={_fmt(outcome.mae_pct)} mfe={_fmt(outcome.mfe_pct)}"
-                    )
-                else:
-                    _persist_outcome(db_path, outcome)
-                success += 1
-    finally:
-        await polygon.aclose()
+    summary = await run_backfill(
+        db_path=db_path,
+        polygon_key=polygon_key,
+        tp_atr=tp_atr,
+        stop_atr=stop_atr,
+        since=args.since,
+        limit=args.limit,
+        dry_run=args.dry_run,
+        log_via_print=True,
+    )
 
     print()
-    print(f"Backfill summary: success={success} skipped={skipped} failed={failed}")
+    print(
+        f"Backfill summary: success={summary['success']} "
+        f"skipped={summary['skipped']} failed={summary['failed']}"
+    )
     if args.dry_run:
         print("(Dry run: no rows written to shadow_outcomes)")
-    return 0 if failed == 0 else 2
+    return 0 if summary["failed"] == 0 else 2
 
 
 def _fmt(v: float | None) -> str:
