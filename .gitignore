@@ -57,3 +57,11 @@ pytest-cache-files-*/
 # or pulled from the VPS. Per-environment, not source.
 config/watchlist_dynamic.json
 boot_*.log
+
+# M2 replay harness — fixtures (data, not code) and LLM response cache.
+# The fixtures README at data/replay/fixtures/README.md documents the
+# export procedure (Rule 26-compliant cross-fork data handoff).
+data/replay/fixtures/*.sqlite
+data/replay/fixtures/*.json
+.replay_cache/
+docs/reports/replay_*.md
