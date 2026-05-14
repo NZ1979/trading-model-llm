@@ -62,6 +62,8 @@ from analysis.indicators import (
     generate_signal,
 )
 from analysis.futures_walls import FuturesWallMonitor
+from analysis.regime import classify_regime
+from analysis.regime_data import fetch_regime_inputs
 from data.alpaca_market_data import AlpacaBarStream
 from data.bar_aggregator import BarAggregator
 from data.bar_types import FiveMinBar, MinuteBar
@@ -79,8 +81,34 @@ from data.watchlist_builder import (
     default_small_cap_sources,
 )
 from execution.alpaca_orders import AlpacaOrderClient, OrderResult
+from scripts.backfill_shadow_outcomes import run_backfill as run_shadow_backfill
 from scripts.build_pm_rvol_thresholds import refresh_pm_rvol_thresholds
-from strategy.risk import compute_atr_stop_pct, size_from_risk, validate_order
+from strategy.llm.context_builder import (
+    build_account_state,
+    build_llm_context,
+    build_market_features,
+    synthesize_default_analysis,
+)
+from strategy.llm.escalation import EscalationBudget
+from strategy.llm.factory import build_escalation_budget, build_tier_clients
+from strategy.llm.policy import (
+    BucketStats,
+    FinalTradeDecision,
+    PolicyConfig,
+    PolicyInput,
+    bucket_key_for,
+    decide as policy_decide,
+    hierarchical_lookup,
+)
+from strategy.llm.signal_engine import TierClients
+from strategy.llm.signal_engine import evaluate as llm_evaluate
+from strategy.llm.types import LLMContext, LLMDecision
+from strategy.risk import (
+    compute_atr_stop_pct,
+    compute_take_profit_price,
+    size_from_risk,
+    validate_order,
+)
 from strategy.signal_engine import evaluate_trade, TradeDecision
 
 logger = logging.getLogger(__name__)
@@ -191,6 +219,12 @@ def init_v2_schema(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "decisions", "schema_version", "TEXT NOT NULL DEFAULT '0.0.0'")
     _add_column_if_missing(conn, "decisions", "code_sha", "TEXT NOT NULL DEFAULT 'unknown'")
     _add_column_if_missing(conn, "decisions", "bucket_key_used", "TEXT")
+    # Review #2 additions (2026-05-13): ev_score is uncalibrated for now
+    # (advisory.confidence/100 × expected_move_pct); liquidity_rejected is
+    # set when the step 7.5 hard-reject gate fires (distinct from the
+    # red-flag downgrade in step 7).
+    _add_column_if_missing(conn, "decisions", "ev_score", "REAL")
+    _add_column_if_missing(conn, "decisions", "liquidity_rejected", "INTEGER NOT NULL DEFAULT 0")
 
     # shadow_outcomes extension (Q2: multi-day holds up to 3 trading days)
     _add_column_if_missing(conn, "shadow_outcomes", "day_1_eod_pct", "REAL")
@@ -279,6 +313,29 @@ class TradingPlatform:
         # Track flatten/journal completion per day so they don't run twice
         self._flatten_done_for: str | None = None
         self._journal_done_for: str | None = None
+        self._shadow_follower_done_for: str | None = None
+
+        # Market regime label, computed once per trading day in
+        # _run_regime_classification and read by every _run_llm_shadow call.
+        # Default "unknown" persists until the first daily routine wakeup
+        # succeeds, at which point all shadow rows for the day share the
+        # same regime label. Daily-level cadence is intentional — regime
+        # changes are slow and intraday recomputation would just add noise.
+        self.current_regime_label: str = "unknown"
+        self._regime_done_for: str | None = None
+
+        # LLM shadow path. Armed only when llm.enabled is true in config;
+        # construction happens in boot() so tests that never boot don't
+        # pay the import-cost or env-key requirement of the Anthropic SDK.
+        # See _run_llm_shadow + _log_shadow_decision. Hot-reload of the
+        # master switch is NOT supported — restart to flip.
+        self.llm_clients: TierClients | None = None
+        self.llm_budget: EscalationBudget | None = None
+        self.policy_config: PolicyConfig | None = None
+        # Last calendar day on which the escalation budget was reset
+        # (ISO date string). Reset happens once per trading day at
+        # premarket-context time alongside the rest of the daily routine.
+        self._llm_budget_reset_for: str | None = None
 
         self._init_db()
 
@@ -373,6 +430,28 @@ class TradingPlatform:
         self.finnhub_client = FinnhubClient(api_key=secrets["finnhub_key"])
         await self.finnhub_client.__aenter__()
         logger.info("Finnhub client initialized (earnings calendar veto enabled)")
+
+        # 0c. LLM shadow path — armed only when llm.enabled is true.
+        # When false (current default), no clients are constructed, the
+        # Anthropic SDK on the LLM-tier path is never instantiated, and no
+        # shadow rows are written. Failures in this construction step
+        # fail loud (Rule 18); we'd rather crash boot than serve with a
+        # broken shadow path that silently produces nothing.
+        llm_cfg = self.config.get("llm") or {}
+        if llm_cfg.get("enabled", False):
+            self.llm_clients = build_tier_clients(llm_cfg)
+            self.llm_budget = build_escalation_budget(llm_cfg)
+            self.policy_config = PolicyConfig()
+            logger.info(
+                "LLM shadow path ARMED: t1=%s t2=%s budget=%d/day prompt=%s policy=%s",
+                type(self.llm_clients.t1).__name__,
+                type(self.llm_clients.t2).__name__ if self.llm_clients.t2 else "off",
+                self.llm_budget.max_per_day,
+                llm_cfg.get("prompt_version", "?"),
+                self.policy_config.policy_version,
+            )
+        else:
+            logger.info("LLM shadow path DORMANT (llm.enabled=false)")
 
         # 1. News pipeline runs 24/7 (sentiment is computed even pre-session).
         self.news_pipeline = NewsSentimentPipeline(
@@ -576,6 +655,23 @@ class TradingPlatform:
                 except Exception:
                     logger.exception("Baseline backfill failed; will retry")
 
+            # Market regime classification (08:30 ET after backfill, weekdays
+            # only). Reuses the Polygon REST endpoint so it gates on backfill
+            # success rather than just the clock — if Polygon is down, the
+            # regime classifier would just fail for the same reason. Result
+            # is read by _run_llm_shadow throughout the day. Retried each
+            # cycle until it succeeds.
+            if (
+                is_weekday
+                and backfill_done_for == today
+                and self._regime_done_for != today
+            ):
+                try:
+                    await self._run_regime_classification()
+                    self._regime_done_for = today
+                except Exception:
+                    logger.exception("Regime classification failed; will retry")
+
             # Finnhub earnings calendar refresh (08:30 ET, every day including
             # weekends). The calendar is forward-looking so weekend refreshes
             # keep catalysts table current ahead of Monday's first signal eval.
@@ -627,6 +723,23 @@ class TradingPlatform:
                 except Exception:
                     logger.exception("Premarket context computation failed")
 
+            # LLM escalation budget reset. Runs once per calendar day at
+            # premarket-context time so the daily T2 quota is fresh for
+            # the day's first signal evaluations. Independent of weekday
+            # check (the budget object exists 7 days a week and resetting
+            # a 0/N counter on a market-closed Saturday is a cheap no-op).
+            if (
+                self.llm_budget is not None
+                and self._llm_budget_reset_for != today
+                and now_t >= pm_time
+            ):
+                self.llm_budget.reset()
+                self._llm_budget_reset_for = today
+                logger.info(
+                    "LLM escalation budget reset for %s (cap=%d/day)",
+                    today, self.llm_budget.max_per_day,
+                )
+
             # Flatten all positions (15:55 ET)
             if (
                 is_weekday
@@ -651,6 +764,26 @@ class TradingPlatform:
                     self._journal_done_for = today
                 except Exception:
                     logger.exception("EOD journal failed")
+
+            # Shadow outcomes follower. Runs once per trading day, after
+            # the EOD journal step so all 1-min bars for the session are
+            # settled at Polygon. Walks Buy/Sell decisions from the last
+            # 7 days that lack shadow_outcomes rows and attributes
+            # realized returns via the same loop scripts/backfill_*.py
+            # uses for manual runs. Idempotent across re-runs.
+            if (
+                is_weekday
+                and self._journal_done_for == today
+                and self._shadow_follower_done_for != today
+                and now_t >= journal_time
+            ):
+                try:
+                    await self._run_shadow_outcomes_follower()
+                    self._shadow_follower_done_for = today
+                except Exception:
+                    logger.exception(
+                        "Shadow outcomes follower wrapper failed; will retry"
+                    )
 
             await asyncio.sleep(30)
 
@@ -709,6 +842,87 @@ class TradingPlatform:
             "Backfill complete: %d daily contexts, %d short-history "
             "(gap-and-go only), %d PM baselines",
             n_daily, n_daily_short_history, n_pm,
+        )
+
+    async def _run_shadow_outcomes_follower(self) -> None:
+        """Attribute realized returns to every Buy/Sell decision logged today.
+
+        Runs once per trading day after the journal step (16:30 ET), at
+        which point all 1-minute bars for the session are settled at
+        Polygon. Delegates to the refactored backfill loop in
+        scripts/backfill_shadow_outcomes.py, which:
+          - Joins decisions to orders (real + synthetic 'shadow' rows
+            written by _log_synthetic_order)
+          - Fetches Polygon 1-min bars per (ticker, date)
+          - Calls strategy.llm.metrics.compute_outcome per row
+          - Inserts to shadow_outcomes
+
+        Idempotent: rows already in shadow_outcomes are skipped by the
+        backfill's LEFT JOIN. Re-running the follower mid-day is safe.
+        Failures are logged and swallowed so a Polygon outage on a
+        post-market day doesn't crash the orchestrator.
+        """
+        polygon_key = self.config["_secrets"]["polygon_key"]
+        risk_cfg = self.config.get("risk", {}) or {}
+        tp_atr = float(risk_cfg.get("take_profit_atr_multiple", 2.0))
+        stop_atr = float(risk_cfg.get("stop_atr_multiplier", 1.5))
+
+        # Only backfill decisions from the last 7 days. Older ones either
+        # already have outcomes or are stale enough that a Polygon refetch
+        # cost isn't worth the marginal data. The 'since' filter is
+        # idempotent with the LEFT JOIN inside _read_decisions_to_backfill.
+        since_dt = datetime.utcnow().date() - timedelta(days=7)
+        try:
+            summary = await run_shadow_backfill(
+                db_path=self.db_path,
+                polygon_key=polygon_key,
+                tp_atr=tp_atr,
+                stop_atr=stop_atr,
+                since=since_dt.isoformat(),
+                limit=None,
+                dry_run=False,
+                log_via_print=False,
+            )
+            logger.info(
+                "Shadow outcomes follower: candidates=%d success=%d "
+                "skipped=%d failed=%d",
+                summary["candidates"], summary["success"],
+                summary["skipped"], summary["failed"],
+            )
+        except Exception:
+            logger.exception("Shadow outcomes follower failed; will retry tomorrow")
+
+    async def _run_regime_classification(self) -> None:
+        """Compute today's market regime label and cache on self.
+
+        Pulls SPY + VIX daily bars via Polygon, derives RegimeInputs
+        (SPY 20-day return, VIX level + 60d median, breadth proxy from
+        SPY vs its 50-day SMA), and dispatches through the five-bucket
+        classifier in analysis/regime.py. Result is stored on
+        self.current_regime_label and read by every _run_llm_shadow
+        call until the next daily routine wakeup overwrites it.
+
+        Per Rule 18, failure leaves the regime at its previous value
+        rather than degrading to "unknown" — yesterday's regime is a
+        better fallback than the empty default because daily regimes
+        change slowly. First-day-after-deploy failures DO surface as
+        "unknown" since there's no prior value to keep; that's the
+        intended fail-loud signal.
+        """
+        polygon_key = self.config["_secrets"]["polygon_key"]
+        async with PolygonRESTClient(api_key=polygon_key) as client:
+            inputs = await fetch_regime_inputs(client)
+            label = classify_regime(inputs)
+        self.current_regime_label = label
+        vix_ratio_str = (
+            f"{inputs.vix_ratio:.2f}" if inputs.vix_ratio is not None else "n/a"
+        )
+        logger.info(
+            "Market regime: %s (spy_20d=%.2f%% vix_ratio=%s breadth=%.2f%%)",
+            label,
+            inputs.spy_return_20d * 100,
+            vix_ratio_str,
+            inputs.breadth_proxy * 100,
         )
 
     async def _run_finnhub_earnings_refresh(self) -> None:
@@ -941,6 +1155,16 @@ class TradingPlatform:
             state.last_decision_action = decision.action
             state.last_decision_setup = decision.setup
 
+        # 6b. LLM shadow path. Runs alongside the rule-based decision but
+        # NEVER routes to the broker — it logs an LLM+policy decision to
+        # the same `decisions` table with setup prefix "llm_shadow/" so
+        # the shadow_outcomes follower can later attribute forward returns.
+        # Per Rule 18, failures here are logged and swallowed so the
+        # live rule-based path is never blocked. No-op when llm.enabled
+        # is false (self.llm_clients is None).
+        if self.llm_clients is not None:
+            await self._run_llm_shadow(ticker, state, df_ind, sentiment)
+
         # 7. Place order if actionable
         if is_actionable:
             latest_price = float(df_ind["close"].iloc[-1])
@@ -1051,22 +1275,26 @@ class TradingPlatform:
         # Broker holds the TP server-side; fast moves to target fill instantly
         # without waiting for the next 5-min eval. When disabled (default),
         # behavior is identical to v1 (OTO with stop only).
-        # See docs/LLM_MODEL_V2_REFINEMENTS.md sec B.1 Layer 1.
-        tp_price = None
+        # See docs/LLM_MODEL_V2_REFINEMENTS.md sec B.1 Layer 1 and
+        # strategy/risk.py::compute_take_profit_price for the pure helper.
         risk_cfg = self.config["risk"]
-        if risk_cfg.get("take_profit_enabled", False):
-            tp_atr_multiple = float(risk_cfg.get("take_profit_atr_multiple", 2.0))
-            if daily_atr > 0:
-                tp_distance = tp_atr_multiple * daily_atr
-                if side == "buy":
-                    tp_price = round(latest_price + tp_distance, 2)
-                else:
-                    tp_price = round(latest_price - tp_distance, 2)
-            else:
-                logger.warning(
-                    "%s: take_profit_enabled but daily_atr=0; submitting without TP leg",
-                    decision.ticker,
-                )
+        tp_enabled = bool(risk_cfg.get("take_profit_enabled", False))
+        tp_atr_multiple = float(risk_cfg.get("take_profit_atr_multiple", 2.0))
+        tp_price = compute_take_profit_price(
+            side=side,
+            entry_price=round(latest_price, 2),
+            daily_atr=daily_atr,
+            tp_atr_multiple=tp_atr_multiple,
+            enabled=tp_enabled,
+        )
+        # Rule 18 fail-loud: if the operator enabled TP but ATR isn't
+        # warmed up yet, surface that gap in the live logs rather than
+        # let it silently degrade.
+        if tp_enabled and tp_price is None and daily_atr <= 0:
+            logger.warning(
+                "%s: take_profit_enabled but daily_atr=%.4f; submitting without TP leg",
+                decision.ticker, daily_atr,
+            )
 
         # Submit bracket (TP leg attached if tp_price is not None)
         result = await self.order_client.submit_bracket_order(
@@ -1088,6 +1316,343 @@ class TradingPlatform:
         else:
             logger.error("ORDER REJECTED %s: %s", result.ticker, result.error)
         self._log_order_result(result, latest_price, decision_id)
+
+    def _get_bucket_history(self, key: tuple) -> BucketStats | None:
+        """Bucket-history reader for hierarchical_lookup.
+
+        Returns ``None`` for every key until the bucket aggregation
+        pipeline lands. That pipeline depends on:
+          1. shadow_outcomes table populated with realized returns.
+          2. A nightly aggregation job that groups by the 5-tuple
+             bucket key and computes (sample_count, expected_r,
+             expected_r_lower_ci, win_rate, avg_win_r, avg_loss_r).
+          3. This method swapped for a SQLite read against that
+             aggregation table.
+
+        Until then the lookup walks all collapse levels, gets None at
+        each (which hierarchical_lookup converts to BucketStats.empty),
+        and returns the bottom of the collapse ladder. The recorded
+        ``bucket_key`` in FinalTradeDecision is still the real
+        most-granular key, so audit trails are correct from day one.
+        """
+        return None
+
+    async def _run_llm_shadow(
+        self,
+        ticker: str,
+        state: SymbolState,
+        df_ind: pd.DataFrame,
+        sentiment: int | None,
+    ) -> None:
+        """LLM + policy shadow evaluation. Logs only; never routes to broker.
+
+        Pipeline:
+          1. build_llm_context()      — orchestrator state → LLMContext
+          2. build_market_features()  — indicator state → MarketFeatures
+          3. build_account_state()    — equity + positions → AccountState
+          4. synthesize_default_analysis() — bridge LLMAnalysis until the
+             LLMOutput refactor lands (see context_builder docstring).
+          5. signal_engine.evaluate() — T1 always, T2 conditional per
+             escalation rule + daily budget.
+          6. hierarchical_lookup()    — bucket-history walk; stubbed to
+             None-returning reader until the aggregation table exists.
+          7. policy.decide()          — deterministic firewall; produces
+             FinalTradeDecision with bucket_key + ev_score +
+             liquidity_rejected + version pins.
+          8. _log_shadow_decision()   — insert into `decisions` with
+             setup="llm_shadow/<tier_provenance>".
+
+        Never raises (Rule 18). Every failure mode is caught and logged
+        so the live rule-based path is unaffected. Returns immediately
+        when the master switch is off (caller already checks; this is
+        a defensive secondary guard).
+
+        UNVERIFIED: bucket history lookup is deferred to a separate
+        session per docs/LLM_MODEL_OVERVIEW.md item 8. Until then,
+        ``BucketStats.empty(())`` is passed, which the policy maps to
+        ``qty_tier="tiny"`` — intentionally conservative.
+
+        ``has_active_stop`` is set from a real /v2/orders query
+        (30s-cached on AlpacaOrderClient.get_active_stop_orders).
+        Catches bracket stop_loss legs at the top level once their
+        parent fills, plus manually-placed stop/stop_limit/
+        trailing_stop orders.
+        """
+        if self.llm_clients is None or self.llm_budget is None or self.policy_config is None:
+            return  # defensive — caller should have short-circuited
+
+        try:
+            prompt_version = self.config["llm"].get("prompt_version", "unknown")
+            now_et = datetime.now(ET)
+
+            # Fetch broker state first so both LLMContext and MarketFeatures
+            # see the same position snapshot. equity + active-stop set are
+            # 30s-cached in alpaca_orders so multiple shadow-path symbols
+            # on the same bar share Alpaca round-trips; get_open_positions
+            # is uncached but returns [] on API error (safe failure mode).
+            assert self.order_client is not None
+            equity = await self.order_client.get_account_equity()
+            positions = await self.order_client.get_open_positions()
+            active_stop_tickers = await self.order_client.get_active_stop_orders()
+
+            # Translate this ticker's broker-side position (if any) into the
+            # {qty, avg_price, unrealized_pl_pct, has_active_stop} dict shape
+            # context_builder expects. None when flat. Sign convention:
+            # unrealized_pl_pct is positive when the position is in the money
+            # regardless of long/short direction.
+            position_dict: dict[str, Any] | None = None
+            this_position = next(
+                (p for p in positions if p.ticker == ticker), None,
+            )
+            if this_position is not None and this_position.quantity != 0:
+                qty = this_position.quantity  # signed
+                avg = this_position.avg_price
+                cur = this_position.current_price
+                raw_pl_pct = (cur / avg - 1.0) * 100.0 if avg > 0 else 0.0
+                pl_pct = raw_pl_pct if qty > 0 else -raw_pl_pct
+                position_dict = {
+                    "qty": qty,
+                    "avg_price": avg,
+                    "unrealized_pl_pct": pl_pct,
+                    "has_active_stop": ticker in active_stop_tickers,
+                }
+
+            # 1. LLMContext
+            ctx = build_llm_context(
+                ticker=ticker,
+                timestamp_et=now_et.isoformat(),
+                prompt_version=prompt_version,
+                df_ind=df_ind,
+                daily_ctx=state.daily_ctx,
+                premarket_ctx=state.premarket_ctx,
+                sentiment=float(sentiment) if sentiment is not None else None,
+                position=position_dict,
+                market_regime_label=self.current_regime_label,
+            )
+
+            # 2. MarketFeatures
+            daily_atr = (
+                state.daily_ctx.daily_atr_14
+                if state.daily_ctx is not None else 0.0
+            )
+            features = build_market_features(
+                df_ind=df_ind,
+                daily_atr=daily_atr,
+                position=position_dict,
+            )
+
+            # 3. AccountState. Built from the same equity/positions snapshot
+            # so all three (ctx, features, account) reference the same point
+            # in time.
+            account = build_account_state(
+                equity=equity,
+                open_positions=positions,
+            )
+
+            # 4. Bridge LLMAnalysis
+            analysis = synthesize_default_analysis()
+
+            # 5. Tier orchestration (T1 always, T2 conditional)
+            t2_cfg = self.config["llm"].get("t2", {}) or {}
+            advisory = await llm_evaluate(
+                ctx,
+                self.llm_clients,
+                self.llm_budget,
+                confidence_floor=int(t2_cfg.get("confidence_floor", 50)),
+                confidence_ceiling=int(t2_cfg.get("confidence_ceiling", 75)),
+                pm_rvol_min=float(t2_cfg.get("pm_rvol_min", 3.0)),
+            )
+
+            # 6. Bucket lookup. The hierarchical_lookup helper walks
+            # progressively-collapsed bucket keys (time_of_day → cap_size)
+            # until a bucket with enough samples is found. The reader
+            # below returns None for every key until the bucket
+            # aggregation table is populated from shadow_outcomes — at
+            # that point the policy's sample-count tier sizing starts
+            # working off real data without any further main.py change.
+            base_key = bucket_key_for(
+                market_regime_label=ctx.market_regime_label,
+                market_cap_bucket=ctx.market_cap_bucket,
+                catalyst_quality_value=analysis.catalyst_quality.value,
+                minutes_since_open=ctx.minutes_since_open,
+                action=advisory.action,
+            )
+            bucket_stats = hierarchical_lookup(
+                base_key=base_key,
+                get_bucket=self._get_bucket_history,
+                sample_min=self.policy_config.sample_min_for_normal_tier,
+            )
+
+            # 7. Policy decision.
+            policy_input = PolicyInput(
+                ctx=ctx,
+                analysis=analysis,
+                advisory=advisory,
+                features=features,
+                account=account,
+                bucket_history=bucket_stats,
+                health_state="healthy",
+            )
+            final = policy_decide(policy_input, self.policy_config)
+
+            # 8. Log shadow row. Distinguishing setup prefix means
+            # rule-based analytics queries can WHERE setup NOT LIKE
+            # 'llm_shadow/%' to exclude these.
+            decision_id = self._log_shadow_decision(ticker, ctx, advisory, final)
+
+            # 9. Synthetic order row for Buy/Sell decisions. Shadow
+            # decisions never reach the broker, but the shadow_outcomes
+            # backfill (scripts/backfill_shadow_outcomes.py) joins
+            # decisions to orders to recover entry + stop prices. This
+            # synthetic row preserves that join shape with
+            # status='shadow', so real-trade analytics can filter on
+            # status='submitted' and shadow analytics can filter on
+            # status='shadow'.
+            #
+            # UNVERIFIED: the backfill recomputes target_price from
+            # the config's tp_atr/stop_atr ratio, not the LLM
+            # advisory's specific multiples. When the LLM picks
+            # ratios that differ from config, target-hit computation
+            # drifts slightly. Acceptable first-land approximation.
+            if final.action != "Hold" and decision_id is not None:
+                daily_atr = (
+                    state.daily_ctx.daily_atr_14
+                    if state.daily_ctx is not None else 0.0
+                )
+                if daily_atr > 0 and ctx.current_close > 0:
+                    synthetic_limit = ctx.current_close
+                    stop_distance = (
+                        final.stop_loss_atr_multiple * daily_atr
+                    )
+                    if final.action == "Buy":
+                        synthetic_stop = synthetic_limit - stop_distance
+                    else:  # Sell
+                        synthetic_stop = synthetic_limit + stop_distance
+                    self._log_synthetic_order(
+                        decision_id=decision_id,
+                        ticker=ticker,
+                        action=final.action,
+                        limit_price=synthetic_limit,
+                        stop_price=synthetic_stop,
+                    )
+        except Exception:
+            logger.exception(
+                "LLM shadow path failed for %s; live path unaffected",
+                ticker,
+            )
+
+    def _log_shadow_decision(
+        self,
+        ticker: str,
+        ctx: LLMContext,
+        advisory: LLMDecision,
+        final: FinalTradeDecision,
+    ) -> int | None:
+        """Insert a shadow row into the decisions table.
+
+        Reuses the existing `decisions` schema (extended by init_v2_schema
+        with bucket_key_used + policy_version + prompt_version columns).
+        Shadow rows differ from rule-based rows by:
+
+          - setup column: ``"llm_shadow/<tier_provenance>"`` (e.g.,
+            ``"llm_shadow/t1_only"``, ``"llm_shadow/t1+t2"``,
+            ``"llm_shadow/t1_failed"``).
+          - reasons column: policy ``rejection_reason`` when the policy
+            overrode the advisory; otherwise the advisory's ``setup_label``;
+            otherwise the literal string ``"approved"``.
+          - confidence column: the advisory's confidence (0-100).
+          - bucket_key_used / policy_version / prompt_version: v2 columns,
+            pinning the row to the code that produced it.
+
+        Failures here are swallowed so the live path is never affected.
+        Returns the inserted row id on success, None on failure or when
+        decisions-to-db logging is disabled in config.
+        """
+        tier = advisory.tier_provenance or "unknown"
+        setup = f"llm_shadow/{tier}"
+        reasons = final.rejection_reason or advisory.setup_label or "approved"
+        # Truncate reasons defensively; the decisions.reasons column has no
+        # length limit in SQLite but the EOD report assumes <=280 chars.
+        reasons = reasons[:280]
+
+        ev_str = (
+            f"{final.ev_score:+.3f}" if final.ev_score is not None else "n/a"
+        )
+        logger.info(
+            "%s [%s] %s (qty_tier=%s conf=%d ev=%s liq_rej=%s reasons=%s)",
+            ticker, setup, final.action, final.qty_tier,
+            advisory.confidence, ev_str,
+            int(final.liquidity_rejected), reasons,
+        )
+        if not self.config["logging"]["decisions_to_db"]:
+            return None
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    "INSERT INTO decisions "
+                    "(ts, ticker, action, setup, sentiment, confidence, "
+                    " walls_status, reasons, bucket_key_used, "
+                    " policy_version, prompt_version, ev_score, "
+                    " liquidity_rejected) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        time.time(), ticker, final.action, setup,
+                        None, advisory.confidence, None, reasons,
+                        str(final.bucket_key),
+                        final.policy_version, ctx.prompt_version,
+                        final.ev_score,
+                        1 if final.liquidity_rejected else 0,
+                    ),
+                )
+                return cursor.lastrowid
+        except Exception:
+            logger.exception("Shadow decision INSERT failed for %s", ticker)
+            return None
+
+    def _log_synthetic_order(
+        self,
+        decision_id: int,
+        ticker: str,
+        action: str,
+        limit_price: float,
+        stop_price: float,
+    ) -> None:
+        """Insert a synthetic orders row for a shadow Buy/Sell decision.
+
+        Shadow decisions never reach the broker, but
+        scripts/backfill_shadow_outcomes.py joins decisions to orders
+        to recover entry + stop prices. This synthetic row preserves
+        that join shape without polluting real-trade analytics: rows
+        are marked status='shadow', so any aggregation that cares
+        about real fills can filter on status='submitted'.
+
+        qty is set to 0 because shadow has no real position size; the
+        backfill script does not read qty, so this doesn't affect
+        outcomes. Failures are logged and swallowed so a synthetic-
+        order INSERT failure can't break the shadow path.
+        """
+        side = "buy" if action == "Buy" else "sell"
+        if not self.config["logging"]["decisions_to_db"]:
+            return
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO orders "
+                    "(ts, ticker, side, qty, limit_price, stop_price, "
+                    " alpaca_order_id, client_order_id, status, error, "
+                    " decision_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        time.time(), ticker, side, 0,
+                        limit_price, stop_price,
+                        None, None, "shadow", None, decision_id,
+                    ),
+                )
+        except Exception:
+            logger.exception(
+                "Synthetic order INSERT failed for shadow decision %d",
+                decision_id,
+            )
 
     def _log_decision(self, d: TradeDecision) -> int | None:
         """Log decision and return the inserted decision row id (for FK linking)."""

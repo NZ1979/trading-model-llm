@@ -9,7 +9,7 @@
 broker:
   mode: paper                                      # paper | live
   alpaca_base_url: https://paper-api.alpaca.markets
-  alpaca_data_feed: sip                            # sip (Algo Trader Plus) | iex (free, IEX-only)
+  alpaca_data_feed: iex                            # sip (Algo Trader Plus) | iex (free, IEX-only). Flipped to iex 2026-05-14: PA3QAZ941NFN doesn't have Algo Trader Plus. Shadow path doesn't need full SIP for verification.
 
 market_data:
   polygon_baseline_days: 20                        # days of pre-market history for RVOL denominator
@@ -91,7 +91,7 @@ risk:
   stop_atr_min_pct: 1.0                            # floor on ATR-based stop (% of entry)
   stop_atr_max_pct: 5.0                            # cap on ATR-based stop (% of entry)
   risk_per_trade_pct: 0.5                          # max loss per trade as % of equity (used by size_from_risk)
-  take_profit_enabled: false                       # Layer 1 v2: when true, attach a take-profit leg to every bracket order. Default false until validated; flip to true to activate.
+  take_profit_enabled: true                        # Layer 1 v2: attach a take-profit leg to every bracket order. ACTIVATED 2026-05-13 (Phase 1 Task #1). Pure-helper logic in strategy/risk.py::compute_take_profit_price; tests in tests/test_take_profit_price.py.
   take_profit_atr_multiple: 2.0                    # TP distance from entry as N × daily ATR(14). With stop_atr_multiplier=1.5 and tp=2.0 the reward/risk ratio is ~1.33; raise to 3.0 for ~2:1 R/R
 
 logging:
@@ -103,8 +103,8 @@ logging:
 # arrives. Tier 2 = Sonnet selective escalation. Tier 3 = Opus offline,
 # disabled in the live engine (replay/audit jobs flip it on per-run).
 llm:
-  enabled: false                                   # master switch; flip to true once signal_engine.evaluate is wired into main.py
-  prompt_version: v0.0-stub                        # bump on prompt template change; invalidates per-tier cache
+  enabled: true                                    # master switch; ARMED 2026-05-13. Shadow path wired in main.py (_run_llm_shadow + _log_shadow_decision). Shadow rows go to decisions table with setup="llm_shadow/<tier_provenance>"; NEVER routes to broker.
+  prompt_version: v0.1-ev-fields                   # bump on prompt template change; invalidates per-tier cache. v0.1: added expected_move_pct + expected_holding_minutes to LLMDecision (2026-05-13, ChatGPT review #2 integration).
 
   t1:
     backend: haiku_stand_in                        # haiku_stand_in (bridge) | anthropic | qwen_local (workstation)
