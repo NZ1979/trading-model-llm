@@ -35,7 +35,6 @@ def test_watchlist_source_dataclass():
     assert src.max_count is None
     src2 = WatchlistSource(name="t", fetcher=stub, min_count=1, max_count=10)
     assert src2.max_count == 10
-    return "WatchlistSource holds expected fields"
 
 
 def test_default_large_cap_sources_shape():
@@ -49,7 +48,6 @@ def test_default_large_cap_sources_shape():
     assert by_name["nasdaq100"].max_count == 110
     assert by_name["djia"].min_count == 30
     assert by_name["djia"].max_count == 30
-    return "default_large_cap_sources returns sp500+ndx+djia with correct bounds"
 
 
 async def test_custom_sources_used():
@@ -72,7 +70,6 @@ async def test_custom_sources_used():
     assert set(result) == {"AAA", "BBB", "CCC", "DDD"}, f"got {result}"
     assert metadata["source_counts"] == {"alpha": 3, "beta": 2}
     assert metadata["union_size"] == 4
-    return "custom sources produce expected union and metadata"
 
 
 async def test_sources_below_min_count_aborts():
@@ -88,7 +85,6 @@ async def test_sources_below_min_count_aborts():
         )
     assert result == []
     assert metadata == {}
-    return "below-min-count source aborts (returns empty pair)"
 
 
 async def test_sources_above_max_count_aborts():
@@ -104,7 +100,6 @@ async def test_sources_above_max_count_aborts():
         )
     assert result == []
     assert metadata == {}
-    return "above-max-count source aborts (returns empty pair)"
 
 
 async def test_empty_sources_list_aborts():
@@ -121,7 +116,6 @@ async def test_empty_sources_list_aborts():
     assert result == []
     assert metadata == {}
     assert api_called["n"] == 0, "should not call ADV API if no sources"
-    return "empty sources list aborts cleanly without API call"
 
 
 async def test_default_sources_used_when_none():
@@ -146,7 +140,6 @@ async def test_default_sources_used_when_none():
     assert metadata["source_counts"]["nasdaq100"] == 100
     assert metadata["source_counts"]["djia"] == 30
     assert len(result) == 500
-    return "sources=None uses default large-cap sources"
 
 
 def main():

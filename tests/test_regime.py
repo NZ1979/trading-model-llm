@@ -54,7 +54,6 @@ def test_trending_up_reachable():
         breadth_proxy=0.04,
     )
     assert classify_regime(inputs) == "trending_up"
-    return "trending_up label reachable"
 
 
 def test_trending_down_reachable():
@@ -66,7 +65,6 @@ def test_trending_down_reachable():
         breadth_proxy=-0.03,
     )
     assert classify_regime(inputs) == "trending_down"
-    return "trending_down label reachable"
 
 
 def test_choppy_reachable_as_default():
@@ -78,7 +76,6 @@ def test_choppy_reachable_as_default():
         breadth_proxy=0.001,    # essentially flat
     )
     assert classify_regime(inputs) == "choppy"
-    return "choppy reached as default when no bucket matches"
 
 
 def test_crash_reachable():
@@ -90,7 +87,6 @@ def test_crash_reachable():
         breadth_proxy=-0.08,
     )
     assert classify_regime(inputs) == "crash"
-    return "crash label reachable"
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +103,6 @@ def test_crash_takes_precedence_over_trending_down():
         breadth_proxy=-0.05,   # bearish
     )
     assert classify_regime(inputs) == "crash"
-    return "crash beats trending_down when VIX confirms"
 
 
 def test_severe_drop_without_vix_spike_is_trending_down_not_crash():
@@ -120,7 +115,6 @@ def test_severe_drop_without_vix_spike_is_trending_down_not_crash():
         breadth_proxy=-0.05,
     )
     assert classify_regime(inputs) == "trending_down"
-    return "severe drop without VIX spike is trending_down, not crash"
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +131,6 @@ def test_trending_up_vetoed_by_elevated_vix_falls_to_choppy():
         breadth_proxy=0.04,
     )
     assert classify_regime(inputs) == "choppy"
-    return "elevated VIX vetoes trending_up → choppy"
 
 
 def test_trending_down_has_no_vix_veto():
@@ -150,7 +143,6 @@ def test_trending_down_has_no_vix_veto():
         breadth_proxy=-0.03,
     )
     assert classify_regime(inputs) == "trending_down"
-    return "trending_down has no VIX veto (slow-bleed regimes pass)"
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +160,6 @@ def test_vix_none_does_not_block_trending_up():
         breadth_proxy=0.04,
     )
     assert classify_regime(inputs) == "trending_up"
-    return "VIX None allows trending_up (no veto possible)"
 
 
 def test_vix_none_blocks_crash():
@@ -181,7 +172,6 @@ def test_vix_none_blocks_crash():
         breadth_proxy=-0.05,
     )
     assert classify_regime(inputs) == "trending_down"
-    return "VIX None prevents crash escalation"
 
 
 def test_vix_none_returns_real_label_not_unknown():
@@ -196,7 +186,6 @@ def test_vix_none_returns_real_label_not_unknown():
     for inputs in test_cases:
         label = classify_regime(inputs)
         assert label != "unknown", f"got unknown for {inputs}"
-    return "VIX None never returns 'unknown'"
 
 
 # ---------------------------------------------------------------------------
@@ -206,19 +195,16 @@ def test_vix_none_returns_real_label_not_unknown():
 def test_vix_ratio_with_both_values():
     inputs = RegimeInputs(0.0, 24.0, 12.0, 0.0)
     assert inputs.vix_ratio == 2.0
-    return "vix_ratio = vix_level / median when both present"
 
 
 def test_vix_ratio_none_when_vix_missing():
     inputs = RegimeInputs(0.0, None, 12.0, 0.0)
     assert inputs.vix_ratio is None
-    return "vix_ratio is None when vix_level is None"
 
 
 def test_vix_ratio_none_when_median_missing():
     inputs = RegimeInputs(0.0, 24.0, None, 0.0)
     assert inputs.vix_ratio is None
-    return "vix_ratio is None when median is None"
 
 
 def test_vix_ratio_none_when_median_zero():
@@ -226,13 +212,11 @@ def test_vix_ratio_none_when_median_zero():
     Property returns None rather than raising or producing inf."""
     inputs = RegimeInputs(0.0, 24.0, 0.0, 0.0)
     assert inputs.vix_ratio is None
-    return "vix_ratio is None when median is zero"
 
 
 def test_vix_ratio_none_when_median_negative():
     inputs = RegimeInputs(0.0, 24.0, -1.0, 0.0)
     assert inputs.vix_ratio is None
-    return "vix_ratio is None when median is negative"
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +232,6 @@ def test_spy_return_exactly_at_trending_up_threshold():
         breadth_proxy=BREADTH_BULLISH,
     )
     assert classify_regime(inputs) == "trending_up"
-    return "SPY_RETURN_TRENDING_UP cutoff is inclusive"
 
 
 def test_spy_return_just_below_trending_up_falls_to_choppy():
@@ -259,7 +242,6 @@ def test_spy_return_just_below_trending_up_falls_to_choppy():
         breadth_proxy=BREADTH_BULLISH,
     )
     assert classify_regime(inputs) == "choppy"
-    return "just-below trending_up threshold → choppy"
 
 
 def test_breadth_exactly_at_bullish_threshold():
@@ -270,7 +252,6 @@ def test_breadth_exactly_at_bullish_threshold():
         breadth_proxy=BREADTH_BULLISH,
     )
     assert classify_regime(inputs) == "trending_up"
-    return "BREADTH_BULLISH cutoff is inclusive"
 
 
 def test_breadth_below_bullish_blocks_trending_up():
@@ -282,7 +263,6 @@ def test_breadth_below_bullish_blocks_trending_up():
         breadth_proxy=BREADTH_BULLISH - 0.001,
     )
     assert classify_regime(inputs) == "choppy"
-    return "weak breadth blocks trending_up even with strong SPY return"
 
 
 def test_vix_exactly_at_crash_ratio_with_severe_drop_is_crash():
@@ -293,7 +273,6 @@ def test_vix_exactly_at_crash_ratio_with_severe_drop_is_crash():
         breadth_proxy=-0.08,
     )
     assert classify_regime(inputs) == "crash"
-    return "VIX_CRASH_RATIO cutoff is inclusive"
 
 
 def test_vix_just_below_elevated_does_not_veto_trending_up():
@@ -306,7 +285,6 @@ def test_vix_just_below_elevated_does_not_veto_trending_up():
         breadth_proxy=0.04,
     )
     assert classify_regime(inputs) == "trending_up"
-    return "VIX_ELEVATED_RATIO exact value does NOT veto (strict-greater veto)"
 
 
 # ---------------------------------------------------------------------------
@@ -337,4 +315,3 @@ def test_classifier_never_returns_unknown_with_real_inputs():
                     "choppy",
                     "crash",
                 ), f"unexpected label {label!r} for inputs {inputs}"
-    return "no 'unknown' returned over 9 × 6 × 7 = 378-input grid"

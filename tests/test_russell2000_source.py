@@ -67,7 +67,6 @@ def test_russell2000_parses_real_format():
     # We DO expect futures/cash-like rows with non-ticker symbols filtered.
     assert "BLK_CSH_FND_TREASURY" not in syms
     assert any("FUTURE" not in s for s in syms)  # FUTURE label dropped
-    return f"parsed {len(syms)} tickers from stub CSV"
 
 
 def test_russell2000_handles_missing_header():
@@ -83,7 +82,6 @@ def test_russell2000_handles_missing_header():
     with patch.object(watchlist_builder, "urlopen", fake_urlopen):
         syms = get_russell2000_symbols()
     assert syms == set(), f"expected empty set, got {syms}"
-    return "missing header returns empty set (no crash)"
 
 
 def test_default_small_cap_sources_shape():
@@ -94,7 +92,6 @@ def test_default_small_cap_sources_shape():
     assert sources[0].fetcher is get_russell2000_symbols
     assert sources[0].min_count == 1500
     assert sources[0].max_count is None
-    return "default_small_cap_sources returns IWM-backed russell2000 source"
 
 
 def main():

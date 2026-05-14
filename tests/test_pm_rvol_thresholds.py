@@ -30,55 +30,46 @@ def test_get_threshold_present():
     t = {"AAPL": 3.8, "MSFT": 4.2, "_default": 5.0}
     assert get_threshold(t, "AAPL") == 3.8
     assert get_threshold(t, "MSFT") == 4.2
-    return "ticker present returns its value"
 
 
 def test_get_threshold_absent_with_default():
     t = {"AAPL": 3.8, "_default": 5.0}
     assert get_threshold(t, "ZZZZ") == 5.0
-    return "ticker absent + _default present returns _default"
 
 
 def test_get_threshold_absent_without_default():
     t = {"AAPL": 3.8}
     assert get_threshold(t, "ZZZZ") == HARD_FALLBACK_THRESHOLD
-    return "ticker absent + no _default returns HARD_FALLBACK"
 
 
 def test_get_threshold_empty_dict():
     assert get_threshold({}, "AAPL") == HARD_FALLBACK_THRESHOLD
-    return "empty dict returns HARD_FALLBACK"
 
 
 def test_get_threshold_invalid_value_falls_back():
     t = {"AAPL": "not a number", "_default": 5.0}
     assert get_threshold(t, "AAPL") == 5.0
-    return "non-numeric ticker value falls back to _default"
 
 
 def test_get_threshold_zero_value_falls_back():
     t = {"AAPL": 0.0, "_default": 5.0}
     assert get_threshold(t, "AAPL") == 5.0
-    return "zero ticker value falls back to _default"
 
 
 def test_get_threshold_negative_value_falls_back():
     t = {"AAPL": -1.0, "_default": 5.0}
     assert get_threshold(t, "AAPL") == 5.0
-    return "negative ticker value falls back to _default"
 
 
 def test_get_threshold_invalid_default_falls_back_to_hard():
     t = {"AAPL": "bad", "_default": "also bad"}
     assert get_threshold(t, "AAPL") == HARD_FALLBACK_THRESHOLD
-    return "invalid _default falls back to HARD_FALLBACK"
 
 
 def test_get_threshold_metadata_key_ignored():
     t = {"AAPL": 3.8, "_metadata": {"computed_at": "2026-05-06"}}
     # _metadata isn't a ticker; lookup of an absent ticker should fall back
     assert get_threshold(t, "ZZZZ") == HARD_FALLBACK_THRESHOLD
-    return "_metadata key is not treated as a ticker entry"
 
 
 def test_load_thresholds_missing_file():
@@ -86,7 +77,6 @@ def test_load_thresholds_missing_file():
         path = Path(d) / "nonexistent.json"
         result = load_thresholds(path)
         assert result == {}
-    return "missing file returns empty dict (no exception)"
 
 
 def test_load_thresholds_malformed_json():
@@ -95,7 +85,6 @@ def test_load_thresholds_malformed_json():
         path.write_text("{ this is not json")
         result = load_thresholds(path)
         assert result == {}
-    return "malformed JSON returns empty dict (no exception)"
 
 
 def test_load_thresholds_non_dict_root():
@@ -104,7 +93,6 @@ def test_load_thresholds_non_dict_root():
         path.write_text('["AAPL", "MSFT"]')
         result = load_thresholds(path)
         assert result == {}
-    return "non-dict root returns empty dict"
 
 
 def test_load_thresholds_valid():
@@ -121,7 +109,6 @@ def test_load_thresholds_valid():
         assert result["MSFT"] == 4.2
         assert result["_default"] == 5.0
         assert "_metadata" in result
-    return "valid JSON loads correctly"
 
 
 def test_load_thresholds_round_trip_via_get_threshold():
@@ -135,7 +122,6 @@ def test_load_thresholds_round_trip_via_get_threshold():
         loaded = load_thresholds(path)
         assert get_threshold(loaded, "AAPL") == 3.8
         assert get_threshold(loaded, "ZZZZ") == 5.5
-    return "round-trip: write -> load -> lookup works"
 
 
 def main():

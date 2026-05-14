@@ -132,7 +132,6 @@ def test_gap_and_go_fires_in_window():
     decisions = db.execute("SELECT action, setup, confidence FROM decisions").fetchall()
     gng_buys = [d for d in decisions if d[0] == "Buy" and d[1] == "gap_and_go"]
     assert len(gng_buys) >= 1, f"Expected at least 1 gap_and_go Buy, got decisions: {decisions}"
-    return f"gap_and_go Buy fired: {len(gng_buys)} action=Buy/setup=gap_and_go rows"
 
 
 def test_eval_runs_in_gap_and_go_window():
@@ -142,7 +141,6 @@ def test_eval_runs_in_gap_and_go_window():
     assert len(in_window) >= 5, f"Expected >=5 evals in 9:35-10:00 ET window, got {len(in_window)}"
     # Show what fired
     fired_in_window = [r for r in in_window if r[2] != "Hold"]
-    return f"{len(in_window)} evals in window, {len(fired_in_window)} non-Hold (e.g., {fired_in_window[:1]})"
 
 
 def test_opening_volatility_blocks_9_30():
@@ -156,7 +154,6 @@ def test_opening_volatility_blocks_9_30():
     # not have been logged because signal_start_time short-circuits before
     # the eval. Verify at least the first logged eval handles correctly.
     assert first_row is not None
-    return f"first eval at ET={first_row[0]} -> {first_row[1]}/{first_row[2]}"
 
 
 def test_pullback_path_still_warmup_gated():
@@ -171,7 +168,6 @@ def test_pullback_path_still_warmup_gated():
     sig = generate_signal(df_ind, daily_ctx, premarket_ctx=None)
     assert sig.signal == "Hold"
     assert "insufficient_data" in sig.reasons or "indicators_warming_up" in sig.reasons
-    return f"pullback gated correctly: reasons={sig.reasons}"
 
 
 def main():

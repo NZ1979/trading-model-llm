@@ -90,7 +90,6 @@ def test_first_hold_logs_under_patch():
     rows = db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
     assert logged is True, "First Hold/none should be logged (dedup default fixed)"
     assert rows == 1, f"Expected 1 row, got {rows}"
-    return f"first Hold/none logged: rows={rows}"
 
 
 def test_second_identical_hold_does_not_relog():
@@ -103,7 +102,6 @@ def test_second_identical_hold_does_not_relog():
     rows = db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
     assert logged is False
     assert rows == 1, f"Expected still 1 row after duplicate, got {rows}"
-    return f"second identical Hold not relogged: rows={rows}"
 
 
 def test_setup_transition_logs():
@@ -116,7 +114,6 @@ def test_setup_transition_logs():
     assert logged is True
     assert len(rows) == 2
     assert rows[0][0] == "none" and rows[1][0] == "pullback"
-    return f"setup transition logged: setups={[r[0] for r in rows]}"
 
 
 def test_actionable_decision_always_logs():
@@ -126,7 +123,6 @@ def test_actionable_decision_always_logs():
     rows = db.execute("SELECT action, setup FROM decisions").fetchall()
     assert logged is True
     assert rows[0] == ("Buy", "pullback")
-    return f"first decision = Buy/pullback logged"
 
 
 def test_independent_tickers_each_log_first():
@@ -137,7 +133,6 @@ def test_independent_tickers_each_log_first():
         attempt_log(state, hold_none_decision(t), db)
     rows = db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
     assert rows == 503, f"Expected 503 rows (one per ticker), got {rows}"
-    return f"503 distinct ticker first-Hold rows logged"
 
 
 def main():
