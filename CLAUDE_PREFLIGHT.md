@@ -509,3 +509,32 @@ If a request inside an LLM-model session implies touching the gap-and-go side �
 - For LLM-model development that needs realistic data (testing shadow_outcomes scoring, validating `policy.py` against historical setups), use SYNTHESIZED fixtures or a deliberately-curated local SQLite DB that lives only inside the LLM-model repo (e.g., `tests/fixtures/` or a small committed sample DB). Do NOT pull from the gap-and-go production DB.
 - When the LLM model is ready to deploy, that's a planned cutover with its own session, its own account credentials (`PA3QAZ941NFN`), its own infrastructure decision (Godzilla as runtime vs a fresh VPS), and its own pre-flight gates. Not a "let's just borrow the existing VPS for a bit" move.
 - This rule supersedes any earlier conversational pattern in which an LLM-model session has discussed gap-and-go state. If you (Claude) find yourself reaching for VPS context inside an LLM-model session, that's the signal to stop and re-anchor.
+
+## Rule 27: Verify durability before declaring a session complete
+
+"Code compiles, tests pass" is not "session done." Pass-on-disk is not the same as pushed-to-origin. A session that ends without a verified `git push` leaves the next session — which may be tomorrow, may be after a Godzilla crash, may be after an OS update reboot — looking at uncommitted code that no one knows is fragile until it's gone.
+
+**The rule, before writing a session summary or generating a handoff prompt for a future session:**
+
+Run these checks from PowerShell on the workstation (NOT from the Cowork bash sandbox — Rule 24 applies; bash-mount staleness and the 0-byte `.git/index.lock` trap both manifest here):
+
+1. `git status` — must show "working tree clean" OR every modified/untracked file must be explicitly acknowledged as intentionally uncommitted (boot logs, .gitignore'd temp files, deliberate WIP experiments). Any project-artifact file (code, tests, docs, configs) that's modified or untracked is a blocker.
+2. `git add <files>` + `git commit -m "<descriptive message>"` — stage and commit the work. The commit message must name what shipped (not "wip" or "end of session" or "checkpoint").
+3. `git push` — push to the fork's own remote (`https://github.com/NZ1979/trading-model-llm.git` for the LLM-model fork from Godzilla; gap-and-go remote symmetrically from gap-and-go sessions — never cross-push per Rule 26). Verify the push output shows the new SHA on `origin/main`.
+4. Re-run `git status` — must now show "Your branch is up to date with 'origin/main'" AND "working tree clean".
+
+Capture the resulting commit SHA in the session summary as a literal line: **`Committed and pushed: <SHA>`**. If that line can't be written truthfully, the summary is premature.
+
+**Words to never use in a session wrap until all four checks pass:** "ARMED," "shipped," "delivered," "complete," "ready," "done," "deployed." Until the push lands, the accurate framing is: *"code on disk, compile-clean, tests passing, NOT YET committed."*
+
+**Specific trap (2026-05-13):** A session landed ~950 lines of new code across `strategy/llm/policy.py` (~900 lines, entire TradePolicy module), `strategy/llm/context_builder.py` (~420 lines), `analysis/regime.py`, `analysis/regime_data.py`, plus 5 new test files (~155 new tests), plus all of yesterday's `main.py` wiring, plus updates to `strategy/llm/types.py`, `strategy/llm/prompts.py`, `strategy/risk.py`, `execution/alpaca_orders.py`, `scripts/backfill_shadow_outcomes.py`, and several docs. The session ran `py_compile main.py` (clean) and `python -m pytest tests/ -q` (231 passed) multiple times. It wrapped with "Operational state: Code is ARMED" and generated a "tomorrow's prompt" handoff. **None of it was committed.** The next morning's session opened with `git status` showing 9 modified files + 16 untracked files, including entire new modules. The full diff was 950+ lines of work that existed only on Godzilla's local disk. Damage was zero (the disk held, no crash, no OS update overnight), but the trajectory was clearly toward losing a full day of work on a single disk hiccup, OneDrive sync glitch, or accidental `git restore`. The fix is this rule.
+
+**Why `py_compile` and `pytest` aren't sufficient verification:** Both verify behavior of files on disk against the in-process Python interpreter. Both pass cleanly on a working tree full of uncommitted local edits. Neither has any visibility into git state. They answer "does this code work?" — they say nothing about "does this work survive a reboot?" Those are two different questions, and only the second one is what "session done" actually means in practice.
+
+**How to apply:**
+
+- Whenever the user signals end-of-session — phrases like "summarize," "wrap up," "tomorrow's prompt," "we're done," "let's stop here," "next session" — STOP and run the four-check sequence FIRST. Generate the summary AFTER `git push` lands.
+- For session-end summaries, the `Committed and pushed: <SHA>` line is mandatory. Even if the session shipped nothing committable (e.g., pure-conversation session, debugging that resolved without code changes), say so explicitly: "**No code changes this session — nothing to commit.**" Don't leave the question unanswered.
+- Apply symmetrically to both forks. Gap-and-go session wraps must verify push to the gap-and-go remote; LLM-model session wraps must verify push to `trading-model-llm`. Cross-pushing between forks is a Rule 26 violation; same-fork pushing is mandatory per this rule.
+- Rule 24 still applies: run `git status` and the commit/push from PowerShell on the workstation, NOT from the Cowork bash sandbox. The bash mount can hold stale snapshots; a 0-byte `.git/index.lock` from prior sandbox activity may need `Remove-Item .git\index.lock -ErrorAction SilentlyContinue` from PowerShell before commits work.
+- If the user explicitly requests that a specific change NOT be committed (a WIP experiment, a config flip pending decision, a debug `print()` to roll back), capture that exception explicitly in the summary: "**Per user request, NOT committed:** `<files>` — `<reason>`." Anything else is the failure mode this rule was written to catch.
