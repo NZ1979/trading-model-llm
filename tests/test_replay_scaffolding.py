@@ -28,7 +28,6 @@ from data.replay import (
     historical_news,
     historical_sentiment,
     market_context,
-    ticker_metadata,
 )
 from sim.fills import SimulatedFill, apply_slippage, simulate_fill
 from sim.portfolio import SimulatedPortfolio
@@ -523,11 +522,6 @@ def test_historical_news_stubs_raise_not_implemented():
 def test_historical_sentiment_stubs_raise_not_implemented():
     with pytest.raises(NotImplementedError, match="M2.2"):
         historical_sentiment.open_fixture(Path("/tmp/none.sqlite"))
-
-
-def test_ticker_metadata_stubs_raise_not_implemented():
-    with pytest.raises(NotImplementedError, match="M2.2"):
-        ticker_metadata.get_ticker_metadata("AAPL")
 
 
 def test_sentiment_loader_docstring_mentions_rule_26():
