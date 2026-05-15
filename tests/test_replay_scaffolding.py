@@ -512,11 +512,6 @@ def test_cli_config_to_printable_serializes_dates_and_paths():
 # ---------------------------------------------------------------------------
 
 
-def test_historical_sentiment_stubs_raise_not_implemented():
-    with pytest.raises(NotImplementedError, match="M2.2"):
-        historical_sentiment.open_fixture(Path("/tmp/none.sqlite"))
-
-
 def test_sentiment_loader_docstring_mentions_rule_26():
     """Sanity check: future maintainers must not delete the Rule 26 note."""
     doc = historical_sentiment.__doc__ or ""

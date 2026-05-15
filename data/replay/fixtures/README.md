@@ -20,13 +20,33 @@ Files in this directory are data, not code. They are:
 **Source:** trader-prod's `sentiment` table on the gap-and-go VPS
 (`5.161.199.155:/opt/trader/app/trading.db`).
 
-**What it contains:** one row per (ticker, ts_et) that the live
-sentiment pipeline scored. Columns: `ts_et`, `ticker`, `sentiment_score`,
-`polygon_article_id`, `haiku_model_id`.
+**Schema:** the fixture is a 1:1 mirror of the live production table
+defined in `data/news_pipeline.py::_init_db`. Five columns:
+
+| column | type | meaning |
+|---|---|---|
+| `news_id` | INTEGER PRIMARY KEY | Positive int for Alpaca news (the Alpaca news_id directly); negative int for Polygon news (via `data.polygon_news._polygon_id_to_int(article_uuid, ticker)`, a 63-bit blake2b hash). |
+| `ticker` | TEXT NOT NULL | Equity symbol, upper-case (e.g. `"AAPL"`). |
+| `sentiment` | INTEGER NOT NULL | Haiku-scored sentiment on the **-10..+10** scale documented in `analysis/sentiment.py::SENTIMENT_SYSTEM_PROMPT`. Not a normalized float. |
+| `reasoning` | TEXT | One-sentence justification for the score; informational only, not consumed by the replay loader. |
+| `headline` | TEXT | The headline that was scored; informational only. |
+| `scored_at` | REAL NOT NULL | UNIX epoch seconds (float) at the time the live pipeline wrote the row. This is what the live `data/news_pipeline.py::latest_sentiment` keys on, and what the replay's `historical_sentiment.coverage_window` reports. |
+
+A `(ticker, scored_at DESC)` index matches the live one for
+point-in-time queries.
 
 **Coverage:** depends on export date. The trader-prod sentiment table
 started recording 2026-04-29; replays of dates before that have no
 sentiment data even if the fixture is fresh.
+
+**Why this schema and not the M2.1 stub's (ts_et, sentiment_score,
+polygon_article_id, haiku_model_id):** the stub described an
+aspirational schema that doesn't exist on trader-prod. The replay
+harness exports a faithful 1:1 copy of the live table per Rule 26 (no
+modifying production for the fork's convenience). The replay loader
+re-derives `news_id` for Polygon-sourced items via the same
+`_polygon_id_to_int` hash so per-article lookup still works without
+the original UUID column being present.
 
 ### Export procedure (one-time, repeat when window slides)
 
@@ -46,29 +66,31 @@ sqlite3 /opt/trader/app/trading.db <<'SQL'
 .mode csv
 .headers on
 .output /tmp/sentiment_export.csv
-SELECT ts_et, ticker, sentiment_score, polygon_article_id, haiku_model_id
+SELECT news_id, ticker, sentiment, reasoning, headline, scored_at
 FROM sentiment
-WHERE ts_et >= '2026-04-29'
-ORDER BY ts_et;
+WHERE scored_at >= strftime('%s', '2026-04-29')
+ORDER BY scored_at;
 SQL
 
-# Convert CSV -> SQLite fixture file in the schema the replay loader expects
+# Convert CSV -> SQLite fixture file in the schema the replay loader expects.
+# Schema mirrors data/news_pipeline.py::_init_db exactly.
 sqlite3 /tmp/sentiment_export.sqlite <<'SQL'
 CREATE TABLE sentiment (
-    ts_et TEXT NOT NULL,
+    news_id INTEGER PRIMARY KEY,
     ticker TEXT NOT NULL,
-    sentiment_score REAL NOT NULL,
-    polygon_article_id TEXT,
-    haiku_model_id TEXT
+    sentiment INTEGER NOT NULL,
+    reasoning TEXT,
+    headline TEXT,
+    scored_at REAL NOT NULL
 );
-CREATE INDEX idx_sentiment_ticker_ts ON sentiment(ticker, ts_et);
+CREATE INDEX idx_sentiment_ticker_time ON sentiment(ticker, scored_at DESC);
 .mode csv
 .import --skip 1 /tmp/sentiment_export.csv sentiment
 SQL
 
 # Sanity check
 sqlite3 /tmp/sentiment_export.sqlite "SELECT COUNT(*) FROM sentiment;"
-sqlite3 /tmp/sentiment_export.sqlite "SELECT MIN(ts_et), MAX(ts_et) FROM sentiment;"
+sqlite3 /tmp/sentiment_export.sqlite "SELECT MIN(scored_at), MAX(scored_at) FROM sentiment;"
 sqlite3 /tmp/sentiment_export.sqlite "SELECT ticker, COUNT(*) FROM sentiment GROUP BY ticker ORDER BY COUNT(*) DESC LIMIT 10;"
 ```
 
@@ -97,7 +119,7 @@ gap-and-go side or a neutral third party.
 # (Godzilla — Cowork session anchored at C:\trading\LLM model\)
 cd 'C:\trading\LLM model'
 .\.venv\Scripts\Activate.ps1
-python -c "import sqlite3; conn = sqlite3.connect('data/replay/fixtures/sentiment.sqlite'); cur = conn.execute('SELECT COUNT(*), MIN(ts_et), MAX(ts_et) FROM sentiment'); print(cur.fetchone())"
+python -c "import sqlite3; conn = sqlite3.connect('data/replay/fixtures/sentiment.sqlite'); cur = conn.execute('SELECT COUNT(*), MIN(scored_at), MAX(scored_at) FROM sentiment'); print(cur.fetchone())"
 ```
 
 Compare the count + min/max ts_et to the values recorded in Step 1.
@@ -108,7 +130,8 @@ transfer corrupted something — re-do.
 
 Re-export when any of these is true:
 
-1. The replay window's `end_date` is past the fixture's `max ts_et`.
+1. The replay window's `end_date` is past the fixture's max `scored_at`
+   (the replay loader's `coverage_window` helper surfaces this number).
 2. The fixture is more than 30 days old AND the live system has been
    running (older sentiment data tends to drift in coverage as the
    trader-prod news pipeline gets updates).
