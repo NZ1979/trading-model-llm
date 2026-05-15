@@ -25,7 +25,6 @@ sys.path.insert(0, '.')
 from data.replay.config import ReplayConfig, cache_key
 from data.replay import (
     historical_bars,
-    historical_news,
     historical_sentiment,
     market_context,
 )
@@ -511,12 +510,6 @@ def test_cli_config_to_printable_serializes_dates_and_paths():
 # ---------------------------------------------------------------------------
 # Loader stubs raise NotImplementedError
 # ---------------------------------------------------------------------------
-
-
-def test_historical_news_stubs_raise_not_implemented():
-    with pytest.raises(NotImplementedError, match="M2.2"):
-        historical_news.load_historical_news(
-            ("AAPL",), date(2026, 4, 1), date(2026, 4, 30))
 
 
 def test_historical_sentiment_stubs_raise_not_implemented():
