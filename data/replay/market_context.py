@@ -5,19 +5,28 @@ Populates the market-context fields of ``LLMContext``:
 classifier (``analysis/regime.py``) which produces
 ``market_regime_label``.
 
-VIX caveat: Polygon Stocks Starter returns 403 on the ``I:VIX``
-ticker (verified 2026-05-13). Until a working VIX source is wired up,
-``vix_level`` is ``None`` and the regime classifier handles the gap
-gracefully (already verified during regime classifier rollout).
+VIX source: ``data/fred_vix.py`` (FRED ``VIXCLS`` daily close). Polygon
+Stocks Starter does not include indices (I:VIX returns 403, verified
+2026-05-13); FRED publishes the same daily close one business day later,
+free, with a stable 30-year API contract. Daily granularity is sufficient
+for the regime classifier's 60-day median comparison.
 
-Status: M2.1 scaffolding stub. Implementation lands in M2.2.
+Status: M2.2. VIX helper wired below; ``load_market_data`` still raises
+``NotImplementedError`` until the SPY half lands in the next sub-task,
+at which point the two halves combine into a single atomic
+implementation (no half-built returns per Rule 18).
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 
 import pandas as pd
+
+from data import fred_vix
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,5 +71,59 @@ def load_market_data(start_date: date, end_date: date) -> MarketContextBundle:
             Per Rule 18, this fails loud.
     """
     raise NotImplementedError(
-        "load_market_data is M2.2 work; M2.1 declares the contract"
+        "load_market_data is M2.2 work; M2.1 declares the contract. "
+        "VIX half wired via _load_vix_daily; SPY half pending the "
+        "polygon_feed.fetch_aggs helper. Both land in the same commit."
     )
+
+
+async def _load_vix_daily(
+    start_date: date, end_date: date
+) -> pd.DataFrame | None:
+    """Best-effort VIX daily fetch over ``[start_date, end_date]`` inclusive.
+
+    Wraps ``data.fred_vix.get_vix_history``. Per the ``load_market_data``
+    contract, VIX is best-effort: any upstream FRED failure (missing key,
+    4xx, retries exhausted, empty observations, all-sentinels) collapses
+    to ``None`` with a WARNING log. Both the regime classifier and the
+    LLMContext builder already handle ``vix_daily=None`` paths (verified
+    during the regime classifier rollout, 2026-05-13).
+
+    A ``ValueError`` from the underlying call (programming error, e.g.
+    ``end_date < start_date``) is re-raised unchanged — that's a caller
+    bug, not a best-effort failure mode, and silently returning None
+    would hide it (Rule 18).
+
+    Unexpected exception types also propagate; the only swallowed class
+    is ``RuntimeError`` from ``fred_vix``, whose contract guarantees
+    that path covers every legitimate FRED-side failure.
+
+    Caller responsibilities:
+      - Pre-pad ``start_date`` for whatever warmup window downstream
+        consumers require (the regime classifier wants ~60 trading days
+        of VIX history to compute its 60-day median).
+      - Caller is sync or async; this helper is async, so a sync caller
+        wraps it in ``asyncio.run`` once at the top of the replay load.
+
+    Rule 22 note: ``fred_vix``'s ``RuntimeError`` messages are already
+    scrubbed of the ``api_key=`` URL value before they reach this
+    handler, so logging ``str(e)`` directly is safe. We rely on that
+    contract rather than re-scrubbing here.
+
+    Args:
+        start_date: inclusive
+        end_date: inclusive
+
+    Returns:
+        ``DataFrame`` indexed by tz-aware UTC midnight date with a single
+        column ``vix_close`` (float), sorted ascending — i.e. exactly
+        the shape ``fred_vix.get_vix_history`` returns. ``None`` if the
+        FRED fetch failed.
+    """
+    try:
+        return await fred_vix.get_vix_history(start_date, end_date)
+    except RuntimeError as e:
+        logger.warning(
+            "VIX load failed; market_context.vix_daily=None: %s", e
+        )
+        return None
