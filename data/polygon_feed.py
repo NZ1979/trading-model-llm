@@ -34,10 +34,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -447,3 +448,269 @@ async def backfill_daily_bars(
 
     logger.info("Daily bars fetched for %d/%d symbols", len(out), len(symbols))
     return out
+
+
+# ---------------------------------------------------------------------------
+# fetch_aggs — generic Polygon aggregates helper (M2.2 sub-task #2)
+#
+# Backs the replay harness's per-ticker bar loaders
+# (``data/replay/historical_bars.py``) and SPY market-context loader
+# (``data/replay/market_context.py``). Standalone async function rather
+# than a method on ``PolygonRESTClient`` because the replay harness
+# wants one call per (ticker, granularity, range) request, not a long-
+# lived client object.
+#
+# Per ``docs/M2_REPLAY_HARNESS_DESIGN.md`` § Inputs.
+# ---------------------------------------------------------------------------
+
+
+# Polygon's per-request hard cap. If a response comes back with EXACTLY
+# this many rows, the result is almost certainly truncated and we cannot
+# trust it without paginating. Per Rule 18 we fail loud rather than
+# silently return truncated data.
+POLYGON_AGGS_PAGE_LIMIT = 50_000
+
+# Valid timespan values per Polygon's docs. Validated up-front to fail
+# loud on caller typos rather than returning a Polygon 400 with a
+# scrubbed-URL error that obscures the actual problem.
+_VALID_TIMESPANS = frozenset(
+    {"minute", "hour", "day", "week", "month", "quarter", "year"}
+)
+
+
+def _require_polygon_key() -> str:
+    """Read ``POLYGON_API_KEY`` from env; raise loud if missing (Rule 18).
+
+    Read at call time, not import time, so tests can monkeypatch the env
+    without re-importing and so a missing key on the VPS fails at first
+    use rather than at module load.
+    """
+    key = os.environ.get("POLYGON_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "POLYGON_API_KEY not set in environment. In PowerShell on "
+            "Godzilla: $env:POLYGON_API_KEY = '<your-key>'. On the VPS, "
+            "the key lives in /etc/trading-platform/env (mode 0600)."
+        )
+    return key
+
+
+def _polygon_bars_to_df(bars: list[dict]) -> "pd.DataFrame":
+    """Convert Polygon aggs ``results`` list to the canonical DataFrame.
+
+    Columns: ``open, high, low, close, volume, vwap, trade_count``.
+    Index: tz-aware UTC ``DatetimeIndex`` derived from Polygon's ``t``
+    field (epoch milliseconds), sorted ascending.
+
+    Callers that want America/New_York-indexed bars (e.g. for matching
+    the 5-min eval-tick boundaries) tz_convert at use-site. The repo
+    convention is UTC-native at the feed layer and ET-converted in
+    indicator/replay code (see ``analysis/indicators.py``).
+
+    Polygon's ``n`` (trade count) and ``vw`` (vwap) fields can be absent
+    on some bar types (notably crypto and certain index products). For
+    equity aggs both are reliably present, but we backfill with NaN
+    defensively so the column set is stable regardless of upstream
+    omissions.
+    """
+    import pandas as pd  # local import: pandas is heavy and not all
+    # module consumers need it (the WebSocket path doesn't).
+
+    if not bars:
+        return pd.DataFrame(
+            columns=["open", "high", "low", "close", "volume", "vwap", "trade_count"]
+        )
+
+    df = pd.DataFrame(bars)
+    df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+    rename_map = {
+        "o": "open",
+        "h": "high",
+        "l": "low",
+        "c": "close",
+        "v": "volume",
+        "vw": "vwap",
+        "n": "trade_count",
+    }
+    df = df.set_index("ts").rename(columns=rename_map)
+    cols = ["open", "high", "low", "close", "volume", "vwap", "trade_count"]
+    for col in cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+    return df[cols].sort_index()
+
+
+async def fetch_aggs(
+    ticker: str,
+    multiplier: int,
+    timespan: str,
+    start_date: date,
+    end_date: date,
+    *,
+    api_key: str | None = None,
+    adjusted: bool = True,
+    timeout_s: float = 30.0,
+    max_retries: int = 3,
+) -> "pd.DataFrame":
+    """Fetch OHLCV aggregates for ``ticker`` over ``[start_date, end_date]``.
+
+    Generic helper backing the M2 replay harness. One HTTP request per
+    call (no pagination in v1 — see "Truncation handling" below). Use
+    via ``await fetch_aggs("SPY", 5, "minute", date(2026, 4, 1),
+    date(2026, 4, 30))`` style.
+
+    Args:
+        ticker: equity symbol (e.g. "SPY", "AAPL"). Case-sensitive on
+            Polygon's side; this function does not upper-case.
+        multiplier: bar width in units of ``timespan`` (e.g. 5 with
+            timespan="minute" returns 5-minute bars). Must be >= 1.
+        timespan: one of ``minute, hour, day, week, month, quarter,
+            year``. Anything else raises ``ValueError`` (caller bug,
+            not a Polygon-side condition).
+        start_date: inclusive (Polygon's ``from``).
+        end_date: inclusive (Polygon's ``to``).
+        api_key: Polygon API key. If ``None``, read from the
+            ``POLYGON_API_KEY`` env var via ``_require_polygon_key``.
+        adjusted: pass-through to Polygon's ``adjusted`` param. True
+            (split/dividend-adjusted) for most replay use cases; False
+            when you specifically want raw bars.
+        timeout_s: per-request timeout. The default 30s comfortably
+            covers a 1-min-bars-over-30-days fetch even on a slow link.
+        max_retries: retries on 429 and 5xx with exponential backoff
+            (1s, 2s, 4s). 4xx that isn't 429 (bad key, malformed
+            request) does not retry — raises immediately.
+
+    Returns:
+        DataFrame from ``_polygon_bars_to_df``: UTC-indexed, columns
+        ``open, high, low, close, volume, vwap, trade_count``, sorted
+        ascending.
+
+    Raises:
+        ValueError: ``end_date < start_date``; ``multiplier < 1``;
+            ``timespan`` not in the validated set. These are caller
+            bugs and propagate unchanged so the failure surfaces in
+            tests rather than in production data.
+        RuntimeError: ``POLYGON_API_KEY`` missing; Polygon 4xx (bad
+            key, unknown ticker, malformed range); 5xx persisting
+            after retries; transient network error persisting after
+            retries; empty results over a non-empty range (Rule 18);
+            truncation (results.len == POLYGON_AGGS_PAGE_LIMIT — see
+            below).
+
+    Truncation handling:
+        Polygon caps each response at 50,000 rows. If we get exactly
+        that many back, the result is almost certainly truncated and
+        we cannot return it as-if-complete. We raise rather than
+        return truncated bars; the caller chunks the range or waits
+        for pagination support (a small follow-up commit).
+
+        Empirical sizing for current M2 scope:
+          - SPY 5-min over 60 days × 78 ticks/day = ~4,680 bars: safe
+          - SPY 1-min RTH over 60 days = ~23,400 bars: safe
+          - SPY 1-min full session × 60 days = ~57,600: WILL TRIP cap
+        First real-data replay run that includes pre/post will tell
+        us when to add pagination.
+
+    Rule 22 note: all URL strings in raised messages pass through
+    ``_scrub_apikey``. The ``from None`` on the re-raise suppresses the
+    original httpx exception chain so its leaky default message can't
+    propagate via ``__cause__``.
+    """
+    if end_date < start_date:
+        raise ValueError(
+            f"end_date {end_date} is before start_date {start_date}"
+        )
+    if multiplier < 1:
+        raise ValueError(
+            f"multiplier must be >= 1, got {multiplier}"
+        )
+    if timespan not in _VALID_TIMESPANS:
+        raise ValueError(
+            f"timespan {timespan!r} not in {sorted(_VALID_TIMESPANS)}"
+        )
+
+    key = api_key if api_key is not None else _require_polygon_key()
+
+    url = (
+        f"{POLYGON_REST_BASE}/v2/aggs/ticker/{ticker}/range/"
+        f"{multiplier}/{timespan}/{start_date.isoformat()}/{end_date.isoformat()}"
+    )
+    params = {
+        "adjusted": "true" if adjusted else "false",
+        "sort": "asc",
+        "limit": POLYGON_AGGS_PAGE_LIMIT,
+        "apiKey": key,
+    }
+
+    backoff = 1.0
+    last_err: Exception | None = None
+    payload: dict | None = None
+
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        for attempt in range(max_retries):
+            try:
+                resp = await client.get(url, params=params)
+                if resp.status_code == 429:
+                    last_err = RuntimeError(
+                        f"Polygon HTTP 429 (rate limited) for "
+                        f"{_scrub_apikey(str(resp.url))}"
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    break
+                resp.raise_for_status()
+                payload = resp.json()
+                break
+            except httpx.HTTPStatusError as e:
+                if 500 <= e.response.status_code < 600:
+                    last_err = e
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    break
+                # 4xx (other than 429): don't retry; raise with scrubbed URL.
+                safe_url = _scrub_apikey(str(e.response.url))
+                body_snippet = _scrub_apikey(e.response.text[:200])
+                raise RuntimeError(
+                    f"Polygon HTTP {e.response.status_code} for {safe_url}: "
+                    f"{body_snippet}"
+                ) from None
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as e:
+                last_err = e
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                break
+
+    if payload is None:
+        raise RuntimeError(
+            f"Polygon fetch_aggs failed after {max_retries} retries for "
+            f"{ticker} {multiplier}/{timespan} "
+            f"{start_date.isoformat()}..{end_date.isoformat()}: "
+            f"{_scrub_apikey(str(last_err))}"
+        ) from None
+
+    results = payload.get("results") or []
+
+    if not results:
+        raise RuntimeError(
+            f"Polygon returned 0 bars for {ticker} {multiplier}/{timespan} "
+            f"{start_date.isoformat()}..{end_date.isoformat()}. "
+            f"Check that the ticker exists on the requested dates and that "
+            f"your plan tier covers this asset class."
+        )
+
+    if len(results) == POLYGON_AGGS_PAGE_LIMIT:
+        raise RuntimeError(
+            f"Polygon returned exactly {POLYGON_AGGS_PAGE_LIMIT} bars (the "
+            f"per-request cap) for {ticker} {multiplier}/{timespan} "
+            f"{start_date.isoformat()}..{end_date.isoformat()}; result is "
+            f"likely truncated. Chunk the date range or wait for pagination "
+            f"support (queued follow-up)."
+        )
+
+    return _polygon_bars_to_df(results)
