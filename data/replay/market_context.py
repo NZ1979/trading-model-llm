@@ -5,28 +5,40 @@ Populates the market-context fields of ``LLMContext``:
 classifier (``analysis/regime.py``) which produces
 ``market_regime_label``.
 
-VIX source: ``data/fred_vix.py`` (FRED ``VIXCLS`` daily close). Polygon
-Stocks Starter does not include indices (I:VIX returns 403, verified
-2026-05-13); FRED publishes the same daily close one business day later,
-free, with a stable 30-year API contract. Daily granularity is sufficient
-for the regime classifier's 60-day median comparison.
+Sources:
 
-Status: M2.2. VIX helper wired below; ``load_market_data`` still raises
-``NotImplementedError`` until the SPY half lands in the next sub-task,
-at which point the two halves combine into a single atomic
-implementation (no half-built returns per Rule 18).
+- SPY 5-min and SPY daily: Polygon via ``data.polygon_feed.fetch_aggs``.
+  The replay window is used as-is for 5-min; SPY daily and VIX daily
+  pre-pad by ``SPY_DAILY_PREPAD_CALENDAR_DAYS`` (~460 calendar days,
+  covering 300 trading days) to give the regime classifier its required
+  warmup window.
+- VIX daily: FRED ``VIXCLS`` via ``data.fred_vix.get_vix_history``,
+  wrapped in ``_load_vix_daily`` for best-effort failure handling.
+  Polygon Stocks Starter does not include indices (I:VIX returns 403,
+  verified 2026-05-13); FRED publishes the same daily close one
+  business day later, free, with a stable 30-year API contract.
+
+Status: M2.2 sub-task #3 — ``load_market_data`` fully wired.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
-from data import fred_vix
+from data import fred_vix, polygon_feed
 
 logger = logging.getLogger(__name__)
+
+
+# 300 trading days × ~1.5 calendar/trading-day ratio + holiday slack.
+# Empirically, 460 calendar days back from any US-market date yields at
+# least 300 trading days even with extended holiday weeks. ``fetch_aggs``
+# does not pre-pad on its own — the caller (this function) extends the
+# range explicitly so the contract stays "what you ask is what you get."
+SPY_DAILY_PREPAD_CALENDAR_DAYS = 460
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,36 +56,86 @@ class MarketContextBundle:
     vix_daily: pd.DataFrame | None  # None when VIX source is unavailable
 
 
-def load_market_data(start_date: date, end_date: date) -> MarketContextBundle:
-    """Load SPY (5-min + daily) and VIX (daily) over a date range.
+async def load_market_data(
+    start_date: date, end_date: date
+) -> MarketContextBundle:
+    """Load SPY (5-min + daily) and VIX (daily) over a replay date range.
 
-    SPY daily extends 300 trading days BEFORE ``start_date`` to give
-    the regime classifier its required warmup window. Caller does not
-    need to extend the range — this loader handles the prepad
-    internally.
+    Async because it calls ``fetch_aggs`` and ``_load_vix_daily``, both
+    async. The replay CLI lives inside an ``asyncio.run(main())`` at
+    the entry point; this function is awaited once at run start.
 
-    VIX is best-effort: if Polygon returns 403 (or any other failure
-    that isn't a transient retry-able error), the function logs a
-    warning and returns ``vix_daily=None``. Callers handle None
-    explicitly (regime classifier + LLMContext both have None-paths).
+    Range handling:
+      - SPY 5-min uses ``[start_date, end_date]`` as-is.
+      - SPY daily and VIX daily pre-pad by
+        ``SPY_DAILY_PREPAD_CALENDAR_DAYS`` (~460 calendar days, covering
+        300 trading days) so the regime classifier has its required
+        SMA200-class warmup window without the caller needing to
+        compute it.
+
+    SPY required vs VIX best-effort (Rule 18):
+      - SPY 5-min and SPY daily are required. Any ``fetch_aggs``
+        failure propagates as ``RuntimeError``: the replay cannot
+        produce meaningful market context without SPY, so a silent
+        empty-DataFrame return would be a Rule 18 violation.
+      - VIX is best-effort. ``_load_vix_daily`` already collapses any
+        FRED-side ``RuntimeError`` to ``None`` with a WARNING log;
+        the regime classifier and LLMContext both handle the None
+        path (verified during regime rollout 2026-05-13).
 
     Args:
-        start_date: inclusive, the replay window's first date
-        end_date: inclusive, the replay window's last date
+        start_date: inclusive, the replay window's first date.
+        end_date: inclusive, the replay window's last date.
 
     Returns:
-        MarketContextBundle as described above.
+        ``MarketContextBundle`` with all three frames. ``vix_daily``
+        is ``None`` only when the FRED fetch failed; ``spy_5min`` and
+        ``spy_daily`` are always non-empty DataFrames (failure raises).
 
     Raises:
-        NotImplementedError: M2.1 scaffolding. Implementation in M2.2.
-        RuntimeError: SPY load failed. SPY is required; we cannot
-            replay without market-context for the LLM's regime field.
-            Per Rule 18, this fails loud.
+        ValueError: ``end_date < start_date``. Caller bug; would
+            propagate the same way from ``fetch_aggs`` but we catch
+            it up-front so the error message names the wrong field.
+        RuntimeError: SPY 5-min or SPY daily fetch failed (bad key,
+            ticker, range, retries exhausted, empty results,
+            truncation). Replay aborts here rather than continuing
+            with partial market context.
     """
-    raise NotImplementedError(
-        "load_market_data is M2.2 work; M2.1 declares the contract. "
-        "VIX half wired via _load_vix_daily; SPY half pending the "
-        "polygon_feed.fetch_aggs helper. Both land in the same commit."
+    if end_date < start_date:
+        raise ValueError(
+            f"end_date {end_date} is before start_date {start_date}"
+        )
+
+    daily_start = start_date - timedelta(days=SPY_DAILY_PREPAD_CALENDAR_DAYS)
+
+    logger.info(
+        "Loading replay market context: SPY 5-min %s..%s, "
+        "SPY daily %s..%s (300-day prepad), VIX daily %s..%s",
+        start_date, end_date,
+        daily_start, end_date,
+        daily_start, end_date,
+    )
+
+    spy_5min = await polygon_feed.fetch_aggs(
+        "SPY", 5, "minute", start_date, end_date
+    )
+    spy_daily = await polygon_feed.fetch_aggs(
+        "SPY", 1, "day", daily_start, end_date
+    )
+    vix_daily = await _load_vix_daily(daily_start, end_date)
+
+    logger.info(
+        "Replay market context loaded: SPY 5-min rows=%d, "
+        "SPY daily rows=%d, VIX daily rows=%s",
+        len(spy_5min),
+        len(spy_daily),
+        len(vix_daily) if vix_daily is not None else "none (degraded)",
+    )
+
+    return MarketContextBundle(
+        spy_5min=spy_5min,
+        spy_daily=spy_daily,
+        vix_daily=vix_daily,
     )
 
 

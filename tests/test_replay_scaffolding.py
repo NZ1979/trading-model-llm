@@ -534,11 +534,6 @@ def test_historical_sentiment_stubs_raise_not_implemented():
         historical_sentiment.open_fixture(Path("/tmp/none.sqlite"))
 
 
-def test_market_context_stub_raises_not_implemented():
-    with pytest.raises(NotImplementedError, match="M2.2"):
-        market_context.load_market_data(date(2026, 4, 1), date(2026, 4, 30))
-
-
 def test_ticker_metadata_stubs_raise_not_implemented():
     with pytest.raises(NotImplementedError, match="M2.2"):
         ticker_metadata.get_ticker_metadata("AAPL")
