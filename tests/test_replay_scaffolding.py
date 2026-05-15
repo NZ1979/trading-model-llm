@@ -514,15 +514,6 @@ def test_cli_config_to_printable_serializes_dates_and_paths():
 # ---------------------------------------------------------------------------
 
 
-def test_historical_bars_stubs_raise_not_implemented():
-    with pytest.raises(NotImplementedError, match="M2.2"):
-        historical_bars.load_historical_bars_1min(
-            "AAPL", date(2026, 4, 1), date(2026, 4, 30))
-    with pytest.raises(NotImplementedError, match="M2.2"):
-        historical_bars.load_historical_bars_daily(
-            "AAPL", date(2026, 4, 1), date(2026, 4, 30))
-
-
 def test_historical_news_stubs_raise_not_implemented():
     with pytest.raises(NotImplementedError, match="M2.2"):
         historical_news.load_historical_news(
