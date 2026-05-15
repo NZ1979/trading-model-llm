@@ -149,6 +149,7 @@ def build_llm_context(
     in_gap_and_go_window: bool = False,
     todays_prior_decisions: tuple[dict[str, Any], ...] = (),
     catalyst_flags: tuple[str, ...] = (),
+    last_5_daily_closes: tuple[float, ...] = (),
 ) -> LLMContext:
     """Assemble an LLMContext from the orchestrator's per-cycle state.
 
@@ -214,14 +215,12 @@ def build_llm_context(
     # Bar count — how warm are the indicators?
     current_5min_bar_count = len(df_ind) if not df_ind.empty else 0
 
-    # last_5_daily_closes — best-effort from daily_df if attached to daily_ctx
-    last_5_daily_closes: tuple[float, ...] = ()
-    if daily_ctx is not None:
-        # DailyContext doesn't carry the close series directly; the
-        # orchestrator has it on state.daily_df but not surfaced here.
-        # Caller can override via a future kwarg if needed; for now,
-        # leave empty so the prompt template's "n/a" fallback renders.
-        pass
+    # last_5_daily_closes — carried via the kwarg of the same name.
+    # DailyContext does not carry the close series directly; live's
+    # orchestrator has the series on state.daily_df, and the M2 replay
+    # harness pre-computes the tuple in TickerDayState.last_5_daily_closes.
+    # Both paths pass it through this kwarg; callers that don't have it
+    # leave the default empty tuple and the prompt template renders "n/a".
 
     return LLMContext(
         ticker=ticker,
