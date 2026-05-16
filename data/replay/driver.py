@@ -62,8 +62,10 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import date
+from functools import lru_cache
 
 import pandas as pd
+import pandas_market_calendars as mcal
 
 from data.replay.config import ReplayConfig
 from data.replay.day_state import build_day_state
@@ -185,20 +187,47 @@ class DayRunResult:
 # ---------------------------------------------------------------------------
 
 
-def _trading_days(start: date, end: date) -> list[date]:
-    """Return weekdays in ``[start, end]`` inclusive.
+@lru_cache(maxsize=1)
+def _nyse_calendar() -> mcal.MarketCalendar:
+    """NYSE trading calendar, cached at module level.
 
-    Uses ``pandas.bdate_range`` which skips Saturday and Sunday. US
-    trading holidays survive this filter and are caught at the
-    per-day try/except layer when bars come back empty. A proper
-    holiday calendar is a follow-up sub-task.
+    ``mcal.get_calendar("NYSE")`` constructs an internal holiday
+    calendar over a range of years; cache it so multi-day replays
+    don't rebuild it on every ``_trading_days`` call. The
+    ``maxsize=1`` cache turns the function into a memoized singleton
+    while keeping it test-friendly (``_nyse_calendar.cache_clear()``
+    available if a test ever needs to swap exchanges).
+    """
+    return mcal.get_calendar("NYSE")
+
+
+def _trading_days(start: date, end: date) -> list[date]:
+    """Return NYSE trading days in ``[start, end]`` inclusive.
+
+    Filters weekends AND US market holidays (Thanksgiving, Christmas,
+    Juneteenth, etc.) via ``pandas_market_calendars``. Promoted from
+    the pre-#24 ``pd.bdate_range`` weekday-only approximation:
+    holidays previously survived to ``build_day_state`` where Polygon
+    returned empty bars and the per-day try/except converted them to
+    skipped DayRunResults. With the calendar in place, holidays
+    never enter the loop in the first place.
+
+    Special cases:
+
+    - ``end < start`` -> empty list (unchanged from the old impl).
+    - Half-day sessions (day-after-Thanksgiving, Christmas Eve when
+      it's a weekday): included. The NYSE calendar treats them as
+      trading days regardless of the 1pm close; downstream the bar
+      feed naturally returns fewer bars, and EOD-flatten at 15:55
+      remains the universal flatten point.
+    - Range entirely within holidays / weekends: empty list, which
+      ``run_replay``'s ``for trading_date in days:`` loop handles
+      cleanly with no iterations and no output rows.
     """
     if end < start:
         return []
-    return [
-        ts.date()
-        for ts in pd.bdate_range(start=start, end=end)
-    ]
+    sched = _nyse_calendar().schedule(start_date=start, end_date=end)
+    return [ts.date() for ts in sched.index]
 
 
 # ---------------------------------------------------------------------------

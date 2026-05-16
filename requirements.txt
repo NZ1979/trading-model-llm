@@ -1,5 +1,6 @@
 # Core data + async
 pandas>=2.0.0
+pandas-market-calendars>=4.0  # NYSE holiday calendar for replay-harness trading-day enumeration (M2.2 sub-task #24)
 numpy>=1.24.0
 pyyaml>=6.0
 websockets>=12.0

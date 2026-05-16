@@ -240,6 +240,72 @@ def test_trading_days_inverted_range_empty():
     assert out == []
 
 
+# ---------------------------------------------------------------------------
+# NYSE holiday-calendar filtering (M2.2 sub-task #24)
+# ---------------------------------------------------------------------------
+
+
+def test_trading_days_excludes_independence_day_observed():
+    """July 4 2026 is a Saturday, so the NYSE observes Independence
+    Day on Friday July 3. That Friday must NOT appear in the trading
+    days list, even though it is a weekday."""
+    out = _trading_days(date(2026, 7, 1), date(2026, 7, 6))
+    # Range covers: Wed 7/1, Thu 7/2, Fri 7/3 (obs Independence Day),
+    # Sat 7/4, Sun 7/5, Mon 7/6. Expected trading days: Wed, Thu, Mon.
+    assert date(2026, 7, 3) not in out
+    assert date(2026, 7, 1) in out
+    assert date(2026, 7, 2) in out
+    assert date(2026, 7, 6) in out
+
+
+def test_trading_days_excludes_thanksgiving():
+    """Thanksgiving 2026 is Thursday Nov 26. NYSE is closed."""
+    out = _trading_days(date(2026, 11, 25), date(2026, 11, 27))
+    assert date(2026, 11, 26) not in out
+    # Wed and Fri remain.
+    assert date(2026, 11, 25) in out
+    assert date(2026, 11, 27) in out
+
+
+def test_trading_days_includes_day_after_thanksgiving():
+    """Friday Nov 27 2026 is a half-day session (1pm ET close) but
+    still a trading day -- the NYSE calendar treats it as such, and
+    the replay harness should iterate it just like any other day."""
+    out = _trading_days(date(2026, 11, 27), date(2026, 11, 27))
+    assert out == [date(2026, 11, 27)]
+
+
+def test_trading_days_excludes_christmas():
+    """Christmas Day 2026 is Friday Dec 25. NYSE is closed."""
+    out = _trading_days(date(2026, 12, 23), date(2026, 12, 28))
+    assert date(2026, 12, 25) not in out
+    # Wed 12/23, Thu 12/24 (Christmas Eve early close = trading day),
+    # Mon 12/28 remain. Sat 12/26 and Sun 12/27 naturally excluded.
+    assert date(2026, 12, 23) in out
+    assert date(2026, 12, 24) in out
+    assert date(2026, 12, 28) in out
+
+
+def test_trading_days_full_thanksgiving_week_returns_4_days():
+    """Mon-Fri across Thanksgiving week (Nov 23-27 2026) -> 4 trading
+    days (Mon, Tue, Wed, Fri). Thursday Nov 26 is the holiday."""
+    out = _trading_days(date(2026, 11, 23), date(2026, 11, 27))
+    assert out == [
+        date(2026, 11, 23),
+        date(2026, 11, 24),
+        date(2026, 11, 25),
+        date(2026, 11, 27),
+    ]
+
+
+def test_trading_days_holiday_only_range_returns_empty():
+    """Single-day range pinned to Christmas 2026 -> empty list.
+    Previously this would have returned [date(2026, 12, 25)] because
+    bdate_range only filtered weekends."""
+    out = _trading_days(date(2026, 12, 25), date(2026, 12, 25))
+    assert out == []
+
+
 # ===========================================================================
 # Watchlist literal
 # ===========================================================================
