@@ -63,6 +63,7 @@ from data.replay.historical_sentiment import open_fixture  # noqa: E402
 from data.replay.persistence import (  # noqa: E402
     complete_run, init_replay_db, start_run,
 )
+from data.replay.t3_budget import T3Budget  # noqa: E402
 from data.replay_cache import CachedLLMClient  # noqa: E402
 from sim.comparison import generate_report  # noqa: E402
 from sim.portfolio import SimulatedPortfolio  # noqa: E402
@@ -162,6 +163,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--t3-max-dollars", type=float, default=500.0,
         help="hard budget cap on Tier 3 cost per run; the harness aborts "
              "the Opus pass if exceeded (no silent throttling, Rule 18)",
+    )
+    p.add_argument(
+        "--t3-per-call-estimate", type=float, default=0.05,
+        help="pre-call USD estimate per Tier 3 invocation (M2.2 #20 "
+             "default 0.05 -- conservative vs the design doc's ~$0.003 "
+             "after caching). Refined to actual post-call cost in a "
+             "future sub-task once the AnthropicClient exposes usage.",
     )
 
     # ---- Simulation ----
@@ -350,18 +358,22 @@ def _git_head_sha() -> str | None:
 def _build_summary_json(
     results: list[DayRunResult],
     wrapped_clients: TierClients,
+    *,
+    t3_budget: T3Budget | None = None,
 ) -> str:
     """Aggregate per-day counts + cache stats into the run-level summary.
 
     Stored in ``replay_runs.summary_json`` for the comparison report
     to pluck out at section 1. Cache hits/misses come from the
     wrapped CachedLLMClient instances; if a tier wasn't wrapped (T3
-    today) its block is omitted.
+    today) its block is omitted. T3 budget stats (call count, skips,
+    estimated cost) are included when ``t3_budget`` is supplied.
     """
     n_days_total = len(results)
     n_days_skipped = sum(1 for r in results if r.skipped)
     n_llm_decisions = sum(len(r.decisions) for r in results)
     n_base_decisions = sum(len(r.base_decisions) for r in results)
+    n_t3_decisions = sum(len(r.t3_decisions) for r in results)
     n_llm_fills = sum(len(r.fills) for r in results)
     n_base_fills = sum(len(r.base_fills) for r in results)
     n_llm_rejections = sum(len(r.rejections) for r in results)
@@ -373,6 +385,7 @@ def _build_summary_json(
         "n_days_skipped": n_days_skipped,
         "n_llm_decisions": n_llm_decisions,
         "n_base_decisions": n_base_decisions,
+        "n_t3_decisions": n_t3_decisions,
         "n_llm_fills": n_llm_fills,
         "n_base_fills": n_base_fills,
         "n_llm_rejections": n_llm_rejections,
@@ -387,6 +400,14 @@ def _build_summary_json(
     if isinstance(wrapped_clients.t2, CachedLLMClient):
         payload["cache_t2_hits"] = wrapped_clients.t2.hits
         payload["cache_t2_misses"] = wrapped_clients.t2.misses
+
+    # T3 budget stats (M2.2 sub-task #20).
+    if t3_budget is not None:
+        payload["t3_calls"] = t3_budget.n_calls
+        payload["t3_skipped_budget"] = t3_budget.n_skipped_budget
+        payload["t3_skipped_sample"] = t3_budget.n_skipped_sample
+        payload["t3_estimated_cost_usd"] = round(t3_budget.used_dollars, 4)
+        payload["t3_cap_dollars"] = t3_budget.cap_dollars
     return json.dumps(payload, sort_keys=True)
 
 
@@ -453,6 +474,16 @@ async def _run(cfg: ReplayConfig, args: argparse.Namespace) -> int:
                     starting_cash=cfg.starting_cash, name="base",
                 )
 
+            # T3 budget: constructed when T3 is enabled AND a client
+            # was actually wired (factory.build_tier_clients returns
+            # None for tier 3 if cfg.t3_enabled is false).
+            t3_budget: T3Budget | None = None
+            if wrapped.t3 is not None:
+                t3_budget = T3Budget(
+                    cap_dollars=cfg.t3_max_dollars_per_run,
+                    per_call_estimate=args.t3_per_call_estimate,
+                )
+
             # Run replay
             results = await run_replay(
                 config=cfg,
@@ -462,10 +493,13 @@ async def _run(cfg: ReplayConfig, args: argparse.Namespace) -> int:
                 base_portfolio=base_portfolio,
                 persistence_conn=persistence_conn,
                 run_id=run_id,
+                t3_budget=t3_budget,
             )
 
             # Complete run with summary
-            summary = _build_summary_json(results, wrapped)
+            summary = _build_summary_json(
+                results, wrapped, t3_budget=t3_budget,
+            )
             complete_run(
                 persistence_conn, run_id=run_id, summary_json=summary,
             )

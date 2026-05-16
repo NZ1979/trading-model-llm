@@ -334,6 +334,30 @@ def write_day_results(
                 portfolio_name="base",
             )
 
+        # Tier 3 (Opus) labeling rows (M2.2 sub-task #20). T3 has no
+        # portfolio / fills / rejections / equity curve -- it's pure
+        # labeling for the comparison report's § 5d analysis. Just
+        # write the decisions with decision_source='t3_only'.
+        for td in day_result.t3_decisions:
+            conn.execute(
+                "INSERT INTO replay_decisions "
+                "(run_id, trading_date, tick_et, ticker, decision_source, "
+                " action, setup_label, confidence, reasoning, "
+                " tier_provenance) "
+                "VALUES (?, ?, ?, ?, 't3_only', ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    trading_date_str,
+                    td.tick_et.isoformat(),
+                    td.ticker,
+                    td.decision.action,
+                    td.decision.setup_label,
+                    td.decision.confidence,
+                    td.decision.reasoning,
+                    td.decision.tier_provenance,
+                ),
+            )
+
 
 def _write_portfolio_side(
     conn: sqlite3.Connection,

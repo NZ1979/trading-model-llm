@@ -163,6 +163,7 @@ def _day_result(
     base_decisions: list[TickDecision] | None = None,
     base_rejections: tuple[RejectedEntry, ...] = (),
     base_equity_curve: tuple[EquityPoint, ...] = (),
+    t3_decisions: list[TickDecision] | None = None,
 ) -> DayRunResult:
     return DayRunResult(
         trading_date=trading_date,
@@ -173,6 +174,7 @@ def _day_result(
         base_decisions=base_decisions if base_decisions is not None else [],
         base_rejections=base_rejections,
         base_equity_curve=base_equity_curve,
+        t3_decisions=t3_decisions if t3_decisions is not None else [],
     )
 
 
@@ -970,5 +972,91 @@ def test_write_day_base_portfolio_none_default_writes_nothing_for_base(tmp_path)
             "WHERE run_id = ? AND decision_source = 'live_merged'", (rid,)
         ).fetchone()[0]
         assert n_llm == 1
+    finally:
+        conn.close()
+
+
+# ===========================================================================
+# Tier 3 (Opus) labeling persistence (M2.2 sub-task #20)
+# ===========================================================================
+
+
+def test_write_day_t3_decisions_have_source_t3_only(tmp_path):
+    """t3_decisions on day_result -> rows land with decision_source='t3_only'."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(0, "Buy")],
+                t3_decisions=[
+                    _tick(5, "Hold"),
+                    _tick(10, "Sell"),
+                ],
+            ),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+        )
+        rows = conn.execute(
+            "SELECT decision_source, action FROM replay_decisions "
+            "WHERE run_id = ? ORDER BY id", (rid,)
+        ).fetchall()
+        assert rows == [
+            ("live_merged", "Buy"),
+            ("t3_only", "Hold"),
+            ("t3_only", "Sell"),
+        ]
+    finally:
+        conn.close()
+
+
+def test_write_day_empty_t3_decisions_writes_nothing(tmp_path):
+    """Empty t3_decisions (the default) -> zero t3_only rows."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(decisions=[_tick(0, "Hold")]),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+        )
+        n = conn.execute(
+            "SELECT COUNT(*) FROM replay_decisions "
+            "WHERE run_id = ? AND decision_source = 't3_only'", (rid,)
+        ).fetchone()[0]
+        assert n == 0
+    finally:
+        conn.close()
+
+
+def test_write_day_t3_decisions_persist_full_fields(tmp_path):
+    """T3 row carries action / setup_label / confidence / reasoning /
+    tier_provenance from the supplied LLMDecision."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        from strategy.llm.types import LLMDecision
+        from data.replay.tick_loop import TickDecision
+        td = TickDecision(
+            tick_et=_bar_et(5),
+            ticker="AAPL",
+            decision=LLMDecision(
+                action="Buy", confidence=80,
+                setup_label="opus_label",
+                reasoning="opus reasoning",
+                tier_provenance="t3_only",
+            ),
+        )
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(t3_decisions=[td]),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+        )
+        row = conn.execute(
+            "SELECT action, setup_label, confidence, reasoning, "
+            "tier_provenance FROM replay_decisions "
+            "WHERE run_id = ? AND decision_source = 't3_only'", (rid,)
+        ).fetchone()
+        assert row == ("Buy", "opus_label", 80, "opus reasoning", "t3_only")
     finally:
         conn.close()

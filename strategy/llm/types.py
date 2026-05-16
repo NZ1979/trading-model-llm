@@ -183,6 +183,14 @@ class LLMDecision(BaseModel):
             "t1_fallback_t2",
             "t1_only_budget_exhausted",
             "t1_failed",
+            # M2.2 sub-task #20: T3 replay-only values. Not used by
+            # live evaluate() -- signal_engine ignores clients.t3.
+            #   t3_only: raw Opus decision from the M2 replay T3 pass.
+            #   t3_failed: T3 client raised; synthetic Hold with the
+            #     failure mode in setup_label (schema_invalid_t3,
+            #     api_failure_t3, t3_unexpected).
+            "t3_only",
+            "t3_failed",
         ]
         | None
     ) = None

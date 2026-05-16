@@ -75,7 +75,13 @@ from data.replay.fill_simulator import (
 )
 from data.replay.market_context import load_market_data
 from data.replay.persistence import write_day_results
-from data.replay.tick_loop import TickDecision, run_day_base_ticks, run_day_ticks
+from data.replay.t3_budget import T3Budget
+from data.replay.tick_loop import (
+    TickDecision,
+    run_day_base_ticks,
+    run_day_t3_ticks,
+    run_day_ticks,
+)
 from sim.fills import SimulatedFill
 from sim.portfolio import EquityPoint, SimulatedPortfolio
 from strategy.llm.escalation import EscalationBudget
@@ -146,6 +152,12 @@ class DayRunResult:
     stop_outs: tuple[StopOut, ...] = ()
     eod_exits: tuple[EodExit, ...] = ()
     equity_curve: tuple[EquityPoint, ...] = ()
+    # Tier 3 (Opus) labeling pass (M2.2 sub-task #20). Populated only
+    # when run_replay is called with clients.t3 not None AND a
+    # t3_budget. Empty list otherwise. T3 does NOT drive a portfolio
+    # (no fills, no equity curve) -- it's pure labeling for the
+    # comparison report's section 5d agreement analysis.
+    t3_decisions: list[TickDecision] = field(default_factory=list)
     # Base-strategy parallel evaluation (M2.2 sub-task #17). All six
     # base_* fields default to empty: when run_replay is called without
     # base_portfolio, the base pass is skipped entirely and these stay
@@ -194,6 +206,7 @@ async def run_replay(
     base_portfolio: SimulatedPortfolio | None = None,
     persistence_conn: sqlite3.Connection | None = None,
     run_id: int | None = None,
+    t3_budget: T3Budget | None = None,
 ) -> list[DayRunResult]:
     """Run the LLM-path replay over ``[config.start_date, config.end_date]``.
 
@@ -372,6 +385,24 @@ async def run_replay(
             eod_exits_t = ()
             equity_curve_t = ()
 
+        # Tier 3 (Opus) labeling pass (M2.2 sub-task #20). Runs only
+        # when clients.t3 is supplied AND t3_budget is supplied;
+        # produces 't3_only' rows for the comparison report's § 5d
+        # agreement analysis. T3 does NOT drive a portfolio -- it's
+        # pure labeling. Same LLMContext the live T1+T2 path saw, so
+        # T1 ↔ T3 agreement metrics are apples-to-apples.
+        if clients.t3 is not None and t3_budget is not None:
+            t3_decisions = await run_day_t3_ticks(
+                day_state=day_state,
+                market_ctx=market_ctx,
+                config=config,
+                clients=clients,
+                budget=t3_budget,
+                portfolio=portfolio,
+            )
+        else:
+            t3_decisions = []
+
         # Base-strategy parallel evaluation (M2.2 sub-task #17). Runs
         # only when base_portfolio is set; emits its own decisions via
         # run_day_base_ticks (no pre-filter, every ticker every tick),
@@ -415,6 +446,7 @@ async def run_replay(
             stop_outs=stop_outs_t,
             eod_exits=eod_exits_t,
             equity_curve=equity_curve_t,
+            t3_decisions=t3_decisions,
             base_decisions=base_decisions,
             base_fills=base_fills_t,
             base_rejections=base_rejections_t,
@@ -425,13 +457,13 @@ async def run_replay(
         results.append(day_result)
         _persist(day_result)
         logger.info(
-            "run_replay: %s complete, %d llm decisions / %d base decisions, "
-            "%d failed ticker(s), %d escalation(s), "
+            "run_replay: %s complete, %d llm decisions / %d base decisions / "
+            "%d t3 decisions, %d failed ticker(s), %d escalation(s), "
             "%d llm fills (%d stops, %d eod) / %d base fills (%d stops, %d eod), "
             "%d llm rejections / %d base rejections, "
             "%d llm equity pts / %d base equity pts",
             trading_date,
-            len(decisions), len(base_decisions),
+            len(decisions), len(base_decisions), len(t3_decisions),
             len(day_state.failed_tickers), budget.used,
             len(fills_t), len(stop_outs_t), len(eod_exits_t),
             len(base_fills_t), len(base_stop_outs_t), len(base_eod_exits_t),

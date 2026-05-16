@@ -63,6 +63,7 @@ Status: M2.2 sub-task #12 -- fully implemented.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -503,12 +504,227 @@ def run_day_base_ticks(
     return decisions
 
 
+# ===========================================================================
+# Tier 3 (Opus) labeling pass (M2.2 sub-task #20)
+# ===========================================================================
+#
+# Tier 3 is replay-only -- live evaluate() ignores clients.t3
+# (signal_engine.py line 12-14). The replay harness runs it as a
+# DISTINCT FLOW (not a tier inside evaluate): same LLMContext the live
+# path saw, but a different decision path. The persisted rows use
+# decision_source='t3_only' so the comparison report's section 5d can
+# compute T1↔T3 agreement metrics without touching the live merged
+# stream.
+#
+# Two gates protect cost:
+#   1. Sample-rate gate (deterministic hash-based, cache-reusable).
+#   2. T3Budget cap (Rule 18 visible degradation -- skip-with-counter,
+#      no silent throttling).
+
+
+_T3_LABEL_SCHEMA_INVALID = "schema_invalid_t3"
+_T3_LABEL_API_FAILURE = "api_failure_t3"
+_T3_LABEL_UNEXPECTED = "t3_unexpected"
+
+
+def _make_t3_hold_failure(label: str, reason: str) -> LLMDecision:
+    """Synthesize a Hold for Tier 3 failure paths.
+
+    Mirrors ``strategy.llm.signal_engine._make_hold_failure`` but
+    encodes T3 provenance so post-hoc analysis can distinguish T1
+    failures from T3 failures by tier_provenance alone.
+    """
+    return LLMDecision(
+        action="Hold",
+        confidence=0,
+        setup_label=label[:50],
+        reasoning=reason[:280],
+        tier_provenance="t3_failed",
+    )
+
+
+def _t3_should_sample(
+    ticker: str, tick_et: datetime, sample_rate: float,
+) -> bool:
+    """Deterministic hash-based sampling decision.
+
+    Returns True iff the (ticker, tick_et) hash bucket falls under
+    ``sample_rate``. Same (ticker, tick) always samples or doesn't at
+    the same rate, so re-runs are reproducible. Reducing rate from 1.0
+    to 0.5 produces a strict subset of the rate=1.0 selections, which
+    means a prior 1.0 cache is fully reusable on a 0.5 follow-up (no
+    cache miss for any sampled candidate).
+    """
+    if sample_rate >= 1.0:
+        return True
+    if sample_rate <= 0.0:
+        return False
+    h = hashlib.sha256(
+        f"{ticker}|{tick_et.isoformat()}".encode("utf-8")
+    ).hexdigest()
+    bucket = int(h[:8], 16) / 0xFFFFFFFF
+    return bucket < sample_rate
+
+
+async def run_day_t3_ticks(
+    *,
+    day_state: DayState,
+    market_ctx: MarketContextBundle,
+    config: ReplayConfig,
+    clients: TierClients,
+    budget,  # T3Budget; not annotated to avoid circular import at module top
+    portfolio: SimulatedPortfolio | None = None,
+) -> list[TickDecision]:
+    """Run the 78-tick Opus labeling pass for one trading day.
+
+    For each (tick, ticker) that survives the same pre-filter the LLM
+    path uses, this function:
+
+    1. Checks the deterministic sample-rate gate. Skips on miss
+       (budget.record_skip_sample()).
+    2. Checks the T3Budget cap. Skips with WARNING on exhaustion
+       (budget.record_skip_budget()).
+    3. Builds the SAME LLMContext that ``run_day_ticks`` would have
+       built for this (ticker, tick) -- includes prior-decisions
+       history scoped to T3's own history (not shared with the live
+       T1+T2 stream).
+    4. Calls ``clients.t3.evaluate(ctx)``.
+    5. On success: records the call, emits a TickDecision with the
+       raw T3 LLMDecision (tier_provenance set by the T3 client or
+       defaulting to None).
+    6. On failure: emits a TickDecision with a synthetic Hold whose
+       setup_label encodes the failure mode (schema_invalid_t3 /
+       api_failure_t3 / t3_unexpected) and ``tier_provenance="t3_failed"``.
+
+    Args:
+        day_state: per-day bundle from ``build_day_state``.
+        market_ctx: run-level SPY+VIX bundle.
+        config: full ReplayConfig. Reads ``t3_sample_rate``.
+        clients: ``TierClients`` with a non-None ``t3``. Caller is
+            expected to have wrapped t3 in ``CachedLLMClient`` to
+            avoid re-paying Opus cost on re-runs.
+        budget: ``T3Budget`` instance owned by the caller. Mutated in
+            place via ``record_call`` / ``record_skip_*``.
+        portfolio: optional ``SimulatedPortfolio``. Read only -- used
+            for the pre-filter holding gate AND the per-ticker
+            position dict in LLMContext, mirroring ``run_day_ticks``'s
+            semantics so T3 sees the same context as T1.
+
+    Returns:
+        ``list[TickDecision]`` for every candidate that actually
+        produced a T3 call (sampled in AND budget allowed). Skipped
+        candidates do NOT appear in the result; their counts live on
+        the budget.
+
+    Raises:
+        ValueError: clients.t3 is None. The driver guards this at the
+            call site; reaching this exception is a programmer bug.
+    """
+    if clients.t3 is None:
+        raise ValueError(
+            "run_day_t3_ticks called with clients.t3=None; "
+            "the driver should guard this. T3 has no client to call."
+        )
+
+    decisions: list[TickDecision] = []
+    t3_prior_history: dict[str, list[dict[str, Any]]] = {}
+
+    for tick_et in tick_times_for_day(day_state.trading_date):
+        holding = _currently_holding(portfolio)
+        candidates = pre_filter_candidates(
+            day_state, tick_et, holding, config,
+        )
+        for ticker in candidates:
+            # Sample-rate gate first (cheap, hash-only).
+            if not _t3_should_sample(ticker, tick_et, config.t3_sample_rate):
+                budget.record_skip_sample()
+                continue
+            # Budget gate next.
+            if not budget.has_capacity():
+                budget.record_skip_budget()
+                logger.warning(
+                    "run_day_t3_ticks: budget exhausted at %s / %s "
+                    "(used=%.4f / cap=%.4f); skipping",
+                    tick_et, ticker,
+                    budget.used_dollars, budget.cap_dollars,
+                )
+                continue
+
+            ctx = build_tick_context(
+                day_state=day_state,
+                market_ctx=market_ctx,
+                config=config,
+                ticker=ticker,
+                tick_et=tick_et,
+                position=_position_dict(portfolio, ticker),
+                todays_prior_decisions=tuple(
+                    t3_prior_history.get(ticker, [])[-PRIOR_DECISIONS_TAIL:]
+                ),
+            )
+
+            # Call T3. Budget is consumed on attempt, not success
+            # (mirrors the live EscalationBudget pattern for T2).
+            budget.record_call()
+            try:
+                raw = await clients.t3.evaluate(ctx)
+                # Tag tier_provenance for in-memory analysis. The
+                # persistence layer uses decision_source='t3_only'
+                # separately; both labels carry the same info but
+                # the in-memory one survives without a DB round-trip.
+                t3_decision = raw.model_copy(
+                    update={"tier_provenance": "t3_only"}
+                )
+            except Exception as exc:  # broad: T3 must never raise out
+                # Inspect type via class name to avoid importing
+                # strategy.llm.clients here (would create a deeper
+                # dependency cycle).
+                exc_cls = type(exc).__name__
+                if exc_cls == "SchemaInvalidError":
+                    t3_decision = _make_t3_hold_failure(
+                        _T3_LABEL_SCHEMA_INVALID, str(exc),
+                    )
+                    logger.warning(
+                        "T3 schema-invalid for %s @ %s: %s",
+                        ticker, tick_et, exc,
+                    )
+                elif exc_cls == "APIUnavailableError":
+                    t3_decision = _make_t3_hold_failure(
+                        _T3_LABEL_API_FAILURE, str(exc),
+                    )
+                    logger.error(
+                        "T3 API unavailable for %s @ %s: %s",
+                        ticker, tick_et, exc,
+                    )
+                else:
+                    t3_decision = _make_t3_hold_failure(
+                        _T3_LABEL_UNEXPECTED,
+                        f"{exc_cls}: {exc}",
+                    )
+                    logger.exception(
+                        "T3 unexpected error for %s @ %s", ticker, tick_et,
+                    )
+
+            decisions.append(
+                TickDecision(
+                    tick_et=tick_et,
+                    ticker=ticker,
+                    decision=t3_decision,
+                )
+            )
+            t3_prior_history.setdefault(ticker, []).append(
+                _prior_record(tick_et, t3_decision)
+            )
+
+    return decisions
+
+
 __all__ = [
     "PRIOR_DECISIONS_TAIL",
     "TICKS_PER_DAY",
     "TICK_INTERVAL_MINUTES",
     "TickDecision",
     "run_day_base_ticks",
+    "run_day_t3_ticks",
     "run_day_ticks",
     "tick_times_for_day",
 ]

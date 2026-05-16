@@ -27,7 +27,7 @@ import sqlite3
 import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -1261,3 +1261,100 @@ async def test_write_day_results_receives_base_portfolio(monkeypatch):
     assert len(captured) == 1
     assert captured[0]["llm"] is pf
     assert captured[0]["base"] is base_pf
+
+
+# ===========================================================================
+# Tier 3 (Opus) labeling pass (M2.2 sub-task #20)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_t3_skipped_when_clients_t3_is_none(monkeypatch):
+    """No T3 client -> run_day_t3_ticks NOT called; DayRunResult.t3_decisions = []."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    t3_calls: list = []
+
+    async def _fake_t3(**kw):
+        t3_calls.append(True)
+        return []
+
+    monkeypatch.setattr(
+        "data.replay.driver.run_day_t3_ticks", _fake_t3
+    )
+
+    # _clients() returns TierClients(t1=fake, t2=None, t3=None)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+    )
+    assert t3_calls == []
+    assert results[0].t3_decisions == []
+
+
+@pytest.mark.asyncio
+async def test_t3_runs_once_per_day_when_clients_and_budget_supplied(monkeypatch):
+    """clients.t3 + t3_budget both set -> run_day_t3_ticks called once per
+    non-skipped day."""
+    from data.replay.t3_budget import T3Budget
+
+    cfg = _config()  # 5 weekdays
+    _install_loader_mocks(monkeypatch)
+
+    t3_calls: list = []
+
+    async def _fake_t3(*, day_state, market_ctx, config, clients, budget, portfolio):
+        t3_calls.append({
+            "trading_date": day_state.trading_date,
+            "budget": budget,
+        })
+        return []
+
+    monkeypatch.setattr(
+        "data.replay.driver.run_day_t3_ticks", _fake_t3
+    )
+
+    t3_client = MagicMock()
+    t3_client.backend = "anthropic"
+    t3_client.model_id = "claude-opus-4-6"
+    clients = TierClients(t1=_FakeClient(), t2=None, t3=t3_client)
+    budget = T3Budget(cap_dollars=1.0)
+    await run_replay(
+        config=cfg, clients=clients, sentiment_conn=_conn(),
+        t3_budget=budget,
+    )
+    assert len(t3_calls) == 5
+    assert all(c["budget"] is budget for c in t3_calls)
+
+
+@pytest.mark.asyncio
+async def test_t3_decisions_propagate_to_dayrunresult(monkeypatch):
+    """Returned t3 decisions land on DayRunResult.t3_decisions."""
+    from data.replay.t3_budget import T3Budget
+
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    fixed = [
+        _tick_decisions(date(2026, 4, 15), n=3)[0],
+        _tick_decisions(date(2026, 4, 15), n=3)[1],
+    ]
+
+    async def _fake_t3(**kw):
+        return fixed
+
+    monkeypatch.setattr(
+        "data.replay.driver.run_day_t3_ticks", _fake_t3
+    )
+
+    t3_client = MagicMock()
+    t3_client.backend = "anthropic"
+    t3_client.model_id = "claude-opus-4-6"
+    clients = TierClients(t1=_FakeClient(), t2=None, t3=t3_client)
+    budget = T3Budget(cap_dollars=1.0)
+    results = await run_replay(
+        config=cfg, clients=clients, sentiment_conn=_conn(),
+        t3_budget=budget,
+    )
+    assert results[0].t3_decisions == fixed
+    assert len(results[0].t3_decisions) == 2
