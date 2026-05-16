@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS replay_decisions (
     raw_response TEXT,
     risk_check_result TEXT,
     tier_provenance TEXT,
+    regime TEXT,
     FOREIGN KEY (run_id) REFERENCES replay_runs(run_id)
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_run_date
@@ -201,11 +202,37 @@ def init_replay_db(path: Path) -> sqlite3.Connection:
         # Enable FK enforcement so bad inserts surface immediately.
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(_SCHEMA)
+        # Column-level migrations for DBs created before the column
+        # was added to _SCHEMA. CREATE TABLE IF NOT EXISTS above is a
+        # no-op against an existing table -- ADD COLUMN handles the
+        # back-compat case.
+        _migrate_add_regime_column(conn)
         conn.commit()
     except sqlite3.DatabaseError:
         conn.close()
         raise
     return conn
+
+
+def _migrate_add_regime_column(conn: sqlite3.Connection) -> None:
+    """Idempotently add ``replay_decisions.regime`` to an existing DB.
+
+    Added in M2.2 sub-task #22 so reports generated against legacy
+    replay_results.db files (created before the column existed) still
+    open cleanly. New DBs already have the column from ``_SCHEMA``; the
+    PRAGMA check makes the ALTER a no-op in that case.
+
+    Rationale for not using ``CREATE TABLE IF NOT EXISTS`` alone:
+    SQLite's IF NOT EXISTS only protects the whole-table create; it
+    does NOT layer new columns onto an already-existing table. ALTER
+    TABLE ADD COLUMN with a manual existence check is the standard
+    pattern for additive column migrations in SQLite.
+    """
+    cols = {row[1] for row in conn.execute(
+        "PRAGMA table_info(replay_decisions)"
+    )}
+    if "regime" not in cols:
+        conn.execute("ALTER TABLE replay_decisions ADD COLUMN regime TEXT")
 
 
 def start_run(
@@ -251,6 +278,7 @@ def write_day_results(
     day_result: DayRunResult,
     llm_portfolio: SimulatedPortfolio,
     base_portfolio: SimulatedPortfolio | None = None,
+    regime: str | None = None,
 ) -> None:
     """Write one day's decisions / fills / rejections / equity curve.
 
@@ -293,6 +321,11 @@ def write_day_results(
             When provided, the base side's rows are written in the
             same transaction. Default ``None`` keeps backward
             compatibility with pre-#17 callers.
+        regime: optional market regime label for this day (one of
+            ``bull`` / ``bear`` / ``neutral`` / ``unknown`` per
+            ``DayState.market_regime_label``). Persists onto every
+            ``replay_decisions`` row written this call. Default
+            ``None`` -> NULL in DB. Wired in M2.2 sub-task #22.
 
     Side effects: writes to all five tables (zero rows for empty
     days). No return value.
@@ -315,6 +348,7 @@ def write_day_results(
             portfolio=llm_portfolio,
             decision_source="live_merged",
             portfolio_name="llm",
+            regime=regime,
         )
 
         # Base side -- written only when base_portfolio is supplied.
@@ -332,6 +366,7 @@ def write_day_results(
                 portfolio=base_portfolio,
                 decision_source="base",
                 portfolio_name="base",
+                regime=regime,
             )
 
         # Tier 3 (Opus) labeling rows (M2.2 sub-task #20). T3 has no
@@ -343,8 +378,8 @@ def write_day_results(
                 "INSERT INTO replay_decisions "
                 "(run_id, trading_date, tick_et, ticker, decision_source, "
                 " action, setup_label, confidence, reasoning, "
-                " tier_provenance) "
-                "VALUES (?, ?, ?, ?, 't3_only', ?, ?, ?, ?, ?)",
+                " tier_provenance, regime) "
+                "VALUES (?, ?, ?, ?, 't3_only', ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     trading_date_str,
@@ -355,6 +390,7 @@ def write_day_results(
                     td.decision.confidence,
                     td.decision.reasoning,
                     td.decision.tier_provenance,
+                    regime,
                 ),
             )
 
@@ -371,6 +407,7 @@ def _write_portfolio_side(
     portfolio: SimulatedPortfolio,
     decision_source: str,
     portfolio_name: str,
+    regime: str | None = None,
 ) -> None:
     """Write one portfolio side's rows under an open transaction.
 
@@ -389,8 +426,8 @@ def _write_portfolio_side(
             "INSERT INTO replay_decisions "
             "(run_id, trading_date, tick_et, ticker, decision_source, "
             " action, setup_label, confidence, reasoning, "
-            " tier_provenance) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " tier_provenance, regime) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 trading_date_str,
@@ -402,6 +439,7 @@ def _write_portfolio_side(
                 td.decision.confidence,
                 td.decision.reasoning,
                 td.decision.tier_provenance,
+                regime,
             ),
         )
         global_id = cur.lastrowid

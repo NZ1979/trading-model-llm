@@ -1098,3 +1098,187 @@ def test_write_day_live_merged_persists_tier_provenance(tmp_path):
         assert row == ("t1_t2_agree",)
     finally:
         conn.close()
+
+
+# ===========================================================================
+# Regime column + migration (M2.2 sub-task #22)
+# ===========================================================================
+
+
+def test_fresh_init_replay_db_has_regime_column(tmp_path):
+    """A new DB created via init_replay_db has the regime column."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(replay_decisions)"
+        )}
+        assert "regime" in cols
+    finally:
+        conn.close()
+
+
+def test_init_replay_db_adds_regime_to_legacy_schema(tmp_path):
+    """A DB created without the regime column (pre-#22) gets it added
+    by init_replay_db's idempotent migration on the next open."""
+    db_path = tmp_path / "legacy.db"
+    # Manually build a legacy-shape schema (no regime column).
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript("""
+        CREATE TABLE replay_runs (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            config_json TEXT NOT NULL,
+            repo_sha TEXT,
+            summary_json TEXT
+        );
+        CREATE TABLE replay_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            trading_date TEXT NOT NULL,
+            tick_et TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            decision_source TEXT NOT NULL,
+            action TEXT NOT NULL,
+            setup_label TEXT,
+            confidence INTEGER,
+            reasoning TEXT,
+            raw_response TEXT,
+            risk_check_result TEXT,
+            tier_provenance TEXT,
+            FOREIGN KEY (run_id) REFERENCES replay_runs(run_id)
+        );
+    """)
+    legacy.commit()
+    # Sanity check the legacy schema is missing the column.
+    pre_cols = {row[1] for row in legacy.execute(
+        "PRAGMA table_info(replay_decisions)"
+    )}
+    assert "regime" not in pre_cols
+    legacy.close()
+
+    # Re-open via init_replay_db -> migration runs, column appears.
+    conn = init_replay_db(db_path)
+    try:
+        post_cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(replay_decisions)"
+        )}
+        assert "regime" in post_cols
+    finally:
+        conn.close()
+
+
+def test_init_replay_db_regime_migration_is_idempotent(tmp_path):
+    """Calling init_replay_db twice on the same path does not error
+    (the second call's ALTER would fail if the migration weren't
+    guarded by the PRAGMA check)."""
+    db_path = tmp_path / "r.db"
+    conn1 = init_replay_db(db_path)
+    conn1.close()
+    # Second call must not raise.
+    conn2 = init_replay_db(db_path)
+    try:
+        cols = {row[1] for row in conn2.execute(
+            "PRAGMA table_info(replay_decisions)"
+        )}
+        assert "regime" in cols
+    finally:
+        conn2.close()
+
+
+def test_write_day_results_persists_regime_on_live_merged(tmp_path):
+    """write_day_results(regime='bull') -> live_merged rows have
+    regime='bull'."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(decisions=[_tick(0, "Buy")]),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+            regime="bull",
+        )
+        row = conn.execute(
+            "SELECT regime FROM replay_decisions "
+            "WHERE run_id = ? AND decision_source = 'live_merged'",
+            (rid,),
+        ).fetchone()
+        assert row == ("bull",)
+    finally:
+        conn.close()
+
+
+def test_write_day_results_persists_regime_on_base(tmp_path):
+    """write_day_results(regime='bear') with base_portfolio -> base
+    rows also have regime='bear'."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(0, "Buy")],
+                base_decisions=[_tick(0, "Hold")],
+            ),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+            base_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+            regime="bear",
+        )
+        rows = conn.execute(
+            "SELECT decision_source, regime FROM replay_decisions "
+            "WHERE run_id = ? ORDER BY decision_source",
+            (rid,),
+        ).fetchall()
+        assert rows == [("base", "bear"), ("live_merged", "bear")]
+    finally:
+        conn.close()
+
+
+def test_write_day_results_persists_regime_on_t3(tmp_path):
+    """write_day_results(regime='neutral') with t3_decisions -> t3_only
+    rows have regime='neutral'."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(0, "Buy")],
+                t3_decisions=[_tick(5, "Hold")],
+            ),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+            regime="neutral",
+        )
+        row = conn.execute(
+            "SELECT regime FROM replay_decisions "
+            "WHERE run_id = ? AND decision_source = 't3_only'",
+            (rid,),
+        ).fetchone()
+        assert row == ("neutral",)
+    finally:
+        conn.close()
+
+
+def test_write_day_results_regime_defaults_to_null(tmp_path):
+    """write_day_results without the regime kwarg -> rows have NULL
+    regime (back-compat: pre-#22 callers don't pass it)."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(0, "Buy")],
+                t3_decisions=[_tick(5, "Hold")],
+            ),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+            # no regime kwarg
+        )
+        rows = conn.execute(
+            "SELECT regime FROM replay_decisions WHERE run_id = ?",
+            (rid,),
+        ).fetchall()
+        assert all(r == (None,) for r in rows)
+        assert len(rows) == 2
+    finally:
+        conn.close()

@@ -92,9 +92,10 @@ def _tick(
     confidence: int = 60,
     setup_label: str = "gap_and_go",
     tier_provenance: str | None = None,
+    trading_date: date = TRADING_DATE,
 ) -> TickDecision:
     return TickDecision(
-        tick_et=_bar_et(minute_offset),
+        tick_et=_bar_et(minute_offset, trading_date),
         ticker=ticker,
         decision=_decision(action, confidence=confidence,
                             setup_label=setup_label,
@@ -563,6 +564,11 @@ def test_section_5_setup_label_frequency(tmp_path):
 
 
 def test_section_5_deferred_stubs_present(tmp_path):
+    """All three 5x section headers render on an empty run.
+
+    5b became a real section in #22; 5c remains stubbed; 5d became real
+    in #21. Each still emits its own header so this assertion holds.
+    """
     db = tmp_path / "r.db"
     rid = _seed_run(db)
     out = tmp_path / "out.md"
@@ -571,6 +577,179 @@ def test_section_5_deferred_stubs_present(tmp_path):
     assert "5b. Regime-stratified performance" in text
     assert "5c. Crash-period replay" in text
     assert "5d. Tier agreement" in text
+
+
+# ===========================================================================
+# Section 5b: Regime-stratified performance (M2.2 sub-task #22)
+# ===========================================================================
+
+
+def test_5b_empty_run_renders_placeholder(tmp_path):
+    """No fills at all -> 5b renders the 'no closed positions' note."""
+    db = tmp_path / "r.db"
+    rid = _seed_run(db)
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "## 5b. Regime-stratified performance" in text
+    assert "No closed positions to stratify" in text
+
+
+def test_5b_single_regime_single_source_renders_one_row(tmp_path):
+    """One closed position on the live_merged side under regime='bull'
+    -> one table row with the correct cells."""
+    db = tmp_path / "r.db"
+    pf = SimulatedPortfolio(starting_cash=100_000.0)
+    pf.closed_positions.append(_closed_position(
+        decision_id=1, exit_price=105.0,  # +50 on 10 shares
+    ))
+    rid = _run_with(
+        db,
+        decisions=[_tick(5, "Buy")],
+        llm_pf=pf,
+        regime="bull",
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    # 1 fill, 1 win, +$50 total, +$50 avg.
+    assert "| bull | live_merged | 1 | 100.0% | $50.00 | $50.00 |" in text
+
+
+def test_5b_cross_table_multiple_regimes_and_sources(tmp_path):
+    """Multi-day run with two regimes (bull on day 1, bear on day 2)
+    and both portfolios -> 4 rows in 5b sorted by (regime, source)."""
+    db = tmp_path / "r.db"
+    day1 = date(2026, 4, 15)
+    day2 = date(2026, 4, 16)
+
+    # Day 1 (bull): live_merged +50, base +20
+    llm_pf = SimulatedPortfolio(starting_cash=100_000.0)
+    llm_pf.closed_positions.append(_closed_position(
+        decision_id=1, exit_price=105.0, trading_date=day1,
+    ))
+    base_pf = SimulatedPortfolio(starting_cash=100_000.0)
+    base_pf.closed_positions.append(_closed_position(
+        decision_id=1, exit_price=102.0, trading_date=day1,
+    ))
+
+    # Day 2 (bear): live_merged -30, base -10
+    llm_pf.closed_positions.append(_closed_position(
+        decision_id=1, exit_price=97.0, trading_date=day2,
+        entry_minute=5, exit_minute=30,
+    ))
+    base_pf.closed_positions.append(_closed_position(
+        decision_id=1, exit_price=99.0, trading_date=day2,
+        entry_minute=5, exit_minute=30,
+    ))
+
+    conn = init_replay_db(db)
+    try:
+        rid = start_run(conn, config=_config())
+        # Day 1.
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(5, "Buy", trading_date=day1)],
+                base_decisions=[_tick(5, "Buy", trading_date=day1)],
+                trading_date=day1,
+            ),
+            llm_portfolio=llm_pf, base_portfolio=base_pf,
+            regime="bull",
+        )
+        # Day 2.
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(5, "Buy", trading_date=day2)],
+                base_decisions=[_tick(5, "Buy", trading_date=day2)],
+                trading_date=day2,
+            ),
+            llm_portfolio=llm_pf, base_portfolio=base_pf,
+            regime="bear",
+        )
+        complete_run(conn, run_id=rid)
+    finally:
+        conn.close()
+
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    # Sorted: (bear,base) -> (bear,live_merged) -> (bull,base) -> (bull,live_merged).
+    bear_base = text.index("| bear | base |")
+    bear_llm = text.index("| bear | live_merged |")
+    bull_base = text.index("| bull | base |")
+    bull_llm = text.index("| bull | live_merged |")
+    assert bear_base < bear_llm < bull_base < bull_llm
+    # Spot-check one numeric cell per row.
+    assert "| bear | live_merged | 1 | 0.0% | $-30.00 | $-30.00 |" in text
+    assert "| bull | live_merged | 1 | 100.0% | $50.00 | $50.00 |" in text
+
+
+def test_5b_null_regime_renders_as_none_marker(tmp_path):
+    """A run written with regime=None (default) -> 5b shows the
+    *(none)* placeholder in the regime column."""
+    db = tmp_path / "r.db"
+    pf = SimulatedPortfolio(starting_cash=100_000.0)
+    pf.closed_positions.append(_closed_position(
+        decision_id=1, exit_price=105.0,
+    ))
+    rid = _run_with(
+        db,
+        decisions=[_tick(5, "Buy")],
+        llm_pf=pf,
+        # no regime kwarg -> regime=None in DB
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "| *(none)* | live_merged |" in text
+
+
+def test_5b_aggregates_win_rate_and_total_pl(tmp_path):
+    """Three fills under regime='neutral': +50, -30, +20. Win rate
+    66.7% (2/3), total +$40, avg +$13.33."""
+    db = tmp_path / "r.db"
+    pf = SimulatedPortfolio(starting_cash=100_000.0)
+    # Three closed positions, all on the same day, three different decisions.
+    pf.closed_positions.append(_closed_position(
+        decision_id=1, ticker="A", exit_price=105.0,  # +50
+    ))
+    pf.closed_positions.append(_closed_position(
+        decision_id=2, ticker="B", exit_price=97.0,  # -30
+    ))
+    pf.closed_positions.append(_closed_position(
+        decision_id=3, ticker="C", exit_price=102.0,  # +20
+    ))
+    rid = _run_with(
+        db,
+        decisions=[
+            _tick(5, "Buy", ticker="A"),
+            _tick(10, "Buy", ticker="B"),
+            _tick(15, "Buy", ticker="C"),
+        ],
+        llm_pf=pf,
+        regime="neutral",
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    # 3 fills, 2 wins, total +$40.00, avg +$13.33.
+    assert "| neutral | live_merged | 3 | 66.7% | $40.00 | $13.33 |" in text
+
+
+def test_5b_renders_before_5c_before_5d(tmp_path):
+    """Structural ordering: 5b appears before 5c which appears before 5d."""
+    db = tmp_path / "r.db"
+    rid = _seed_run(db)
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    idx_5b = text.index("## 5b. Regime-stratified performance")
+    idx_5c = text.index("## 5c. Crash-period replay")
+    idx_5d = text.index("## 5d. Tier agreement")
+    idx_6 = text.index("## 6. Failure modes")
+    assert idx_5b < idx_5c < idx_5d < idx_6
 
 
 # ===========================================================================
@@ -585,7 +764,9 @@ def _run_with(
     t3_decisions=None,
     base_decisions=None,
     llm_pf: SimulatedPortfolio | None = None,
+    base_pf: SimulatedPortfolio | None = None,
     config: ReplayConfig | None = None,
+    regime: str | None = None,
 ) -> int:
     """Seed one run with the supplied decisions / portfolio, return run_id."""
     conn = init_replay_db(db)
@@ -599,6 +780,8 @@ def _run_with(
                 base_decisions=base_decisions,
             ),
             llm_portfolio=llm_pf or SimulatedPortfolio(starting_cash=100_000.0),
+            base_portfolio=base_pf,
+            regime=regime,
         )
         complete_run(conn, run_id=rid)
     finally:

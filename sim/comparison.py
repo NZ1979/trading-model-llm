@@ -5,7 +5,8 @@ Reads one replay run's rows from ``replay_results.db`` (written by
 seven sections per ``docs/M2_REPLAY_HARNESS_DESIGN.md`` § Comparison
 report format.
 
-Sections that ship today (M2.2 #18 baseline + #21 tier-agreement):
+Sections that ship today (M2.2 #18 baseline + #21 tier-agreement +
+#22 regime-stratified):
 
 1. Run metadata -- date range, prompt version, tier config from
    replay_runs.config_json. Cache hits/misses and per-tier wall-clock
@@ -20,6 +21,8 @@ Sections that ship today (M2.2 #18 baseline + #21 tier-agreement):
 5. LLM-specific quality metrics -- confidence histogram, setup label
    frequency, reasoning length distribution. Restricted to
    live_merged rows.
+5b. Regime-stratified performance (M2.2 sub-task #22) -- per-(regime,
+   source) trade count, win rate, total + avg realized P&L.
 5d. Tier agreement & escalation analysis (M2.2 sub-task #21) --
    T1↔T3 agreement rate, 3×3 confusion matrix, disagreement
    profitability, confidence-band breakdown, tier_provenance counts.
@@ -29,8 +32,8 @@ Sections that ship today (M2.2 #18 baseline + #21 tier-agreement):
 7. Top decisions worth manual review -- highest-confidence wins,
    highest-confidence losses, biggest divergences.
 
-Sections 5b (regime-stratified) and 5c (crash-period replay) remain
-stubbed with explicit "deferred" notes pending their own sub-tasks.
+Section 5c (crash-period replay) remains stubbed -- it is a
+separate-run analysis, not a section of the per-run report.
 
 Failure semantics (Rule 18):
 - Missing db_path: FileNotFoundError, named loud.
@@ -127,7 +130,9 @@ def generate_report(
         lines.append("")
         lines.extend(_section_5_llm_quality(conn, run_id))
         lines.append("")
-        lines.extend(_section_5b_5c_deferred_stubs())
+        lines.extend(_section_5b_regime_stratified(conn, run_id))
+        lines.append("")
+        lines.extend(_section_5c_deferred_stub())
         lines.append("")
         lines.extend(_section_5d_tier_agreement(conn, run_id))
         lines.append("")
@@ -608,19 +613,15 @@ def _section_5_llm_quality(
     return lines
 
 
-def _section_5b_5c_deferred_stubs() -> list[str]:
-    """Stubs for 5b (regime-stratified) and 5c (crash-period).
+def _section_5c_deferred_stub() -> list[str]:
+    """Stub for 5c (crash-period replay).
 
-    Section 5d landed in M2.2 sub-task #21 as a real implementation;
-    see ``_section_5d_tier_agreement``.
+    5b landed in M2.2 sub-task #22 (regime-stratified persistence +
+    section). 5d landed in M2.2 sub-task #21 (tier agreement). 5c
+    remains stubbed because it is a separate-run analysis, not a
+    section of the per-run report.
     """
     return [
-        "## 5b. Regime-stratified performance",
-        "",
-        "*Deferred — per-decision regime label is not yet persisted. "
-        "A future sub-task will add a `regime` column to "
-        "`replay_decisions` and stratify the section 3 metrics by it.*",
-        "",
         "## 5c. Crash-period replay",
         "",
         "*Deferred — this is a separate-run analysis, not a section "
@@ -628,6 +629,95 @@ def _section_5b_5c_deferred_stubs() -> list[str]:
         "identified high-volatility window with its own run_id; "
         "compare against the baseline run.*",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Section 5b: Regime-stratified performance (M2.2 sub-task #22)
+# ---------------------------------------------------------------------------
+#
+# Inputs: ``replay_decisions.regime`` (added in #22) joined with
+# ``replay_fills.realized_pl``. Regime is per-day (one of
+# ``bull`` / ``bear`` / ``neutral`` / ``unknown`` per
+# ``DayState.market_regime_label``); every decision on the same trading
+# day shares the same regime label, so the grouping is by (regime,
+# decision_source).
+#
+# Output: one row per (regime, decision_source) pair with:
+#   - Trades: count of fills attached to live_merged/base decisions
+#   - Win rate: fills with realized_pl > 0 / total fills
+#   - Total realized P&L: SUM(realized_pl)
+#   - Avg P&L: mean realized_pl per fill
+#
+# NULL regime (legacy rows from pre-#22 DBs) renders as *(none)*.
+#
+# Notes:
+#   - T3 has no fills (it's a labeling pass) so t3_only is intentionally
+#     omitted from this section. Per-tier behavior lives in § 5d.
+#   - Per-regime max drawdown is out of scope: drawdown is a continuous
+#     portfolio-curve metric, and a single day has one regime label, so
+#     per-regime DD requires a regime column on replay_equity_curve --
+#     a separate sub-task.
+
+
+def _section_5b_regime_stratified(
+    conn: sqlite3.Connection, run_id: int,
+) -> list[str]:
+    lines = ["## 5b. Regime-stratified performance", ""]
+
+    rows = conn.execute(
+        """
+        SELECT
+            d.regime,
+            d.decision_source,
+            COUNT(f.id) AS n_fills,
+            SUM(CASE WHEN f.realized_pl > 0 THEN 1 ELSE 0 END)
+                AS n_wins,
+            SUM(f.realized_pl) AS total_pl,
+            AVG(f.realized_pl) AS avg_pl
+        FROM replay_fills f
+        JOIN replay_decisions d ON f.decision_id = d.id
+        WHERE d.run_id = ?
+            AND d.decision_source IN ('live_merged', 'base')
+            AND f.realized_pl IS NOT NULL
+        GROUP BY d.regime, d.decision_source
+        ORDER BY
+            CASE WHEN d.regime IS NULL THEN 1 ELSE 0 END,
+            d.regime,
+            d.decision_source
+        """,
+        (run_id,),
+    ).fetchall()
+
+    if not rows:
+        lines.append(
+            "*No closed positions to stratify. "
+            "Either the run had no fills, or all fills had NULL "
+            "realized_pl (still-open positions).*"
+        )
+        return lines
+
+    lines.append(
+        "| Regime | Source | Trades | Win rate | "
+        "Total realized P&L | Avg P&L |"
+    )
+    lines.append("|---|---|---|---|---|---|")
+    for regime, source, n_fills, n_wins, total_pl, avg_pl in rows:
+        regime_label = regime if regime is not None else "*(none)*"
+        win_rate = (n_wins / n_fills) if n_fills else 0.0
+        lines.append(
+            f"| {regime_label} | {source} | {n_fills} | "
+            f"{win_rate * 100:.1f}% | ${total_pl:,.2f} | "
+            f"${avg_pl:,.2f} |"
+        )
+    lines.append("")
+    lines.append(
+        "*Note: per-regime max drawdown is omitted — drawdown is a "
+        "continuous portfolio-curve metric and per-regime DD requires "
+        "a regime column on `replay_equity_curve` (separate sub-task). "
+        "T3 has no fills (labeling pass), so it is not included here; "
+        "tier-level analysis lives in § 5d.*"
+    )
+    return lines
 
 
 # ---------------------------------------------------------------------------

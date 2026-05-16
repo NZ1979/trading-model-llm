@@ -912,7 +912,7 @@ async def test_persistence_disabled_no_writes(monkeypatch):
 
     write_calls: list = []
 
-    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None):
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None, regime=None):
         write_calls.append((run_id, day_result.trading_date))
 
     monkeypatch.setattr(
@@ -957,7 +957,7 @@ async def test_persistence_enabled_calls_writer_per_day(monkeypatch):
 
     write_calls: list[dict] = []
 
-    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None):
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None, regime=None):
         write_calls.append({
             "conn": conn,
             "run_id": run_id,
@@ -998,7 +998,7 @@ async def test_persistence_skipped_day_still_calls_writer(monkeypatch):
 
     write_calls: list = []
 
-    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None):
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None, regime=None):
         write_calls.append(day_result.skipped)
 
     monkeypatch.setattr(
@@ -1028,7 +1028,7 @@ async def test_persistence_without_portfolio_no_writes(monkeypatch):
 
     write_calls: list = []
 
-    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None):
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None, regime=None):
         write_calls.append(True)
 
     monkeypatch.setattr(
@@ -1228,6 +1228,33 @@ async def test_dayrunresult_base_fields_populated_when_base_portfolio_set(monkey
 
 
 @pytest.mark.asyncio
+async def test_write_day_results_receives_market_regime_label(monkeypatch):
+    """run_replay threads day_state.market_regime_label through to
+    write_day_results as `regime=...` (M2.2 sub-task #22)."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)  # default _day_state has regime='neutral'
+
+    captured: list[str | None] = []
+
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio,
+                    base_portfolio=None, regime=None):
+        captured.append(regime)
+
+    monkeypatch.setattr(
+        "data.replay.driver.write_day_results", _fake_write
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    persistence_conn = sqlite3.connect(":memory:")
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+        persistence_conn=persistence_conn, run_id=1,
+    )
+    assert captured == ["neutral"]
+
+
+@pytest.mark.asyncio
 async def test_write_day_results_receives_base_portfolio(monkeypatch):
     """When persistence + base_portfolio are both set, write_day_results gets
     base_portfolio threaded through."""
@@ -1240,7 +1267,7 @@ async def test_write_day_results_receives_base_portfolio(monkeypatch):
 
     captured: list[dict] = []
 
-    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None):
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None, regime=None):
         captured.append({
             "llm": llm_portfolio,
             "base": base_portfolio,

@@ -285,7 +285,9 @@ async def run_replay(
     # One EscalationBudget across the run; reset per day.
     budget = EscalationBudget(max_per_day=config.t2_max_per_day)
 
-    def _persist(day_result: DayRunResult) -> None:
+    def _persist(
+        day_result: DayRunResult, *, regime: str | None = None,
+    ) -> None:
         """Write one day's rows when persistence is enabled.
 
         No-ops when persistence is disabled OR when the day was skipped
@@ -297,6 +299,12 @@ async def run_replay(
         decisions / fills / equity points are written in the same
         transaction with ``decision_source='base'`` and
         ``portfolio_name='base'``.
+
+        ``regime`` is ``day_state.market_regime_label`` (per M2.2
+        sub-task #22). Skipped-day calls before ``day_state`` exists
+        pass ``regime=None``; ``write_day_results`` no-ops on skipped
+        days regardless, so the value is informational only on that
+        path.
         """
         if not persistence_enabled or portfolio is None:
             return
@@ -306,6 +314,7 @@ async def run_replay(
             day_result=day_result,
             llm_portfolio=portfolio,
             base_portfolio=base_portfolio,
+            regime=regime,
         )
 
     results: list[DayRunResult] = []
@@ -359,7 +368,7 @@ async def run_replay(
                 skip_reason=reason,
             )
             results.append(skipped_result)
-            _persist(skipped_result)
+            _persist(skipped_result, regime=day_state.market_regime_label)
             continue
 
         # LLM-side fill + stop + MTM + EOD-flatten simulation when the
@@ -455,7 +464,7 @@ async def run_replay(
             base_equity_curve=base_equity_curve_t,
         )
         results.append(day_result)
-        _persist(day_result)
+        _persist(day_result, regime=day_state.market_regime_label)
         logger.info(
             "run_replay: %s complete, %d llm decisions / %d base decisions / "
             "%d t3 decisions, %d failed ticker(s), %d escalation(s), "
