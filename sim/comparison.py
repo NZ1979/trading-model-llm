@@ -5,14 +5,13 @@ Reads one replay run's rows from ``replay_results.db`` (written by
 seven sections per ``docs/M2_REPLAY_HARNESS_DESIGN.md`` § Comparison
 report format.
 
-Sections that ship in M2.2 sub-task #18:
+Sections that ship today (M2.2 #18 baseline + #21 tier-agreement):
 
 1. Run metadata -- date range, prompt version, tier config from
    replay_runs.config_json. Cache hits/misses and per-tier wall-clock
    time are deferred (not yet persisted).
-2. Decision summary -- counts by action × source (live_merged vs base).
-   T1/T2/T3 separate rows are deferred (Tier 3 persistence is a
-   separate sub-task).
+2. Decision summary -- counts by action × source (live_merged vs base
+   vs t3_only).
 3. Portfolio performance -- starting/ending equity, total realized
    P&L, win rate, drawdown, rough Sharpe ratio for each portfolio.
 4. Divergence analysis -- (ticker, tick_et) pairs where live_merged
@@ -21,16 +20,17 @@ Sections that ship in M2.2 sub-task #18:
 5. LLM-specific quality metrics -- confidence histogram, setup label
    frequency, reasoning length distribution. Restricted to
    live_merged rows.
+5d. Tier agreement & escalation analysis (M2.2 sub-task #21) --
+   T1↔T3 agreement rate, 3×3 confusion matrix, disagreement
+   profitability, confidence-band breakdown, tier_provenance counts.
 6. Failure modes -- replay_rejections grouped by reason; LLM tier
    failure setup_label patterns (schema_invalid_t1, api_failure_t1,
    t1_unexpected).
 7. Top decisions worth manual review -- highest-confidence wins,
    highest-confidence losses, biggest divergences.
 
-Sections 5b (regime-stratified), 5c (crash-period replay), and 5d
-(tier agreement) are stubbed with explicit "deferred to sub-task XX"
-notes so readers see the planned shape without confusion about why
-they're empty.
+Sections 5b (regime-stratified) and 5c (crash-period replay) remain
+stubbed with explicit "deferred" notes pending their own sub-tasks.
 
 Failure semantics (Rule 18):
 - Missing db_path: FileNotFoundError, named loud.
@@ -127,7 +127,9 @@ def generate_report(
         lines.append("")
         lines.extend(_section_5_llm_quality(conn, run_id))
         lines.append("")
-        lines.extend(_section_5_deferred_stubs())
+        lines.extend(_section_5b_5c_deferred_stubs())
+        lines.append("")
+        lines.extend(_section_5d_tier_agreement(conn, run_id))
         lines.append("")
         lines.extend(_section_6_failure_modes(conn, run_id))
         lines.append("")
@@ -606,7 +608,12 @@ def _section_5_llm_quality(
     return lines
 
 
-def _section_5_deferred_stubs() -> list[str]:
+def _section_5b_5c_deferred_stubs() -> list[str]:
+    """Stubs for 5b (regime-stratified) and 5c (crash-period).
+
+    Section 5d landed in M2.2 sub-task #21 as a real implementation;
+    see ``_section_5d_tier_agreement``.
+    """
     return [
         "## 5b. Regime-stratified performance",
         "",
@@ -620,14 +627,250 @@ def _section_5_deferred_stubs() -> list[str]:
         "of the regular per-run report. Run the harness on an "
         "identified high-volatility window with its own run_id; "
         "compare against the baseline run.*",
-        "",
-        "## 5d. Tier agreement & escalation analysis",
-        "",
-        "*Deferred — separate T1 / T2 / T3 rows in `replay_decisions` "
-        "are not yet persisted (only `live_merged` lands today). "
-        "A future sub-task will add per-tier persistence and the "
-        "agreement / confusion-matrix queries this section requires.*",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Section 5d: Tier agreement & escalation analysis (M2.2 sub-task #21)
+# ---------------------------------------------------------------------------
+#
+# Quantifies the tiered architecture per
+# ``docs/M2_REPLAY_HARNESS_DESIGN.md`` § 5d and
+# ``docs/LLM_SIGNAL_INTERFACE.md`` § Tiered evaluation.
+#
+# Inputs: ``replay_decisions`` rows with ``decision_source IN
+# ('live_merged', 't3_only')`` plus optional ``replay_fills.realized_pl``
+# join on the T1 (live_merged) ``decision_id``.
+#
+# Sub-blocks rendered:
+#   5d.1 Evaluated-pair denominator + T1 / T3 failure tally.
+#   5d.2 Overall T1↔T3 agreement rate + 3×3 confusion matrix.
+#   5d.3 Disagreement profitability on T1's realized P&L side.
+#        (T3 has no portfolio simulation -- it's a labeling pass --
+#         so a counterfactual T3 P&L is intentionally not computed.)
+#   5d.4 Agreement breakdown by T1 confidence band (high ≥ 75 vs
+#        low < 75). 75 matches the escalation rule's ceiling.
+#   5d.5 Tier 2 escalation tier_provenance counts on the live_merged
+#        side. The T2-reverse-vs-T1-original P&L analysis from the
+#        design doc is intentionally out of scope -- it needs the
+#        pre-merge T1 action persisted, which today is not stored.
+
+_T1_FAIL_SETUPS = ("schema_invalid_t1", "api_failure_t1", "t1_unexpected")
+_T3_FAIL_SETUPS = ("schema_invalid_t3", "api_failure_t3", "t3_unexpected")
+_HIGH_CONF_THRESHOLD = 75  # matches escalation_rule.confidence_ceiling
+_ACTIONS: tuple[str, ...] = ("Buy", "Sell", "Hold")
+
+
+def _section_5d_tier_agreement(
+    conn: sqlite3.Connection, run_id: int,
+) -> list[str]:
+    lines = ["## 5d. Tier agreement & escalation analysis", ""]
+
+    # Count tier-failure rows on each side (excluded from the agreement
+    # math but surfaced for visibility).
+    n_t1_fail = conn.execute(
+        f"SELECT COUNT(*) FROM replay_decisions "
+        f"WHERE run_id = ? AND decision_source = 'live_merged' "
+        f"AND setup_label IN ("
+        f"{','.join('?' * len(_T1_FAIL_SETUPS))})",
+        (run_id, *_T1_FAIL_SETUPS),
+    ).fetchone()[0]
+    n_t3_fail = conn.execute(
+        f"SELECT COUNT(*) FROM replay_decisions "
+        f"WHERE run_id = ? AND decision_source = 't3_only' "
+        f"AND (setup_label IN ("
+        f"{','.join('?' * len(_T3_FAIL_SETUPS))}) "
+        f"OR tier_provenance = 't3_failed')",
+        (run_id, *_T3_FAIL_SETUPS),
+    ).fetchone()[0]
+
+    # Pair T1 (live_merged) with T3 (t3_only) on (ticker, tick_et).
+    # Failure rows excluded on both sides.
+    placeholders_t1 = ",".join("?" * len(_T1_FAIL_SETUPS))
+    placeholders_t3 = ",".join("?" * len(_T3_FAIL_SETUPS))
+    pairs = conn.execute(
+        f"""
+        SELECT t1.action, t3.action, t1.confidence, t1.id, t3.id
+        FROM replay_decisions t1
+        INNER JOIN replay_decisions t3
+            ON t1.run_id = t3.run_id
+            AND t1.ticker = t3.ticker
+            AND t1.tick_et = t3.tick_et
+        WHERE t1.run_id = ?
+            AND t1.decision_source = 'live_merged'
+            AND t3.decision_source = 't3_only'
+            AND (t1.setup_label IS NULL
+                 OR t1.setup_label NOT IN ({placeholders_t1}))
+            AND (t3.setup_label IS NULL
+                 OR t3.setup_label NOT IN ({placeholders_t3}))
+            AND (t3.tier_provenance IS NULL
+                 OR t3.tier_provenance != 't3_failed')
+        """,
+        (run_id, *_T1_FAIL_SETUPS, *_T3_FAIL_SETUPS),
+    ).fetchall()
+
+    if not pairs:
+        lines.append(
+            "*No paired T1 / T3 decisions for this run — T3 labeling "
+            "not enabled, no overlapping (ticker, tick) pairs, or all "
+            "pairs were tier failures.*"
+        )
+        if n_t1_fail or n_t3_fail:
+            lines.append("")
+            lines.append("### Tier failure counts")
+            lines.append("")
+            lines.append(f"- **T1 failures:** {n_t1_fail}")
+            lines.append(f"- **T3 failures:** {n_t3_fail}")
+        lines.append("")
+        lines.extend(_section_5d5_escalation_counts(conn, run_id))
+        return lines
+
+    n_pairs = len(pairs)
+
+    # ---- 5d.1: evaluated-pair denominator + tier failure tally ----
+    lines.append("### Evaluated pairs")
+    lines.append("")
+    lines.append(f"- **Paired T1↔T3 decisions:** {n_pairs}")
+    lines.append(f"- **T1 failures excluded:** {n_t1_fail}")
+    lines.append(f"- **T3 failures excluded:** {n_t3_fail}")
+    lines.append("")
+
+    # ---- 5d.2: overall agreement + 3×3 confusion matrix ----
+    n_agree = sum(1 for t1a, t3a, *_ in pairs if t1a == t3a)
+    rate = n_agree / n_pairs
+
+    matrix: dict[tuple[str, str], int] = {
+        (a, b): 0 for a in _ACTIONS for b in _ACTIONS
+    }
+    for t1a, t3a, *_ in pairs:
+        if t1a in _ACTIONS and t3a in _ACTIONS:
+            matrix[(t1a, t3a)] += 1
+
+    lines.append("### Overall T1↔T3 agreement")
+    lines.append("")
+    lines.append(
+        f"- **Agreement rate:** {rate * 100:.1f}% ({n_agree}/{n_pairs})"
+    )
+    lines.append("")
+    lines.append(
+        "### Confusion matrix (rows = T1 action, cols = T3 action)"
+    )
+    lines.append("")
+    lines.append("| T1 \\ T3 | Buy | Sell | Hold |")
+    lines.append("|---|---|---|---|")
+    for t1a in _ACTIONS:
+        cells = " | ".join(
+            str(matrix[(t1a, t3a)]) for t3a in _ACTIONS
+        )
+        lines.append(f"| **{t1a}** | {cells} |")
+    lines.append("")
+
+    # ---- 5d.3: disagreement profitability (T1 side) ----
+    disagreements = [
+        (t1a, t3a, conf, t1id, t3id)
+        for (t1a, t3a, conf, t1id, t3id) in pairs
+        if t1a != t3a
+    ]
+    lines.append("### Disagreement profitability (T1 side)")
+    lines.append("")
+    if not disagreements:
+        lines.append("*No T1↔T3 disagreements in this run.*")
+    else:
+        pls: list[float] = []
+        for _, _, _, t1id, _ in disagreements:
+            pl = _decision_realized_pl(conn, t1id)
+            if pl is not None:
+                pls.append(pl)
+        lines.append(f"- **Disagreements:** {len(disagreements)}")
+        lines.append(f"- **Disagreements with fills:** {len(pls)}")
+        if pls:
+            mean_pl = sum(pls) / len(pls)
+            lines.append(
+                "- **Mean T1-side realized P&L on disagreements:** "
+                f"${mean_pl:,.2f}"
+            )
+        else:
+            lines.append(
+                "- *No fills attached to disagreement decisions.*"
+            )
+        lines.append("")
+        lines.append(
+            "*Note: T3 has no portfolio simulation (it is a labeling "
+            "pass), so a counterfactual \"what would T3 have realized\" "
+            "P&L is not computed here.*"
+        )
+    lines.append("")
+
+    # ---- 5d.4: agreement by T1 confidence band ----
+    high = [
+        (t1a, t3a)
+        for (t1a, t3a, conf, _, _) in pairs
+        if conf is not None and conf >= _HIGH_CONF_THRESHOLD
+    ]
+    low = [
+        (t1a, t3a)
+        for (t1a, t3a, conf, _, _) in pairs
+        if conf is not None and conf < _HIGH_CONF_THRESHOLD
+    ]
+    lines.append(
+        f"### Agreement by T1 confidence band "
+        f"(threshold = {_HIGH_CONF_THRESHOLD})"
+    )
+    lines.append("")
+    lines.append("| Band | N | Agreement rate |")
+    lines.append("|---|---|---|")
+    for label, group in (
+        (f"High (≥{_HIGH_CONF_THRESHOLD})", high),
+        (f"Low (<{_HIGH_CONF_THRESHOLD})", low),
+    ):
+        if group:
+            ar = sum(1 for t1a, t3a in group if t1a == t3a) / len(group)
+            lines.append(f"| {label} | {len(group)} | {ar * 100:.1f}% |")
+        else:
+            lines.append(f"| {label} | 0 | *(no data)* |")
+    lines.append("")
+
+    # ---- 5d.5: T2 escalation tier_provenance counts ----
+    lines.extend(_section_5d5_escalation_counts(conn, run_id))
+    return lines
+
+
+def _section_5d5_escalation_counts(
+    conn: sqlite3.Connection, run_id: int,
+) -> list[str]:
+    """Counts of live_merged rows grouped by ``tier_provenance``.
+
+    The full design-doc § 5d "Tier 2 escalation behavior" block
+    (T2-confirm vs T2-reverse vs T1-original P&L) requires persisting
+    the pre-merge T1 action, which today is not stored. This sub-block
+    renders the counts that ARE available from the existing schema and
+    flags the missing analysis explicitly.
+    """
+    lines = [
+        "### Tier 2 escalation behavior (tier_provenance counts)",
+        "",
+    ]
+    rows = conn.execute(
+        "SELECT tier_provenance, COUNT(*) FROM replay_decisions "
+        "WHERE run_id = ? AND decision_source = 'live_merged' "
+        "GROUP BY tier_provenance ORDER BY COUNT(*) DESC",
+        (run_id,),
+    ).fetchall()
+    if not rows:
+        lines.append("*No live_merged decisions in this run.*")
+        return lines
+    lines.append("| tier_provenance | Count |")
+    lines.append("|---|---|")
+    for prov, n in rows:
+        label = prov if prov is not None else "*(none)*"
+        lines.append(f"| `{label}` | {n} |")
+    lines.append("")
+    lines.append(
+        "*Note: a future sub-task will add the T2-confirm-vs-reverse "
+        "P&L analysis from the design doc — it requires persisting "
+        "the pre-merge T1 action, which today is not stored.*"
+    )
+    return lines
 
 
 # ---------------------------------------------------------------------------

@@ -1060,3 +1060,41 @@ def test_write_day_t3_decisions_persist_full_fields(tmp_path):
         assert row == ("Buy", "opus_label", 80, "opus reasoning", "t3_only")
     finally:
         conn.close()
+
+
+def test_write_day_live_merged_persists_tier_provenance(tmp_path):
+    """live_merged row preserves tier_provenance from the LLMDecision.
+
+    Added in M2.2 sub-task #21 so § 5d's tier_provenance counts table
+    has real data to render. Previously only the t3_only insert path
+    persisted tier_provenance; live_merged rows landed with NULL even
+    when the LLMDecision carried a value.
+    """
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        from strategy.llm.types import LLMDecision
+        from data.replay.tick_loop import TickDecision
+        td = TickDecision(
+            tick_et=_bar_et(5),
+            ticker="AAPL",
+            decision=LLMDecision(
+                action="Buy", confidence=70,
+                setup_label="gap_and_go",
+                reasoning="merged via T2",
+                tier_provenance="t1_t2_agree",
+            ),
+        )
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(decisions=[td]),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+        )
+        row = conn.execute(
+            "SELECT tier_provenance FROM replay_decisions "
+            "WHERE run_id = ? AND decision_source = 'live_merged'",
+            (rid,),
+        ).fetchone()
+        assert row == ("t1_t2_agree",)
+    finally:
+        conn.close()

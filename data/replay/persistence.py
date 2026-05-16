@@ -388,8 +388,9 @@ def _write_portfolio_side(
         cur = conn.execute(
             "INSERT INTO replay_decisions "
             "(run_id, trading_date, tick_et, ticker, decision_source, "
-            " action, setup_label, confidence, reasoning) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " action, setup_label, confidence, reasoning, "
+            " tier_provenance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 trading_date_str,
@@ -400,6 +401,7 @@ def _write_portfolio_side(
                 td.decision.setup_label,
                 td.decision.confidence,
                 td.decision.reasoning,
+                td.decision.tier_provenance,
             ),
         )
         global_id = cur.lastrowid

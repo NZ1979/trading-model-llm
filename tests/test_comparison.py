@@ -75,10 +75,12 @@ def _decision(
     *,
     confidence: int = 60,
     setup_label: str = "gap_and_go",
+    tier_provenance: str | None = None,
 ) -> LLMDecision:
     return LLMDecision(
         action=action, confidence=confidence,
         setup_label=setup_label, reasoning="r",
+        tier_provenance=tier_provenance,  # type: ignore[arg-type]
     )
 
 
@@ -89,12 +91,14 @@ def _tick(
     *,
     confidence: int = 60,
     setup_label: str = "gap_and_go",
+    tier_provenance: str | None = None,
 ) -> TickDecision:
     return TickDecision(
         tick_et=_bar_et(minute_offset),
         ticker=ticker,
         decision=_decision(action, confidence=confidence,
-                            setup_label=setup_label),
+                            setup_label=setup_label,
+                            tier_provenance=tier_provenance),
     )
 
 
@@ -153,6 +157,7 @@ def _day_result(
     base_decisions=None,
     base_rejections=(),
     base_equity_curve=(),
+    t3_decisions=None,
 ) -> DayRunResult:
     return DayRunResult(
         trading_date=trading_date,
@@ -163,6 +168,7 @@ def _day_result(
         base_decisions=base_decisions if base_decisions is not None else [],
         base_rejections=base_rejections,
         base_equity_curve=base_equity_curve,
+        t3_decisions=t3_decisions if t3_decisions is not None else [],
     )
 
 
@@ -565,6 +571,388 @@ def test_section_5_deferred_stubs_present(tmp_path):
     assert "5b. Regime-stratified performance" in text
     assert "5c. Crash-period replay" in text
     assert "5d. Tier agreement" in text
+
+
+# ===========================================================================
+# Section 5d: Tier agreement & escalation analysis (M2.2 sub-task #21)
+# ===========================================================================
+
+
+def _run_with(
+    db: Path,
+    *,
+    decisions=None,
+    t3_decisions=None,
+    base_decisions=None,
+    llm_pf: SimulatedPortfolio | None = None,
+    config: ReplayConfig | None = None,
+) -> int:
+    """Seed one run with the supplied decisions / portfolio, return run_id."""
+    conn = init_replay_db(db)
+    try:
+        rid = start_run(conn, config=config or _config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=decisions or [],
+                t3_decisions=t3_decisions or [],
+                base_decisions=base_decisions,
+            ),
+            llm_portfolio=llm_pf or SimulatedPortfolio(starting_cash=100_000.0),
+        )
+        complete_run(conn, run_id=rid)
+    finally:
+        conn.close()
+    return rid
+
+
+def test_5d_empty_run_renders_placeholder(tmp_path):
+    """No live_merged, no t3_only -> 5d header + placeholder + 5d.5
+    'no live_merged' note. No crash."""
+    db = tmp_path / "r.db"
+    rid = _seed_run(db)
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "## 5d. Tier agreement" in text
+    assert "No paired T1 / T3 decisions" in text
+    assert "No live_merged decisions in this run" in text
+
+
+def test_5d_live_merged_only_renders_placeholder_plus_provenance(tmp_path):
+    """live_merged rows present, no t3_only -> 5d.1-5d.4 placeholder
+    but 5d.5 still renders tier_provenance counts for live_merged."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        decisions=[_tick(0, "Buy", tier_provenance="t1_only")],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "No paired T1 / T3 decisions" in text
+    # 5d.5 section header + the tier_provenance value rendered.
+    assert "tier_provenance counts" in text
+    assert "`t1_only`" in text
+
+
+def test_5d_t3_only_no_live_merged_renders_placeholder(tmp_path):
+    """t3_only rows present, no live_merged -> placeholder + 5d.5
+    'no live_merged' note."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        t3_decisions=[_tick(0, "Buy", tier_provenance="t3_only")],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "No paired T1 / T3 decisions" in text
+    assert "No live_merged decisions in this run" in text
+
+
+def test_5d_full_agreement_renders_100_percent(tmp_path):
+    """Two paired Buys -> agreement rate 100% and matrix (Buy,Buy)=2."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        decisions=[
+            _tick(0, "Buy", tier_provenance="t1_only"),
+            _tick(5, "Buy", ticker="MSFT", tier_provenance="t1_only"),
+        ],
+        t3_decisions=[
+            _tick(0, "Buy", tier_provenance="t3_only"),
+            _tick(5, "Buy", ticker="MSFT", tier_provenance="t3_only"),
+        ],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "Agreement rate:** 100.0% (2/2)" in text
+    # Diagonal cell (Buy,Buy) = 2; off-diagonal cells = 0.
+    # The Buy row in the matrix is "**Buy** | 2 | 0 | 0".
+    assert "| **Buy** | 2 | 0 | 0 |" in text
+    assert "No T1↔T3 disagreements in this run." in text
+
+
+def test_5d_full_disagreement_renders_0_percent(tmp_path):
+    """T1=Buy paired with T3=Sell on the same key -> 0% agreement,
+    matrix (Buy,Sell)=1."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        decisions=[_tick(0, "Buy", tier_provenance="t1_only")],
+        t3_decisions=[_tick(0, "Sell", tier_provenance="t3_only")],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "Agreement rate:** 0.0% (0/1)" in text
+    assert "| **Buy** | 0 | 1 | 0 |" in text
+    assert "Disagreements:** 1" in text
+
+
+def test_5d_mixed_matrix_cell_counts(tmp_path):
+    """4 paired decisions across 4 different (T1,T3) cells.
+
+    Pairs: (AAPL Buy/Buy), (MSFT Sell/Hold), (NVDA Hold/Buy),
+    (GOOG Buy/Sell). Agreement = 1/4 = 25%.
+    """
+    db = tmp_path / "r.db"
+    pairs = [
+        ("AAPL", "Buy", "Buy"),
+        ("MSFT", "Sell", "Hold"),
+        ("NVDA", "Hold", "Buy"),
+        ("GOOG", "Buy", "Sell"),
+    ]
+    decisions = [
+        _tick(i * 5, t1, ticker=t, tier_provenance="t1_only")
+        for i, (t, t1, _) in enumerate(pairs)
+    ]
+    t3 = [
+        _tick(i * 5, t3a, ticker=t, tier_provenance="t3_only")
+        for i, (t, _, t3a) in enumerate(pairs)
+    ]
+    rid = _run_with(db, decisions=decisions, t3_decisions=t3)
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "Agreement rate:** 25.0% (1/4)" in text
+    # (Buy, Buy)=1, (Buy, Sell)=1, (Buy, Hold)=0 -> Buy row "1 | 1 | 0"
+    assert "| **Buy** | 1 | 1 | 0 |" in text
+    # (Sell, *) -> 0 | 0 | 1
+    assert "| **Sell** | 0 | 0 | 1 |" in text
+    # (Hold, *) -> 1 | 0 | 0
+    assert "| **Hold** | 1 | 0 | 0 |" in text
+
+
+def test_5d_failure_markers_excluded_from_matrix(tmp_path):
+    """T1 row with setup_label='schema_invalid_t1' paired with a normal T3
+    row -> pair excluded from the matrix, counted in the failures tally."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        decisions=[
+            _tick(0, "Hold", setup_label="schema_invalid_t1",
+                  tier_provenance="t1_failed"),
+        ],
+        t3_decisions=[_tick(0, "Buy", tier_provenance="t3_only")],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    # No valid pair -> placeholder + failure tally.
+    assert "No paired T1 / T3 decisions" in text
+    assert "T1 failures:** 1" in text
+
+
+def test_5d_t3_failure_excluded_from_matrix(tmp_path):
+    """T3 row with tier_provenance='t3_failed' paired with a normal T1
+    row -> pair excluded, T3 failure counted."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        decisions=[_tick(0, "Buy", tier_provenance="t1_only")],
+        t3_decisions=[
+            _tick(0, "Hold", setup_label="api_failure_t3",
+                  tier_provenance="t3_failed"),
+        ],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "No paired T1 / T3 decisions" in text
+    assert "T3 failures:** 1" in text
+
+
+def test_5d_disagreement_with_fill_renders_mean_pl(tmp_path):
+    """Disagreement on AAPL; T1's decision_id=1 has a closed-position
+    fill with realized_pl=+50. Mean P&L line shows $50.00."""
+    db = tmp_path / "r.db"
+    pf = SimulatedPortfolio(starting_cash=100_000.0)
+    # Position references decision_id=1 (the first live_merged row).
+    pf.closed_positions.append(_closed_position(
+        decision_id=1, exit_price=105.0,  # +50 on 10 shares
+    ))
+    conn = init_replay_db(db)
+    try:
+        rid = start_run(conn, config=_config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(5, "Buy", tier_provenance="t1_only")],
+                t3_decisions=[_tick(5, "Sell", tier_provenance="t3_only")],
+            ),
+            llm_portfolio=pf,
+        )
+        complete_run(conn, run_id=rid)
+    finally:
+        conn.close()
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "Disagreements:** 1" in text
+    assert "Disagreements with fills:** 1" in text
+    assert "Mean T1-side realized P&L on disagreements:** $50.00" in text
+
+
+def test_5d_disagreement_without_fill_renders_no_fills_note(tmp_path):
+    """Disagreement but no fills on T1 side -> 'no fills attached' note."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        decisions=[_tick(0, "Buy", tier_provenance="t1_only")],
+        t3_decisions=[_tick(0, "Sell", tier_provenance="t3_only")],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "Disagreements:** 1" in text
+    assert "Disagreements with fills:** 0" in text
+    assert "No fills attached to disagreement decisions" in text
+
+
+def test_5d_confidence_band_split(tmp_path):
+    """4 pairs: 2 high-conf (75+) all agree, 2 low-conf (<75) all disagree.
+
+    High band agreement = 100%, low band = 0%.
+    """
+    db = tmp_path / "r.db"
+    decisions = [
+        _tick(0, "Buy", ticker="A", confidence=80, tier_provenance="t1_only"),
+        _tick(5, "Buy", ticker="B", confidence=90, tier_provenance="t1_only"),
+        _tick(10, "Buy", ticker="C", confidence=40, tier_provenance="t1_only"),
+        _tick(15, "Buy", ticker="D", confidence=50, tier_provenance="t1_only"),
+    ]
+    t3 = [
+        _tick(0, "Buy", ticker="A", tier_provenance="t3_only"),
+        _tick(5, "Buy", ticker="B", tier_provenance="t3_only"),
+        _tick(10, "Sell", ticker="C", tier_provenance="t3_only"),
+        _tick(15, "Sell", ticker="D", tier_provenance="t3_only"),
+    ]
+    rid = _run_with(db, decisions=decisions, t3_decisions=t3)
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    # Section header includes the threshold.
+    assert "confidence band (threshold = 75)" in text
+    # High band: 2 pairs, 100% agreement.
+    assert "| High (≥75) | 2 | 100.0% |" in text
+    # Low band: 2 pairs, 0% agreement.
+    assert "| Low (<75) | 2 | 0.0% |" in text
+
+
+def test_5d_provenance_counts_table_renders_present_values(tmp_path):
+    """Mix of tier_provenance values on live_merged side -> rows for
+    each value rendered in the counts table."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        decisions=[
+            _tick(0, "Buy", ticker="A", tier_provenance="t1_only"),
+            _tick(5, "Buy", ticker="B", tier_provenance="t1_t2_agree"),
+            _tick(10, "Hold", ticker="C", tier_provenance="t1_t2_disagree"),
+        ],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "`t1_only`" in text
+    assert "`t1_t2_agree`" in text
+    assert "`t1_t2_disagree`" in text
+
+
+def test_5d_provenance_counts_handles_null(tmp_path):
+    """live_merged rows with tier_provenance=None render as '*(none)*'."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        decisions=[_tick(0, "Buy", tier_provenance=None)],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    # The table renders the literal markdown string "*(none)*" inside
+    # the cell. The Python source is "*(none)*".
+    assert "*(none)*" in text
+
+
+def test_5d_multi_run_isolation(tmp_path):
+    """Pairs from run B do not leak into run A's report."""
+    db = tmp_path / "r.db"
+    conn = init_replay_db(db)
+    try:
+        ra = start_run(conn, config=_config(llm_prompt_version="va"))
+        rb = start_run(conn, config=_config(llm_prompt_version="vb"))
+        # Run A: T1=Buy, T3=Buy at minute 0 (agreement).
+        write_day_results(
+            conn, run_id=ra,
+            day_result=_day_result(
+                decisions=[_tick(0, "Buy", tier_provenance="t1_only")],
+                t3_decisions=[_tick(0, "Buy", tier_provenance="t3_only")],
+            ),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+        )
+        # Run B: T1=Buy, T3=Sell (disagreement).
+        write_day_results(
+            conn, run_id=rb,
+            day_result=_day_result(
+                decisions=[_tick(0, "Buy", tier_provenance="t1_only")],
+                t3_decisions=[_tick(0, "Sell", tier_provenance="t3_only")],
+            ),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+        )
+        complete_run(conn, run_id=ra)
+        complete_run(conn, run_id=rb)
+    finally:
+        conn.close()
+    out_a = tmp_path / "a.md"
+    out_b = tmp_path / "b.md"
+    generate_report(db_path=db, run_id=ra, output_path=out_a)
+    generate_report(db_path=db, run_id=rb, output_path=out_b)
+    text_a = out_a.read_text(encoding="utf-8")
+    text_b = out_b.read_text(encoding="utf-8")
+    assert "Agreement rate:** 100.0% (1/1)" in text_a
+    assert "Agreement rate:** 0.0% (0/1)" in text_b
+
+
+def test_5d_inner_join_skips_unpaired_keys(tmp_path):
+    """Three tickers: A has both T1+T3 (paired), B has T1-only (no T3),
+    C has T3-only (no T1). Only A contributes to the pair denominator."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        decisions=[
+            _tick(0, "Buy", ticker="A", tier_provenance="t1_only"),
+            _tick(5, "Buy", ticker="B", tier_provenance="t1_only"),
+        ],
+        t3_decisions=[
+            _tick(0, "Buy", ticker="A", tier_provenance="t3_only"),
+            _tick(10, "Sell", ticker="C", tier_provenance="t3_only"),
+        ],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    # Only one pair (A,A); agreement = 100%.
+    assert "Paired T1↔T3 decisions:** 1" in text
+    assert "Agreement rate:** 100.0% (1/1)" in text
+
+
+def test_5d_renders_before_section_6(tmp_path):
+    """Smoke: 5d header appears before section 6 header."""
+    db = tmp_path / "r.db"
+    rid = _run_with(
+        db,
+        decisions=[_tick(0, "Buy", tier_provenance="t1_only")],
+        t3_decisions=[_tick(0, "Buy", tier_provenance="t3_only")],
+    )
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    idx_5d = text.index("## 5d. Tier agreement")
+    idx_6 = text.index("## 6. Failure modes")
+    assert idx_5d < idx_6
 
 
 # ===========================================================================
