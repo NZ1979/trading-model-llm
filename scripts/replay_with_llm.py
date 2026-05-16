@@ -3,18 +3,44 @@
 Usage examples in ``docs/M2_REPLAY_HARNESS_DESIGN.md`` § CLI. The flag
 shape mirrors the spec; defaults match ``ReplayConfig``.
 
-Status: M2.1 scaffolding. This CLI parses arguments into a
-``ReplayConfig`` and echoes the config back as JSON. The replay loop
-itself — build ``LLMContext`` per tick, call ``signal_engine.evaluate``,
-simulate fills via ``sim/``, write the comparison report — lands in
-M2.2 / M2.3. The point of M2.1's CLI is to confirm the flag shape and
-config wiring so M2.2 can layer the loop on top without re-litigating
-arg parsing.
+Flow (M2.2 sub-task #19):
+
+1. argparse -> ``ReplayConfig``.
+2. ``open_fixture`` for the sentiment SQLite (Rule-26 compliant; not
+   trader-prod).
+3. ``build_tier_clients`` from the bridged ``llm_config`` dict;
+   wrap T1 + T2 in ``CachedLLMClient`` (T3 left raw -- the Tier-3
+   pass through ``run_replay`` is a deferred sub-task).
+4. ``init_replay_db`` + ``start_run`` on the persistence DB derived
+   from ``config.replay_db_path``. ``repo_sha`` from
+   ``git rev-parse HEAD`` (best-effort).
+5. Construct ``SimulatedPortfolio`` for the LLM side. When
+   ``--base-portfolio`` is set, also construct a base portfolio so
+   the parallel base-strategy pass + comparison report has data.
+6. ``await run_replay(...)`` with everything threaded.
+7. ``complete_run`` with a summary JSON aggregating per-day counts
+   and cache hit/miss stats from the wrapped clients.
+8. ``generate_report`` writes the markdown comparison report (unless
+   ``--skip-report``). Path goes to stdout; everything else to stderr.
+
+Exit codes:
+  0 -- success
+  2 -- FileNotFoundError (missing sentiment fixture, missing DB path
+       parent, etc.)
+  3 -- ValueError / NotImplementedError (bad config, watchlist literal
+       not yet wired, etc.)
+
+Rule 22: ``_setup_logging`` silences ``httpx`` / ``httpcore`` /
+``aiohttp`` / ``anthropic`` / ``urllib3`` loggers to WARNING so the
+Polygon API key (passed as a URL query param) cannot leak into stderr.
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import logging
+import subprocess
 import sys
 from dataclasses import asdict
 from datetime import date
@@ -26,12 +52,22 @@ from typing import Any
 # invocation; this is the form the design doc CLI examples use). In the
 # direct-invocation case Python does NOT put the repo root on sys.path
 # automatically, only the scripts/ dir, so the ``from data.replay...``
-# import below would otherwise raise ModuleNotFoundError.
+# imports below would otherwise raise ModuleNotFoundError.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from data.replay.config import ReplayConfig  # noqa: E402
+from data.replay.driver import DayRunResult, run_replay  # noqa: E402
+from data.replay.historical_sentiment import open_fixture  # noqa: E402
+from data.replay.persistence import (  # noqa: E402
+    complete_run, init_replay_db, start_run,
+)
+from data.replay_cache import CachedLLMClient  # noqa: E402
+from sim.comparison import generate_report  # noqa: E402
+from sim.portfolio import SimulatedPortfolio  # noqa: E402
+from strategy.llm.factory import build_tier_clients  # noqa: E402
+from strategy.llm.signal_engine import TierClients  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -153,12 +189,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pre-filter-news-lookback-hours", type=int, default=2)
     p.add_argument("--max-candidates-per-tick", type=int, default=30)
 
+    # ---- Base-strategy parallel evaluation (M2.2 sub-task #17 / #19) ----
+    p.add_argument(
+        "--base-portfolio", action="store_true",
+        help="run base rule-based strategy in parallel on a second "
+             "SimulatedPortfolio (no pre-filter; every ticker every "
+             "tick). Required for the comparison report's divergence "
+             "section to have data. Default: off (LLM-only run).",
+    )
+    p.add_argument(
+        "--base-require-walls-for-pullback",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="when --base-portfolio is set, base-side pullback signals "
+             "Hold unless walls align. Default False because walls are "
+             "dormant in this fork (Databento canceled).",
+    )
+
     # ---- Behavior toggles ----
     p.add_argument(
         "--echo-only", action="store_true",
-        help="parse + print config + exit cleanly (no replay loop). "
-             "M2.1 default behavior is echo-only regardless of this flag; "
-             "M2.2 will make this flag meaningful.",
+        help="parse + print config + exit cleanly without running the "
+             "replay loop. Useful for verifying flag parsing.",
+    )
+    p.add_argument(
+        "--skip-report", action="store_true",
+        help="run the replay + persistence but skip generate_report at "
+             "the end. The report can be generated separately via "
+             "sim.comparison.generate_report(db_path, run_id).",
     )
 
     return p
@@ -196,7 +253,35 @@ def args_to_config(args: argparse.Namespace) -> ReplayConfig:
         pre_filter_min_gap_pct=args.pre_filter_min_gap_pct,
         pre_filter_news_lookback_hours=args.pre_filter_news_lookback_hours,
         max_candidates_per_tick=args.max_candidates_per_tick,
+        base_require_walls_for_pullback=args.base_require_walls_for_pullback,
     )
+
+
+def _replay_config_to_llm_config_dict(cfg: ReplayConfig) -> dict[str, Any]:
+    """Bridge ReplayConfig's flat fields to the nested llm_config dict shape
+    that ``strategy.llm.factory.build_tier_clients`` expects.
+
+    T2 and T3 backends are hardcoded to ``"anthropic"`` -- per design,
+    they're always Anthropic (only T1 is configurable across qwen_local
+    / anthropic / haiku_stand_in).
+    """
+    return {
+        "enabled": True,
+        "t1": {
+            "backend": cfg.t1_backend,
+            "model_id": cfg.t1_model_id,
+        },
+        "t2": {
+            "enabled": cfg.t2_enabled,
+            "backend": "anthropic",
+            "model_id": cfg.t2_model_id,
+        },
+        "t3": {
+            "enabled": cfg.t3_enabled,
+            "backend": "anthropic",
+            "model_id": cfg.t3_model_id,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +308,190 @@ def config_to_printable(cfg: ReplayConfig) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Logging + provenance helpers
+# ---------------------------------------------------------------------------
+
+
+def _setup_logging() -> None:
+    """Initialize root logger; silence credential-leak-prone HTTP loggers.
+
+    Rule 22: httpx (and the anthropic SDK on top of it) logs full
+    request URLs at INFO by default. Polygon passes API keys as URL
+    query params. Forcing httpx / httpcore / aiohttp / anthropic /
+    urllib3 to WARNING is the standing invariant; removing it would
+    leak credentials into stderr on the next run.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    for name in ("httpx", "httpcore", "aiohttp", "anthropic", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def _git_head_sha() -> str | None:
+    """Return the 7-char short SHA of HEAD, or None on any failure.
+
+    Best-effort: a missing ``git``, a detached working tree, or any
+    other subprocess failure yields None (persisted as NULL in
+    ``replay_runs.repo_sha``). Never raises.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short=7", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        return out.stdout.strip() or None
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        return None
+
+
+def _build_summary_json(
+    results: list[DayRunResult],
+    wrapped_clients: TierClients,
+) -> str:
+    """Aggregate per-day counts + cache stats into the run-level summary.
+
+    Stored in ``replay_runs.summary_json`` for the comparison report
+    to pluck out at section 1. Cache hits/misses come from the
+    wrapped CachedLLMClient instances; if a tier wasn't wrapped (T3
+    today) its block is omitted.
+    """
+    n_days_total = len(results)
+    n_days_skipped = sum(1 for r in results if r.skipped)
+    n_llm_decisions = sum(len(r.decisions) for r in results)
+    n_base_decisions = sum(len(r.base_decisions) for r in results)
+    n_llm_fills = sum(len(r.fills) for r in results)
+    n_base_fills = sum(len(r.base_fills) for r in results)
+    n_llm_rejections = sum(len(r.rejections) for r in results)
+    n_base_rejections = sum(len(r.base_rejections) for r in results)
+    n_t2_escalations = sum(r.t2_escalations_used for r in results)
+
+    payload: dict[str, Any] = {
+        "n_days_total": n_days_total,
+        "n_days_skipped": n_days_skipped,
+        "n_llm_decisions": n_llm_decisions,
+        "n_base_decisions": n_base_decisions,
+        "n_llm_fills": n_llm_fills,
+        "n_base_fills": n_base_fills,
+        "n_llm_rejections": n_llm_rejections,
+        "n_base_rejections": n_base_rejections,
+        "n_t2_escalations": n_t2_escalations,
+    }
+
+    # Cache stats: only present for tiers wrapped in CachedLLMClient.
+    if isinstance(wrapped_clients.t1, CachedLLMClient):
+        payload["cache_t1_hits"] = wrapped_clients.t1.hits
+        payload["cache_t1_misses"] = wrapped_clients.t1.misses
+    if isinstance(wrapped_clients.t2, CachedLLMClient):
+        payload["cache_t2_hits"] = wrapped_clients.t2.hits
+        payload["cache_t2_misses"] = wrapped_clients.t2.misses
+    return json.dumps(payload, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# Replay orchestration
+# ---------------------------------------------------------------------------
+
+
+async def _run(cfg: ReplayConfig, args: argparse.Namespace) -> int:
+    """Async body of the CLI: opens connections, runs replay, writes report."""
+    logger = logging.getLogger("replay_with_llm")
+    logger.info(
+        "replay starting: %s -> %s, prompt_version=%s, base_portfolio=%s",
+        cfg.start_date, cfg.end_date, cfg.llm_prompt_version,
+        args.base_portfolio,
+    )
+
+    sentiment_conn = open_fixture(cfg.sentiment_fixture_path)
+    try:
+        # Build + wrap tier clients
+        llm_cfg = _replay_config_to_llm_config_dict(cfg)
+        raw_clients = build_tier_clients(llm_cfg)
+        t1_wrapped = (
+            CachedLLMClient(
+                raw_clients.t1,
+                cache_dir=cfg.cache_dir,
+                prompt_version=cfg.llm_prompt_version,
+            )
+            if raw_clients.t1 is not None else None
+        )
+        t2_wrapped = (
+            CachedLLMClient(
+                raw_clients.t2,
+                cache_dir=cfg.cache_dir,
+                prompt_version=cfg.llm_prompt_version,
+            )
+            if raw_clients.t2 is not None else None
+        )
+        # T3 left raw -- run_replay doesn't read clients.t3 today
+        # (Tier-3 pass is a deferred sub-task). Wrapping would add
+        # dead code.
+        wrapped = TierClients(t1=t1_wrapped, t2=t2_wrapped, t3=raw_clients.t3)
+
+        # Open persistence DB
+        cfg.replay_db_path.parent.mkdir(parents=True, exist_ok=True)
+        persistence_conn = init_replay_db(cfg.replay_db_path)
+        try:
+            repo_sha = _git_head_sha()
+            run_id = start_run(
+                persistence_conn, config=cfg, repo_sha=repo_sha,
+            )
+            logger.info(
+                "run_id=%d started (repo_sha=%s, db=%s)",
+                run_id, repo_sha, cfg.replay_db_path,
+            )
+
+            # Construct portfolios
+            llm_portfolio = SimulatedPortfolio(
+                starting_cash=cfg.starting_cash, name="llm",
+            )
+            base_portfolio: SimulatedPortfolio | None = None
+            if args.base_portfolio:
+                base_portfolio = SimulatedPortfolio(
+                    starting_cash=cfg.starting_cash, name="base",
+                )
+
+            # Run replay
+            results = await run_replay(
+                config=cfg,
+                clients=wrapped,
+                sentiment_conn=sentiment_conn,
+                portfolio=llm_portfolio,
+                base_portfolio=base_portfolio,
+                persistence_conn=persistence_conn,
+                run_id=run_id,
+            )
+
+            # Complete run with summary
+            summary = _build_summary_json(results, wrapped)
+            complete_run(
+                persistence_conn, run_id=run_id, summary_json=summary,
+            )
+            logger.info("run_id=%d completed; summary=%s", run_id, summary)
+        finally:
+            persistence_conn.close()
+    finally:
+        sentiment_conn.close()
+
+    # Generate report unless --skip-report
+    if args.skip_report:
+        print(
+            f"Run {run_id} complete; report skipped (--skip-report). "
+            f"Generate later via sim.comparison.generate_report.",
+            file=sys.stderr,
+        )
+    else:
+        report_path = generate_report(
+            db_path=cfg.replay_db_path, run_id=run_id,
+        )
+        # The path goes to stdout so it's pipeable.
+        print(str(report_path))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -232,22 +501,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cfg = args_to_config(args)
 
-    # Always echo the parsed config; this is the M2.1 deliverable.
-    print(json.dumps(config_to_printable(cfg), indent=2, sort_keys=True))
-
     if args.echo_only:
+        print(json.dumps(config_to_printable(cfg), indent=2, sort_keys=True))
         return 0
 
-    # M2.1 scaffolding: the replay loop is not yet implemented. The
-    # CLI returns 0 with a banner so it's usable for config-only
-    # verification. M2.2 replaces this branch with the replay-loop
-    # invocation.
-    print(
-        "\n[M2.1] replay loop not yet implemented; exiting after config "
-        "echo. Use --echo-only to suppress this banner.",
-        file=sys.stderr,
-    )
-    return 0
+    _setup_logging()
+    try:
+        return asyncio.run(_run(cfg, args))
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except (ValueError, NotImplementedError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":
