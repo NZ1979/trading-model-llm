@@ -85,6 +85,7 @@ from data.replay.tick_loop import (
     run_day_t3_ticks,
     run_day_ticks,
 )
+from data.watchlist_builder import read_watchlist_file
 from sim.fills import SimulatedFill
 from sim.portfolio import EquityPoint, SimulatedPortfolio
 from strategy.llm.escalation import EscalationBudget
@@ -283,22 +284,37 @@ async def run_replay(
         gaps.
 
     Raises:
-        NotImplementedError: ``config.tickers == "watchlist"``.
-            Resolve via watchlist_builder before constructing the
-            config (separate sub-task).
         RuntimeError: ``load_market_data`` failed (SPY required;
-            replay unrunnable without it).
+            replay unrunnable without it), or
+            ``config.tickers == "watchlist"`` but
+            ``read_watchlist_file(config.watchlist_path)`` returned
+            ``None`` (missing / malformed / empty watchlist fixture).
         ValueError: ``persistence_conn`` and ``run_id`` not paired
             (exactly one is None). They must both be passed together
             for persistence to be enabled, or both omitted to disable
             it.
     """
+    # Resolve tickers (M2.2 sub-task #25). The "watchlist" literal
+    # reads from a JSON fixture written by main.py's daily refresh;
+    # the staleness check is bypassed because replay runs against
+    # historical bars and the file's recency has no semantic meaning
+    # here. See ReplayConfig.watchlist_path for the file location.
     if config.tickers == "watchlist":
-        raise NotImplementedError(
-            "run_replay: ReplayConfig.tickers='watchlist' resolution "
-            "is a follow-up sub-task. Pass an explicit ticker tuple "
-            "through ReplayConfig.tickers for now."
+        resolved = read_watchlist_file(
+            config.watchlist_path, max_age_days=365 * 100,
         )
+        if not resolved:
+            raise RuntimeError(
+                "run_replay: ReplayConfig.tickers='watchlist' but no "
+                f"valid watchlist found at {config.watchlist_path}. "
+                "Either run the watchlist refresh job to (re)generate "
+                "that file or pass an explicit ticker tuple via "
+                "ReplayConfig.tickers."
+            )
+        tickers: tuple[str, ...] = tuple(resolved)
+    else:
+        tickers = config.tickers_tuple
+
     if (persistence_conn is None) != (run_id is None):
         raise ValueError(
             "run_replay: persistence_conn and run_id must be paired "
@@ -308,7 +324,6 @@ async def run_replay(
         )
     persistence_enabled = persistence_conn is not None and run_id is not None
 
-    tickers = config.tickers_tuple
     days = _trading_days(config.start_date, config.end_date)
 
     logger.info(

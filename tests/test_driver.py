@@ -26,6 +26,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
@@ -312,13 +313,106 @@ def test_trading_days_holiday_only_range_returns_empty():
 
 
 @pytest.mark.asyncio
-async def test_watchlist_literal_raises_not_implemented(monkeypatch):
-    cfg = _config(tickers="watchlist")
-    # No need to set up market mocks; the raise happens before.
-    with pytest.raises(NotImplementedError, match="watchlist"):
+async def test_watchlist_literal_resolves_from_file(monkeypatch):
+    """Patched read_watchlist_file -> tuple flows through to build_day_state.
+
+    The driver's "watchlist" literal resolution reads from
+    config.watchlist_path. We patch read_watchlist_file at the
+    driver's import site (not the watchlist_builder module) so the
+    patched return value drives run_replay's resolution path.
+    (M2.2 sub-task #25.)
+    """
+    cfg = _config(
+        start_date=date(2026, 4, 15), end_date=date(2026, 4, 15),
+        tickers="watchlist",
+    )
+    _install_loader_mocks(monkeypatch)
+
+    captured_tickers: list = []
+
+    async def _fake_build(*, config, trading_date, tickers, market_ctx, sentiment_conn):
+        captured_tickers.append(tuple(tickers))
+        return _day_state(trading_date)
+
+    monkeypatch.setattr(
+        "data.replay.driver.build_day_state", _fake_build
+    )
+    monkeypatch.setattr(
+        "data.replay.driver.read_watchlist_file",
+        lambda path, *, max_age_days: ["AAPL", "NVDA", "TSLA"],
+    )
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn()
+    )
+    assert captured_tickers == [("AAPL", "NVDA", "TSLA")]
+
+
+@pytest.mark.asyncio
+async def test_watchlist_missing_file_raises_runtime_error(monkeypatch):
+    """read_watchlist_file returns None (missing / malformed / stale) ->
+    run_replay raises RuntimeError naming the configured path."""
+    cfg = _config(
+        tickers="watchlist",
+        watchlist_path=Path("/some/missing/path/watchlist.json"),
+    )
+    monkeypatch.setattr(
+        "data.replay.driver.read_watchlist_file",
+        lambda path, *, max_age_days: None,
+    )
+    with pytest.raises(RuntimeError, match=r"watchlist\.json"):
         await run_replay(
             config=cfg, clients=_clients(), sentiment_conn=_conn()
         )
+
+
+@pytest.mark.asyncio
+async def test_explicit_tickers_tuple_skips_watchlist_resolution(monkeypatch):
+    """tickers=tuple -> read_watchlist_file is NOT called."""
+    cfg = _config(
+        start_date=date(2026, 4, 15), end_date=date(2026, 4, 15),
+        tickers=("AAPL",),
+    )
+    _install_loader_mocks(monkeypatch)
+
+    reader_calls: list = []
+
+    def _fake_reader(path, *, max_age_days):
+        reader_calls.append(path)
+        return None  # would-be-fatal if reached
+
+    monkeypatch.setattr(
+        "data.replay.driver.read_watchlist_file", _fake_reader
+    )
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn()
+    )
+    assert reader_calls == []  # never invoked for explicit-tuple tickers
+
+
+@pytest.mark.asyncio
+async def test_watchlist_path_kwarg_threaded_through(monkeypatch):
+    """The configured watchlist_path is the path read_watchlist_file
+    receives -- not the default."""
+    custom_path = Path("config/custom_watchlist.json")
+    cfg = _config(
+        start_date=date(2026, 4, 15), end_date=date(2026, 4, 15),
+        tickers="watchlist", watchlist_path=custom_path,
+    )
+    _install_loader_mocks(monkeypatch)
+
+    captured_paths: list[Path] = []
+
+    def _fake_reader(path, *, max_age_days):
+        captured_paths.append(path)
+        return ["AAPL"]
+
+    monkeypatch.setattr(
+        "data.replay.driver.read_watchlist_file", _fake_reader
+    )
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn()
+    )
+    assert captured_paths == [custom_path]
 
 
 # ===========================================================================

@@ -97,6 +97,17 @@ class ReplayConfig:
     output_dir: Path = Path("docs/reports")
     cache_dir: Path = Path(".replay_cache")
 
+    # ---- Watchlist resolution (M2.2 sub-task #25) ----
+    # When ``tickers == "watchlist"`` the driver reads this JSON file
+    # via ``data.watchlist_builder.read_watchlist_file``. Defaults to
+    # the location main.py's daily 08:30 ET refresh writes to.
+    # ``read_watchlist_file``'s 7-day staleness check is bypassed at
+    # the driver layer because replay runs against historical bars --
+    # the file's recency has no semantic meaning for replay
+    # reproducibility. Generate the file once via the watchlist
+    # refresh job and reuse for any replay against any date range.
+    watchlist_path: Path = Path("config/watchlist_dynamic.json")
+
     def __post_init__(self) -> None:
         if self.end_date < self.start_date:
             raise ValueError(
