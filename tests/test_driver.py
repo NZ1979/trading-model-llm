@@ -546,3 +546,179 @@ async def test_decisions_accumulated_per_day(monkeypatch):
         config=cfg, clients=_clients(), sentiment_conn=_conn()
     )
     assert len(results[0].decisions) == 7
+
+
+# ===========================================================================
+# Fill simulation wiring (M2.2 sub-task #14)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_no_portfolio_yields_empty_fills_and_rejections(monkeypatch):
+    """When portfolio=None (the default), the driver does NOT call the
+    fill simulator and the new DayRunResult fields are empty tuples."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    called: list = []
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        called.append(True)
+        return None  # unreachable -- driver should not call
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_decisions_to_portfolio", _fake_apply
+    )
+
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn()
+    )
+    assert called == []  # never invoked when portfolio is None
+    r = results[0]
+    assert r.fills == ()
+    assert r.rejections == ()
+
+
+@pytest.mark.asyncio
+async def test_portfolio_triggers_fill_simulator_call(monkeypatch):
+    """When a portfolio is passed, apply_decisions_to_portfolio is invoked
+    once per non-skipped day with the correct arguments threaded through."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    from data.replay.fill_simulator import FillSimulationResult
+    captured: list[dict] = []
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        captured.append({
+            "decisions": decisions,
+            "day_state": day_state,
+            "portfolio": portfolio,
+            "config": config,
+        })
+        return FillSimulationResult(fills=(), rejections=())
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_decisions_to_portfolio", _fake_apply
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+    )
+    assert len(captured) == 1
+    call = captured[0]
+    assert call["portfolio"] is pf
+    assert call["config"] is cfg
+    assert call["day_state"].trading_date == date(2026, 4, 15)
+    # decisions should match what run_day_ticks returned (the fake returns 3).
+    assert len(call["decisions"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_fills_and_rejections_propagate_to_dayrunresult(monkeypatch):
+    """A FillSimulationResult with known fills/rejections should land on
+    DayRunResult unchanged."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    from data.replay.fill_simulator import (
+        FillSimulationResult, RejectedEntry,
+    )
+    from sim.fills import SimulatedFill
+
+    fixed_fill = SimulatedFill(
+        ticker="AAPL", side="buy", qty=100, fill_price=100.05,
+        fill_timestamp=datetime(2026, 4, 15, 9, 35, tzinfo=ET),
+        stop_price=98.0, decision_id=1,
+    )
+    fixed_reject = RejectedEntry(
+        tick_et=datetime(2026, 4, 15, 9, 40, tzinfo=ET),
+        ticker="MSFT", side="sell", requested_qty=50,
+        reason="total_exposure_cap_exceeded ($95,000 > $90,000)",
+    )
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        return FillSimulationResult(
+            fills=(fixed_fill,), rejections=(fixed_reject,)
+        )
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_decisions_to_portfolio", _fake_apply
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+    )
+    r = results[0]
+    assert r.fills == (fixed_fill,)
+    assert r.rejections == (fixed_reject,)
+
+
+@pytest.mark.asyncio
+async def test_skipped_day_has_empty_fills_and_rejections(monkeypatch):
+    """build_day_state failure -> the driver never invokes the fill
+    simulator for that day; fills/rejections stay empty."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(
+        monkeypatch,
+        build_day_state_per_day={
+            date(2026, 4, 15): RuntimeError("nothing loadable"),
+        },
+    )
+
+    apply_calls: list = []
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        apply_calls.append(True)
+        from data.replay.fill_simulator import FillSimulationResult
+        return FillSimulationResult(fills=(), rejections=())
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_decisions_to_portfolio", _fake_apply
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+    )
+    assert apply_calls == []
+    assert results[0].skipped is True
+    assert results[0].fills == ()
+    assert results[0].rejections == ()
+
+
+@pytest.mark.asyncio
+async def test_run_day_ticks_failure_skips_fill_simulator(monkeypatch):
+    """run_day_ticks raising -> the driver doesn't call the fill simulator
+    for that day (skipped result has empty fills/rejections)."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(
+        monkeypatch,
+        run_day_ticks_raises=ValueError("simulated bug"),
+    )
+
+    apply_calls: list = []
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        apply_calls.append(True)
+        from data.replay.fill_simulator import FillSimulationResult
+        return FillSimulationResult(fills=(), rejections=())
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_decisions_to_portfolio", _fake_apply
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+    )
+    assert apply_calls == []
+    assert results[0].skipped is True
+    assert results[0].fills == ()
+    assert results[0].rejections == ()

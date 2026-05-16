@@ -66,8 +66,13 @@ import pandas as pd
 
 from data.replay.config import ReplayConfig
 from data.replay.day_state import build_day_state
+from data.replay.fill_simulator import (
+    RejectedEntry,
+    apply_decisions_to_portfolio,
+)
 from data.replay.market_context import load_market_data
 from data.replay.tick_loop import TickDecision, run_day_ticks
+from sim.fills import SimulatedFill
 from sim.portfolio import SimulatedPortfolio
 from strategy.llm.escalation import EscalationBudget
 from strategy.llm.signal_engine import TierClients
@@ -96,6 +101,18 @@ class DayRunResult:
     "the day ran but produced zero decisions" -- both yield empty
     ``decisions`` but only the former should count against
     coverage in the report.
+
+    ``fills`` and ``rejections`` are populated when the caller passes a
+    SimulatedPortfolio AND the day ran successfully. When ``portfolio``
+    is None at the run_replay call (the M2.2 sub-task #13 default
+    pattern, kept for backward compatibility), both tuples are empty
+    and no portfolio mutation happens. ``fills`` covers successful
+    entries; flip-exits are visible on ``portfolio.closed_positions``
+    with ``exit_reason="flip"``. ``rejections`` captures Buy/Sell
+    decisions that did not transact (risk-gate rejection, no next bar
+    at the last tick, etc.) -- structured output rather than logged
+    counts, so the report can break down "decisions that didn't
+    transact" by reason without re-parsing logs.
     """
 
     trading_date: date
@@ -104,6 +121,8 @@ class DayRunResult:
     t2_escalations_used: int = 0
     skipped: bool = False
     skip_reason: str | None = None
+    fills: tuple[SimulatedFill, ...] = ()
+    rejections: tuple[RejectedEntry, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +267,24 @@ async def run_replay(
             )
             continue
 
+        # Fill simulation: convert decisions to portfolio mutations when
+        # the caller supplied a SimulatedPortfolio. With no portfolio
+        # (the M2.2 #13 default pattern), fills + rejections remain
+        # empty -- backward-compatible with tests that don't yet wire
+        # a portfolio.
+        if portfolio is not None:
+            fill_result = apply_decisions_to_portfolio(
+                decisions=decisions,
+                day_state=day_state,
+                portfolio=portfolio,
+                config=config,
+            )
+            fills_t = fill_result.fills
+            rejections_t = fill_result.rejections
+        else:
+            fills_t = ()
+            rejections_t = ()
+
         results.append(
             DayRunResult(
                 trading_date=trading_date,
@@ -256,13 +293,15 @@ async def run_replay(
                 t2_escalations_used=budget.used,
                 skipped=False,
                 skip_reason=None,
+                fills=fills_t,
+                rejections=rejections_t,
             )
         )
         logger.info(
             "run_replay: %s complete, %d decisions, %d failed ticker(s), "
-            "%d escalation(s) used",
+            "%d escalation(s) used, %d fill(s), %d rejection(s)",
             trading_date, len(decisions), len(day_state.failed_tickers),
-            budget.used,
+            budget.used, len(fills_t), len(rejections_t),
         )
 
     return results
