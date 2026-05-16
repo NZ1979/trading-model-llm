@@ -63,13 +63,19 @@ Status: M2.2 sub-task #12 -- fully implemented.
 """
 from __future__ import annotations
 
+import logging
+import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+
+from analysis.indicators import compute_intraday_indicators, generate_signal
 from data.replay.config import ReplayConfig
-from data.replay.day_state import DayState
+from data.replay.day_state import DayState, TickerDayState
+from data.replay.historical_sentiment import latest_sentiment
 from data.replay.market_context import MarketContextBundle
 from data.replay.pre_filter import pre_filter_candidates
 from data.replay.tick_context import build_tick_context
@@ -77,9 +83,15 @@ from sim.portfolio import SimulatedPortfolio
 from strategy.llm.escalation import EscalationBudget
 from strategy.llm.signal_engine import TierClients, evaluate
 from strategy.llm.types import LLMDecision
+from strategy.signal_engine import TradeDecision, evaluate_trade
+
+
+logger = logging.getLogger(__name__)
 
 
 ET = ZoneInfo("America/New_York")
+RTH_OPEN = time(9, 30)
+RTH_CLOSE = time(16, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -289,11 +301,214 @@ async def run_day_ticks(
     return decisions
 
 
+# ===========================================================================
+# Base-strategy parallel evaluation (M2.2 sub-task #17)
+# ===========================================================================
+#
+# The base rule-based pass mirrors the live ``main.py`` evaluation loop:
+# every ticker, every 5-min tick, no pre-filter. It feeds the SAME
+# ``apply_day_to_portfolio`` machinery the LLM side uses by emitting
+# ``TickDecision`` rows whose ``LLMDecision`` payload is adapted from
+# ``TradeDecision``. The fill simulator can't tell the difference -- it
+# reads action / confidence / setup_label / reasoning, all of which the
+# adapter populates from the base ``TradeDecision`` shape.
+#
+# Synchronous (no network I/O); the driver calls it directly without
+# ``await``.
+
+
+def _build_today_5min_indicators(
+    tds: TickerDayState, trading_date: date
+) -> pd.DataFrame:
+    """Resample minute_bars to RTH 5-min + add intraday indicator columns.
+
+    Indicators (SMA, EMA, RSI, MACD, ADX, VWAP, BBands) are backward-
+    looking and emit NaN until their warmup period elapses; computing
+    them once on the full day's frame is equivalent to recomputing them
+    on each tick's prefix slice, which is the efficiency win this
+    cache buys.
+
+    Returns the same shape as ``fill_simulator._build_today_5min`` plus
+    the indicator columns ``compute_intraday_indicators`` adds. An
+    empty DataFrame (no RTH bars on trading_date) returns the same
+    empty shape.
+    """
+    if tds.minute_bars.empty:
+        return tds.minute_bars.iloc[0:0]
+    same_date = tds.minute_bars.index.date == trading_date
+    bars_time = tds.minute_bars.index.time
+    rth_mask = (bars_time >= RTH_OPEN) & (bars_time < RTH_CLOSE)
+    one_min = tds.minute_bars[same_date & rth_mask]
+    if one_min.empty:
+        return one_min.iloc[0:0]
+    five_min = one_min.resample(
+        "5min", label="left", closed="left", origin="start_day"
+    ).agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+    ).dropna(how="all")
+    if five_min.empty:
+        return five_min
+    return compute_intraday_indicators(five_min, rth_only=False)
+
+
+def _trade_to_llm_decision(td: TradeDecision) -> LLMDecision:
+    """Adapt a base TradeDecision to an LLMDecision-shape for the fill simulator.
+
+    The fill simulator (``apply_day_to_portfolio``) reads only
+    ``action`` / ``confidence`` / ``setup_label`` / ``reasoning`` from
+    the decision payload; everything else is LLM-tier metadata the
+    base pass doesn't have. The adapter maps:
+
+    - ``TradeDecision.action`` -> ``LLMDecision.action`` (same enum).
+    - ``TradeDecision.technical_confidence`` -> ``LLMDecision.confidence``.
+    - ``TradeDecision.setup`` -> ``LLMDecision.setup_label`` (truncated
+      to 50 chars per the pydantic schema's ``max_length=50``).
+    - ``TradeDecision.reasons`` -> ``LLMDecision.reasoning`` joined
+      with "; " and truncated to 280 chars (the schema cap).
+
+    The pydantic defaults for ``stop_loss_atr_multiple``,
+    ``take_profit_atr_multiple``, ``time_horizon``, and the forward-
+    prediction fields land at their declared defaults -- the base
+    strategy doesn't predict take-profit or time horizon, so the
+    defaults are the right "no-prediction" sentinels for the
+    comparison report.
+    """
+    setup_label = (td.setup or "none")[:50]
+    reasoning = "; ".join(td.reasons) if td.reasons else "no_reasons"
+    reasoning = reasoning[:280]
+    return LLMDecision(
+        action=td.action,
+        confidence=int(td.technical_confidence),
+        setup_label=setup_label,
+        reasoning=reasoning,
+    )
+
+
+def run_day_base_ticks(
+    *,
+    day_state: DayState,
+    config: ReplayConfig,
+    sentiment_conn: sqlite3.Connection,
+    portfolio: SimulatedPortfolio | None = None,
+) -> list[TickDecision]:
+    """Run the 78-tick base rule-based evaluation pass for one trading day.
+
+    For each of the 78 canonical 5-min ticks (09:30..15:55 ET) and
+    every ticker in ``day_state.tickers``:
+
+    1. Resample minute_bars to 5-min RTH with intraday indicators
+       (cached per ticker per day -- one resample + one indicator
+       pass per ticker regardless of tick count).
+    2. Slice the indicator frame up to and including ``tick_et``
+       (point-in-time correct: no peeking at future bars beyond the
+       tick that just fired).
+    3. ``generate_signal(intraday_df, daily_ctx, premarket_ctx)``
+       returns a ``TechnicalSignal``.
+    4. ``latest_sentiment(sentiment_conn, ticker, tick_et)`` returns
+       the most-recent sentiment score (or None) within the live
+       default 3600s freshness window.
+    5. ``evaluate_trade(ticker, sentiment, technical_signal,
+       futures_walls=None,
+       require_walls_for_pullback=config.base_require_walls_for_pullback)``
+       returns a ``TradeDecision``. Walls are always None in replay
+       (Databento canceled, PROJECT_BLUEPRINT § Vendor stack).
+    6. Adapt ``TradeDecision`` -> ``LLMDecision`` via
+       ``_trade_to_llm_decision``, wrap in ``TickDecision``, append.
+
+    NO pre-filter is applied -- base evaluation runs on every ticker
+    every tick, per the design doc § Pre-filter: "the base codebase's
+    signal engine evaluates ALL watchlist tickers every tick. To make
+    the comparison fair, we run base evaluation on every ticker too
+    -- only the LLM evaluation is gated by the pre-filter."
+
+    Args:
+        day_state: per-day bundle from ``build_day_state``.
+        config: full ReplayConfig. Reads
+            ``base_require_walls_for_pullback``.
+        sentiment_conn: open historical-sentiment fixture (the SAME
+            connection the LLM pass uses; one DB, two readers).
+        portfolio: optional ``SimulatedPortfolio`` (read-only). The
+            base pass does NOT use a pre-filter holding gate -- the
+            base side evaluates regardless of current position; the
+            fill simulator's transition table handles the no-op /
+            flip cases. The arg is reserved here for symmetry with
+            ``run_day_ticks`` and for future use if the base pass ever
+            wants position context.
+
+    Returns:
+        ``list[TickDecision]`` in (tick_et, ticker-order-of-day_state.tickers)
+        order. Empty when ``day_state.tickers`` is empty. The order
+        matches what ``apply_day_to_portfolio`` expects (chronological,
+        with ties broken by input order at the same tick).
+
+    Side effects: queries ``sentiment_conn`` (read-only via
+    ``latest_sentiment``). Does NOT mutate ``portfolio``.
+
+    Never raises on normal data shape. Per-ticker failures (empty
+    bars, indicator NaN, etc.) degrade visibly: the technical signal
+    returns Hold and the loop continues.
+    """
+    decisions: list[TickDecision] = []
+    indicator_cache: dict[str, pd.DataFrame] = {}
+
+    # Iterate the canonical 78 ticks (same as run_day_ticks).
+    for tick_et in tick_times_for_day(day_state.trading_date):
+        for ticker, tds in day_state.tickers.items():
+            # Build / look up the indicator-augmented 5-min frame.
+            if ticker not in indicator_cache:
+                indicator_cache[ticker] = _build_today_5min_indicators(
+                    tds, day_state.trading_date
+                )
+            five_min = indicator_cache[ticker]
+            # Point-in-time slice: bars at or before this tick.
+            if not five_min.empty:
+                tick_ts = pd.Timestamp(tick_et)
+                intraday_df = five_min[five_min.index <= tick_ts]
+            else:
+                intraday_df = five_min
+
+            tech = generate_signal(
+                intraday_df,
+                tds.daily_context,
+                tds.premarket_context,
+            )
+
+            sentiment_score = latest_sentiment(
+                sentiment_conn, ticker, tick_et,
+            )
+
+            trade = evaluate_trade(
+                ticker=ticker,
+                sentiment_score=sentiment_score,
+                technical_signal=tech,
+                futures_walls=None,
+                require_walls_for_pullback=(
+                    config.base_require_walls_for_pullback
+                ),
+            )
+            decisions.append(
+                TickDecision(
+                    tick_et=tick_et,
+                    ticker=ticker,
+                    decision=_trade_to_llm_decision(trade),
+                )
+            )
+
+    return decisions
+
+
 __all__ = [
     "PRIOR_DECISIONS_TAIL",
     "TICKS_PER_DAY",
     "TICK_INTERVAL_MINUTES",
     "TickDecision",
+    "run_day_base_ticks",
     "run_day_ticks",
     "tick_times_for_day",
 ]

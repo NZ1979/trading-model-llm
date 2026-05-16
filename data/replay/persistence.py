@@ -250,6 +250,7 @@ def write_day_results(
     run_id: int,
     day_result: DayRunResult,
     llm_portfolio: SimulatedPortfolio,
+    base_portfolio: SimulatedPortfolio | None = None,
 ) -> None:
     """Write one day's decisions / fills / rejections / equity curve.
 
@@ -257,33 +258,41 @@ def write_day_results(
     transaction) so the day either lands fully or not at all. Skipped
     days are a no-op -- absence of rows is the signal.
 
-    The writer:
+    For each portfolio side (LLM always; base when ``base_portfolio`` is
+    supplied), the writer:
 
-    1. Inserts each ``TickDecision`` into ``replay_decisions`` (always
-       ``decision_source='live_merged'`` for now; later sub-tasks add
-       per-tier and base-strategy rows). Captures a map from per-day
-       decision_id (the input-list index + ``decision_id_start``,
-       which defaults to 1) to the global ``replay_decisions.id``.
+    1. Inserts each ``TickDecision`` into ``replay_decisions`` with the
+       appropriate ``decision_source`` ('live_merged' for LLM, 'base'
+       for the base rule-based pass). Captures a per-side per-day
+       decision_id -> global ``replay_decisions.id`` map.
     2. Inserts each ``RejectedEntry`` into ``replay_rejections`` with
-       its decision_id resolved through the map.
-    3. Iterates ``llm_portfolio.closed_positions`` filtered to those
-       with ``entry_timestamp.date() == trading_date``. For each,
-       writes one ``replay_fills`` row with entry + exit columns
-       populated. Multi-day positions (entry on prior day) are
-       skipped with a WARNING -- they shouldn't exist with EOD
-       flatten, but the guard is defensive (Rule 18 visible
-       degradation rather than silent drop).
-    4. Inserts each ``EquityPoint`` from ``day_result.equity_curve``
-       into ``replay_equity_curve`` with ``portfolio_name='llm'``.
-       Two-points-at-15:55 (pre + post EOD-flatten) both land; the
-       table's autoincrement ``id`` preserves ordinal sequence.
+       its decision_id resolved through that side's map.
+    3. Iterates the side's portfolio's ``closed_positions`` filtered to
+       those with ``entry_timestamp.date() == trading_date``. Writes
+       one ``replay_fills`` row per Position with entry + exit columns
+       populated. Multi-day positions (entry on prior day) are skipped
+       with a WARNING -- they shouldn't exist with EOD flatten, but
+       the guard is defensive (Rule 18 visible degradation).
+    4. Iterates the side's portfolio's still-``positions`` (open at
+       write time, entry today). Defensive non-flatten branch: writes
+       a row with NULL exit columns.
+    5. Inserts each ``EquityPoint`` from the side's equity curve into
+       ``replay_equity_curve`` with the appropriate ``portfolio_name``
+       ('llm' / 'base'). The autoincrement ``id`` preserves the
+       chronological order even when two points share a timestamp
+       (e.g. pre + post EOD-flatten at 15:55).
 
     Args:
         conn: opened by ``init_replay_db``.
         run_id: from ``start_run``.
-        day_result: the ``DayRunResult`` for one trading day.
-        llm_portfolio: the same ``SimulatedPortfolio`` that produced
-            ``day_result``'s fills/exits.
+        day_result: the ``DayRunResult`` for one trading day. Provides
+            both LLM and base decisions / rejections / equity-curve
+            sequences via its parallel field sets.
+        llm_portfolio: the LLM-side ``SimulatedPortfolio``.
+        base_portfolio: optional base-strategy ``SimulatedPortfolio``.
+            When provided, the base side's rows are written in the
+            same transaction. Default ``None`` keeps backward
+            compatibility with pre-#17 callers.
 
     Side effects: writes to all five tables (zero rows for empty
     days). No return value.
@@ -294,143 +303,173 @@ def write_day_results(
     trading_date_str = day_result.trading_date.isoformat()
 
     with conn:
-        # 1) Decisions -- always 'live_merged' source for now.
-        per_day_to_global: dict[int, int] = {}
-        for idx, td in enumerate(day_result.decisions):
-            per_day_id = idx + 1  # mirrors apply_day_to_portfolio's default decision_id_start
-            cur = conn.execute(
-                "INSERT INTO replay_decisions "
-                "(run_id, trading_date, tick_et, ticker, decision_source, "
-                " action, setup_label, confidence, reasoning) "
-                "VALUES (?, ?, ?, ?, 'live_merged', ?, ?, ?, ?)",
-                (
-                    run_id,
-                    trading_date_str,
-                    td.tick_et.isoformat(),
-                    td.ticker,
-                    td.decision.action,
-                    td.decision.setup_label,
-                    td.decision.confidence,
-                    td.decision.reasoning,
-                ),
-            )
-            global_id = cur.lastrowid
-            assert global_id is not None
-            per_day_to_global[per_day_id] = global_id
+        # LLM side -- always written (the only side that existed pre-#17).
+        _write_portfolio_side(
+            conn,
+            run_id=run_id,
+            trading_date_str=trading_date_str,
+            trading_date=day_result.trading_date,
+            decisions=day_result.decisions,
+            rejections=day_result.rejections,
+            equity_curve=day_result.equity_curve,
+            portfolio=llm_portfolio,
+            decision_source="live_merged",
+            portfolio_name="llm",
+        )
 
-        # 2) Rejections -- FK back to decision via the per-day map.
-        for rj in day_result.rejections:
-            global_decision_id = per_day_to_global.get(rj.decision_id)
-            if global_decision_id is None:
-                logger.warning(
-                    "write_day_results: rejection has unmatched decision_id=%d "
-                    "(ticker=%s, tick=%s); skipping row",
-                    rj.decision_id, rj.ticker, rj.tick_et,
-                )
-                continue
-            conn.execute(
-                "INSERT INTO replay_rejections "
-                "(run_id, decision_id, ticker, side, requested_qty, reason) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    run_id,
-                    global_decision_id,
-                    rj.ticker,
-                    rj.side,
-                    rj.requested_qty,
-                    rj.reason,
-                ),
+        # Base side -- written only when base_portfolio is supplied.
+        # Same transaction so a base-write failure rolls back the LLM
+        # side too (atomic per-day semantics).
+        if base_portfolio is not None:
+            _write_portfolio_side(
+                conn,
+                run_id=run_id,
+                trading_date_str=trading_date_str,
+                trading_date=day_result.trading_date,
+                decisions=day_result.base_decisions,
+                rejections=day_result.base_rejections,
+                equity_curve=day_result.base_equity_curve,
+                portfolio=base_portfolio,
+                decision_source="base",
+                portfolio_name="base",
             )
 
-        # 3) Fills -- one row per Position closed today (entry on
-        # day_result.trading_date). Exit columns populated from the
-        # Position's exit_* fields.
-        for pos in llm_portfolio.closed_positions:
-            if pos.entry_timestamp.date() != day_result.trading_date:
-                continue
-            global_decision_id = per_day_to_global.get(pos.decision_id)
-            if global_decision_id is None:
-                logger.warning(
-                    "write_day_results: fill has unmatched decision_id=%d "
-                    "(ticker=%s, entry=%s); skipping row",
-                    pos.decision_id, pos.ticker, pos.entry_timestamp,
-                )
-                continue
-            conn.execute(
-                "INSERT INTO replay_fills "
-                "(run_id, decision_id, ticker, side, qty, fill_price, "
-                " fill_timestamp, stop_price, exit_timestamp, exit_price, "
-                " exit_reason, realized_pl) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    run_id,
-                    global_decision_id,
-                    pos.ticker,
-                    pos.side,
-                    pos.qty,
-                    pos.entry_price,
-                    pos.entry_timestamp.isoformat(),
-                    pos.stop_price,
-                    pos.exit_timestamp.isoformat()
-                    if pos.exit_timestamp is not None
-                    else None,
-                    pos.exit_price,
-                    pos.exit_reason,
-                    pos.realized_pl,
-                ),
-            )
 
-        # Also handle any STILL-open positions whose entry was today.
-        # Post-EOD-flatten there should be none, but defensive: if the
-        # caller ran the day without flatten (or there's a bug), we
-        # still record the entry side with NULL exits so the data is
-        # captured.
-        for ticker, pos in llm_portfolio.positions.items():
-            if not pos.is_open:
-                continue
-            if pos.entry_timestamp.date() != day_result.trading_date:
-                continue
-            global_decision_id = per_day_to_global.get(pos.decision_id)
-            if global_decision_id is None:
-                logger.warning(
-                    "write_day_results: open fill has unmatched "
-                    "decision_id=%d (ticker=%s); skipping row",
-                    pos.decision_id, ticker,
-                )
-                continue
-            conn.execute(
-                "INSERT INTO replay_fills "
-                "(run_id, decision_id, ticker, side, qty, fill_price, "
-                " fill_timestamp, stop_price, exit_timestamp, exit_price, "
-                " exit_reason, realized_pl) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)",
-                (
-                    run_id,
-                    global_decision_id,
-                    pos.ticker,
-                    pos.side,
-                    pos.qty,
-                    pos.entry_price,
-                    pos.entry_timestamp.isoformat(),
-                    pos.stop_price,
-                ),
-            )
+def _write_portfolio_side(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    trading_date_str: str,
+    trading_date,  # datetime.date  -- avoid extra import at module top
+    decisions,
+    rejections,
+    equity_curve,
+    portfolio: SimulatedPortfolio,
+    decision_source: str,
+    portfolio_name: str,
+) -> None:
+    """Write one portfolio side's rows under an open transaction.
 
-        # 4) Equity curve.
-        for pt in day_result.equity_curve:
-            conn.execute(
-                "INSERT INTO replay_equity_curve "
-                "(run_id, portfolio_name, bar_et, equity, cash, "
-                " n_open_positions) "
-                "VALUES (?, 'llm', ?, ?, ?, ?)",
-                (
-                    run_id,
-                    pt.timestamp.isoformat(),
-                    pt.equity,
-                    pt.cash,
-                    pt.n_open_positions,
-                ),
+    Called by ``write_day_results`` once for the LLM side and (when
+    enabled) once for the base side. Schema is the same for both --
+    only ``decision_source`` and ``portfolio_name`` differ. Each side
+    builds its own per-day -> global decision_id map so the FK
+    linkage is unambiguous even though both sides use per-day
+    decision_id sequences starting at 1.
+    """
+    # 1) Decisions
+    per_day_to_global: dict[int, int] = {}
+    for idx, td in enumerate(decisions):
+        per_day_id = idx + 1
+        cur = conn.execute(
+            "INSERT INTO replay_decisions "
+            "(run_id, trading_date, tick_et, ticker, decision_source, "
+            " action, setup_label, confidence, reasoning) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                trading_date_str,
+                td.tick_et.isoformat(),
+                td.ticker,
+                decision_source,
+                td.decision.action,
+                td.decision.setup_label,
+                td.decision.confidence,
+                td.decision.reasoning,
+            ),
+        )
+        global_id = cur.lastrowid
+        assert global_id is not None
+        per_day_to_global[per_day_id] = global_id
+
+    # 2) Rejections
+    for rj in rejections:
+        global_decision_id = per_day_to_global.get(rj.decision_id)
+        if global_decision_id is None:
+            logger.warning(
+                "write_day_results[%s]: rejection has unmatched "
+                "decision_id=%d (ticker=%s, tick=%s); skipping row",
+                portfolio_name, rj.decision_id, rj.ticker, rj.tick_et,
             )
+            continue
+        conn.execute(
+            "INSERT INTO replay_rejections "
+            "(run_id, decision_id, ticker, side, requested_qty, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_id, global_decision_id, rj.ticker,
+                rj.side, rj.requested_qty, rj.reason,
+            ),
+        )
+
+    # 3) Fills -- closed positions opened today
+    for pos in portfolio.closed_positions:
+        if pos.entry_timestamp.date() != trading_date:
+            continue
+        global_decision_id = per_day_to_global.get(pos.decision_id)
+        if global_decision_id is None:
+            logger.warning(
+                "write_day_results[%s]: fill has unmatched decision_id=%d "
+                "(ticker=%s, entry=%s); skipping row",
+                portfolio_name, pos.decision_id,
+                pos.ticker, pos.entry_timestamp,
+            )
+            continue
+        conn.execute(
+            "INSERT INTO replay_fills "
+            "(run_id, decision_id, ticker, side, qty, fill_price, "
+            " fill_timestamp, stop_price, exit_timestamp, exit_price, "
+            " exit_reason, realized_pl) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id, global_decision_id, pos.ticker, pos.side, pos.qty,
+                pos.entry_price, pos.entry_timestamp.isoformat(),
+                pos.stop_price,
+                pos.exit_timestamp.isoformat()
+                if pos.exit_timestamp is not None else None,
+                pos.exit_price, pos.exit_reason, pos.realized_pl,
+            ),
+        )
+
+    # Defensive: still-open positions whose entry was today
+    for ticker, pos in portfolio.positions.items():
+        if not pos.is_open:
+            continue
+        if pos.entry_timestamp.date() != trading_date:
+            continue
+        global_decision_id = per_day_to_global.get(pos.decision_id)
+        if global_decision_id is None:
+            logger.warning(
+                "write_day_results[%s]: open fill has unmatched "
+                "decision_id=%d (ticker=%s); skipping row",
+                portfolio_name, pos.decision_id, ticker,
+            )
+            continue
+        conn.execute(
+            "INSERT INTO replay_fills "
+            "(run_id, decision_id, ticker, side, qty, fill_price, "
+            " fill_timestamp, stop_price, exit_timestamp, exit_price, "
+            " exit_reason, realized_pl) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)",
+            (
+                run_id, global_decision_id, pos.ticker,
+                pos.side, pos.qty, pos.entry_price,
+                pos.entry_timestamp.isoformat(), pos.stop_price,
+            ),
+        )
+
+    # 4) Equity curve
+    for pt in equity_curve:
+        conn.execute(
+            "INSERT INTO replay_equity_curve "
+            "(run_id, portfolio_name, bar_et, equity, cash, "
+            " n_open_positions) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_id, portfolio_name, pt.timestamp.isoformat(),
+                pt.equity, pt.cash, pt.n_open_positions,
+            ),
+        )
 
 
 def complete_run(

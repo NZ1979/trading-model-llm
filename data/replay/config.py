@@ -77,6 +77,14 @@ class ReplayConfig:
     fill_at: Literal["next_bar_open", "current_close"] = "next_bar_open"
     news_lag_seconds: int = 30
 
+    # ---- Base-strategy parallel evaluation (M2.2 sub-task #17) ----
+    # Mirrors live ``config.signals.require_walls_for_pullback``. Default
+    # False because futures walls are dormant in the LLM-fork's deploy
+    # stack (Databento was canceled per PROJECT_BLUEPRINT.md § Vendor stack);
+    # this matches what live actually runs. Flip to True for the
+    # original-spec strict mode in ablation runs.
+    base_require_walls_for_pullback: bool = False
+
     # ---- Data sources ----
     # Rule 26: harness reads sentiment from this one-time export fixture,
     # NOT from trader-prod's live DB. See data/replay/fixtures/README.md

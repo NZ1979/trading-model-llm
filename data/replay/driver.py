@@ -67,6 +67,7 @@ import pandas as pd
 from data.replay.config import ReplayConfig
 from data.replay.day_state import build_day_state
 from data.replay.fill_simulator import (
+    DayApplicationResult,
     EodExit,
     RejectedEntry,
     StopOut,
@@ -74,7 +75,7 @@ from data.replay.fill_simulator import (
 )
 from data.replay.market_context import load_market_data
 from data.replay.persistence import write_day_results
-from data.replay.tick_loop import TickDecision, run_day_ticks
+from data.replay.tick_loop import TickDecision, run_day_base_ticks, run_day_ticks
 from sim.fills import SimulatedFill
 from sim.portfolio import EquityPoint, SimulatedPortfolio
 from strategy.llm.escalation import EscalationBudget
@@ -145,6 +146,17 @@ class DayRunResult:
     stop_outs: tuple[StopOut, ...] = ()
     eod_exits: tuple[EodExit, ...] = ()
     equity_curve: tuple[EquityPoint, ...] = ()
+    # Base-strategy parallel evaluation (M2.2 sub-task #17). All six
+    # base_* fields default to empty: when run_replay is called without
+    # base_portfolio, the base pass is skipped entirely and these stay
+    # empty -- backward-compatible with every test that doesn't wire
+    # a base portfolio.
+    base_decisions: list[TickDecision] = field(default_factory=list)
+    base_fills: tuple[SimulatedFill, ...] = ()
+    base_rejections: tuple[RejectedEntry, ...] = ()
+    base_stop_outs: tuple[StopOut, ...] = ()
+    base_eod_exits: tuple[EodExit, ...] = ()
+    base_equity_curve: tuple[EquityPoint, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +191,7 @@ async def run_replay(
     clients: TierClients,
     sentiment_conn: sqlite3.Connection,
     portfolio: SimulatedPortfolio | None = None,
+    base_portfolio: SimulatedPortfolio | None = None,
     persistence_conn: sqlite3.Connection | None = None,
     run_id: int | None = None,
 ) -> list[DayRunResult]:
@@ -267,7 +280,10 @@ async def run_replay(
         Fills are written from ``portfolio.closed_positions``; without
         a portfolio there is no fill data to persist, so persistence
         only fires when both ``persistence_enabled`` and ``portfolio``
-        are set.
+        are set. When ``base_portfolio`` is also set, base-side
+        decisions / fills / equity points are written in the same
+        transaction with ``decision_source='base'`` and
+        ``portfolio_name='base'``.
         """
         if not persistence_enabled or portfolio is None:
             return
@@ -276,6 +292,7 @@ async def run_replay(
             run_id=run_id,  # type: ignore[arg-type]
             day_result=day_result,
             llm_portfolio=portfolio,
+            base_portfolio=base_portfolio,
         )
 
     results: list[DayRunResult] = []
@@ -332,29 +349,59 @@ async def run_replay(
             _persist(skipped_result)
             continue
 
-        # Fill + stop + MTM + EOD-flatten simulation when the caller
-        # supplied a SimulatedPortfolio. With no portfolio (the M2.2
-        # #13 default pattern), all five new tuples remain empty --
-        # backward-compatible with tests that don't yet wire a
-        # portfolio.
+        # LLM-side fill + stop + MTM + EOD-flatten simulation when the
+        # caller supplied a SimulatedPortfolio. With no portfolio (the
+        # M2.2 #13 default pattern), all five LLM-side tuples remain
+        # empty.
         if portfolio is not None:
-            day_result = apply_day_to_portfolio(
+            llm_day_app = apply_day_to_portfolio(
                 decisions=decisions,
                 day_state=day_state,
                 portfolio=portfolio,
                 config=config,
             )
-            fills_t = day_result.fills
-            rejections_t = day_result.rejections
-            stop_outs_t = day_result.stop_outs
-            eod_exits_t = day_result.eod_exits
-            equity_curve_t = day_result.equity_curve
+            fills_t = llm_day_app.fills
+            rejections_t = llm_day_app.rejections
+            stop_outs_t = llm_day_app.stop_outs
+            eod_exits_t = llm_day_app.eod_exits
+            equity_curve_t = llm_day_app.equity_curve
         else:
             fills_t = ()
             rejections_t = ()
             stop_outs_t = ()
             eod_exits_t = ()
             equity_curve_t = ()
+
+        # Base-strategy parallel evaluation (M2.2 sub-task #17). Runs
+        # only when base_portfolio is set; emits its own decisions via
+        # run_day_base_ticks (no pre-filter, every ticker every tick),
+        # then drives the SAME apply_day_to_portfolio against the base
+        # portfolio so stops + EOD flatten + MTM apply symmetrically.
+        if base_portfolio is not None:
+            base_decisions = run_day_base_ticks(
+                day_state=day_state,
+                config=config,
+                sentiment_conn=sentiment_conn,
+                portfolio=base_portfolio,
+            )
+            base_day_app: DayApplicationResult = apply_day_to_portfolio(
+                decisions=base_decisions,
+                day_state=day_state,
+                portfolio=base_portfolio,
+                config=config,
+            )
+            base_fills_t = base_day_app.fills
+            base_rejections_t = base_day_app.rejections
+            base_stop_outs_t = base_day_app.stop_outs
+            base_eod_exits_t = base_day_app.eod_exits
+            base_equity_curve_t = base_day_app.equity_curve
+        else:
+            base_decisions = []
+            base_fills_t = ()
+            base_rejections_t = ()
+            base_stop_outs_t = ()
+            base_eod_exits_t = ()
+            base_equity_curve_t = ()
 
         day_result = DayRunResult(
             trading_date=trading_date,
@@ -368,16 +415,28 @@ async def run_replay(
             stop_outs=stop_outs_t,
             eod_exits=eod_exits_t,
             equity_curve=equity_curve_t,
+            base_decisions=base_decisions,
+            base_fills=base_fills_t,
+            base_rejections=base_rejections_t,
+            base_stop_outs=base_stop_outs_t,
+            base_eod_exits=base_eod_exits_t,
+            base_equity_curve=base_equity_curve_t,
         )
         results.append(day_result)
         _persist(day_result)
         logger.info(
-            "run_replay: %s complete, %d decisions, %d failed ticker(s), "
-            "%d escalation(s) used, %d fill(s), %d rejection(s), "
-            "%d stop-out(s), %d eod exit(s), %d equity point(s)",
-            trading_date, len(decisions), len(day_state.failed_tickers),
-            budget.used, len(fills_t), len(rejections_t),
-            len(stop_outs_t), len(eod_exits_t), len(equity_curve_t),
+            "run_replay: %s complete, %d llm decisions / %d base decisions, "
+            "%d failed ticker(s), %d escalation(s), "
+            "%d llm fills (%d stops, %d eod) / %d base fills (%d stops, %d eod), "
+            "%d llm rejections / %d base rejections, "
+            "%d llm equity pts / %d base equity pts",
+            trading_date,
+            len(decisions), len(base_decisions),
+            len(day_state.failed_tickers), budget.used,
+            len(fills_t), len(stop_outs_t), len(eod_exits_t),
+            len(base_fills_t), len(base_stop_outs_t), len(base_eod_exits_t),
+            len(rejections_t), len(base_rejections_t),
+            len(equity_curve_t), len(base_equity_curve_t),
         )
 
     return results

@@ -912,7 +912,7 @@ async def test_persistence_disabled_no_writes(monkeypatch):
 
     write_calls: list = []
 
-    def _fake_write(conn, *, run_id, day_result, llm_portfolio):
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None):
         write_calls.append((run_id, day_result.trading_date))
 
     monkeypatch.setattr(
@@ -957,7 +957,7 @@ async def test_persistence_enabled_calls_writer_per_day(monkeypatch):
 
     write_calls: list[dict] = []
 
-    def _fake_write(conn, *, run_id, day_result, llm_portfolio):
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None):
         write_calls.append({
             "conn": conn,
             "run_id": run_id,
@@ -998,7 +998,7 @@ async def test_persistence_skipped_day_still_calls_writer(monkeypatch):
 
     write_calls: list = []
 
-    def _fake_write(conn, *, run_id, day_result, llm_portfolio):
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None):
         write_calls.append(day_result.skipped)
 
     monkeypatch.setattr(
@@ -1028,7 +1028,7 @@ async def test_persistence_without_portfolio_no_writes(monkeypatch):
 
     write_calls: list = []
 
-    def _fake_write(conn, *, run_id, day_result, llm_portfolio):
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None):
         write_calls.append(True)
 
     monkeypatch.setattr(
@@ -1043,3 +1043,221 @@ async def test_persistence_without_portfolio_no_writes(monkeypatch):
         run_id=1,
     )
     assert write_calls == []
+
+
+# ===========================================================================
+# Base-strategy parallel evaluation (M2.2 sub-task #17)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_base_pass_skipped_when_base_portfolio_none(monkeypatch):
+    """Default behavior: base_portfolio=None -> run_day_base_ticks NOT called,
+    DayRunResult.base_* fields stay empty."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    base_calls: list = []
+
+    def _fake_base(*, day_state, config, sentiment_conn, portfolio):
+        base_calls.append(True)
+        return []
+
+    monkeypatch.setattr(
+        "data.replay.driver.run_day_base_ticks", _fake_base
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+        # base_portfolio=None default -> base pass skipped
+    )
+    assert base_calls == []
+    r = results[0]
+    assert r.base_decisions == []
+    assert r.base_fills == ()
+    assert r.base_rejections == ()
+    assert r.base_stop_outs == ()
+    assert r.base_eod_exits == ()
+    assert r.base_equity_curve == ()
+
+
+@pytest.mark.asyncio
+async def test_base_pass_runs_when_base_portfolio_set(monkeypatch):
+    """base_portfolio set -> run_day_base_ticks called once per non-skipped day."""
+    cfg = _config()  # 5 weekdays
+    _install_loader_mocks(monkeypatch)
+
+    base_calls: list = []
+
+    def _fake_base(*, day_state, config, sentiment_conn, portfolio):
+        base_calls.append({
+            "trading_date": day_state.trading_date,
+            "portfolio": portfolio,
+        })
+        return _tick_decisions(day_state.trading_date, n=2)
+
+    monkeypatch.setattr(
+        "data.replay.driver.run_day_base_ticks", _fake_base
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    base_pf = SimulatedPortfolio(starting_cash=50_000.0)
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf, base_portfolio=base_pf,
+    )
+    assert len(base_calls) == 5
+    assert all(c["portfolio"] is base_pf for c in base_calls)
+
+
+@pytest.mark.asyncio
+async def test_base_pass_drives_apply_day_to_portfolio_separately(monkeypatch):
+    """With base_portfolio set, apply_day_to_portfolio is called TWICE per day:
+    once with portfolio=llm, once with portfolio=base."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    from data.replay.fill_simulator import DayApplicationResult
+
+    apply_calls: list = []
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        apply_calls.append(portfolio)
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(),
+            eod_exits=(), equity_curve=(),
+        )
+
+    def _fake_base(*, day_state, config, sentiment_conn, portfolio):
+        return _tick_decisions(day_state.trading_date, n=1)
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
+    )
+    monkeypatch.setattr(
+        "data.replay.driver.run_day_base_ticks", _fake_base
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    base_pf = SimulatedPortfolio(starting_cash=50_000.0)
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf, base_portfolio=base_pf,
+    )
+    # Two calls in order: LLM portfolio first, base second.
+    assert apply_calls == [pf, base_pf]
+
+
+@pytest.mark.asyncio
+async def test_dayrunresult_base_fields_populated_when_base_portfolio_set(monkeypatch):
+    """The base DayApplicationResult's tuples land on DayRunResult.base_* fields."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    from data.replay.fill_simulator import (
+        DayApplicationResult, EodExit, RejectedEntry, StopOut,
+    )
+    from sim.fills import SimulatedFill
+    from sim.portfolio import EquityPoint
+
+    base_fill = SimulatedFill(
+        ticker="AAPL", side="buy", qty=10, fill_price=100.0,
+        fill_timestamp=datetime(2026, 4, 15, 9, 35, tzinfo=ET),
+        stop_price=98.0, decision_id=1,
+    )
+    base_reject = RejectedEntry(
+        tick_et=datetime(2026, 4, 15, 9, 40, tzinfo=ET),
+        ticker="MSFT", side="sell", requested_qty=0,
+        reason="invalid_equity", decision_id=2,
+    )
+    base_stop = StopOut(
+        bar_et=datetime(2026, 4, 15, 10, 0, tzinfo=ET),
+        ticker="AAPL", side="buy", qty=10,
+        stop_price=98.0, realized_pl=-20.0,
+    )
+    base_eod = EodExit(
+        flatten_et=datetime(2026, 4, 15, 15, 55, tzinfo=ET),
+        ticker="AAPL", side="buy", qty=10,
+        exit_price=99.0, realized_pl=-10.0,
+    )
+    base_pt = EquityPoint(
+        timestamp=datetime(2026, 4, 15, 15, 55, tzinfo=ET),
+        equity=49_990.0, cash=49_990.0, n_open_positions=0,
+    )
+
+    apply_calls: list = []
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        apply_calls.append(portfolio)
+        if len(apply_calls) == 1:
+            # First call = LLM side; return empty
+            return DayApplicationResult(
+                fills=(), rejections=(), stop_outs=(),
+                eod_exits=(), equity_curve=(),
+            )
+        # Second call = base side; return the known fixture data
+        return DayApplicationResult(
+            fills=(base_fill,), rejections=(base_reject,),
+            stop_outs=(base_stop,), eod_exits=(base_eod,),
+            equity_curve=(base_pt,),
+        )
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
+    )
+    monkeypatch.setattr(
+        "data.replay.driver.run_day_base_ticks",
+        lambda **kw: _tick_decisions(kw["day_state"].trading_date, n=2),
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    base_pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf, base_portfolio=base_pf,
+    )
+    r = results[0]
+    assert r.base_fills == (base_fill,)
+    assert r.base_rejections == (base_reject,)
+    assert r.base_stop_outs == (base_stop,)
+    assert r.base_eod_exits == (base_eod,)
+    assert r.base_equity_curve == (base_pt,)
+    assert len(r.base_decisions) == 2
+
+
+@pytest.mark.asyncio
+async def test_write_day_results_receives_base_portfolio(monkeypatch):
+    """When persistence + base_portfolio are both set, write_day_results gets
+    base_portfolio threaded through."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+    monkeypatch.setattr(
+        "data.replay.driver.run_day_base_ticks",
+        lambda **kw: _tick_decisions(kw["day_state"].trading_date, n=1),
+    )
+
+    captured: list[dict] = []
+
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio, base_portfolio=None):
+        captured.append({
+            "llm": llm_portfolio,
+            "base": base_portfolio,
+        })
+
+    monkeypatch.setattr(
+        "data.replay.driver.write_day_results", _fake_write
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    base_pf = SimulatedPortfolio(starting_cash=50_000.0)
+    persistence_conn = sqlite3.connect(":memory:")
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf, base_portfolio=base_pf,
+        persistence_conn=persistence_conn, run_id=1,
+    )
+    assert len(captured) == 1
+    assert captured[0]["llm"] is pf
+    assert captured[0]["base"] is base_pf

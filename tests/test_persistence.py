@@ -160,6 +160,9 @@ def _day_result(
     equity_curve: tuple[EquityPoint, ...] = (),
     skipped: bool = False,
     trading_date: date = TRADING_DATE,
+    base_decisions: list[TickDecision] | None = None,
+    base_rejections: tuple[RejectedEntry, ...] = (),
+    base_equity_curve: tuple[EquityPoint, ...] = (),
 ) -> DayRunResult:
     return DayRunResult(
         trading_date=trading_date,
@@ -167,6 +170,9 @@ def _day_result(
         skipped=skipped,
         rejections=rejections,
         equity_curve=equity_curve,
+        base_decisions=base_decisions if base_decisions is not None else [],
+        base_rejections=base_rejections,
+        base_equity_curve=base_equity_curve,
     )
 
 
@@ -779,5 +785,190 @@ def test_complete_run_overwrites_on_second_call(tmp_path):
             "SELECT summary_json FROM replay_runs WHERE run_id = ?", (rid,)
         ).fetchone()
         assert row[0] == "second"
+    finally:
+        conn.close()
+
+
+# ===========================================================================
+# Base-strategy parallel persistence (M2.2 sub-task #17)
+# ===========================================================================
+
+
+def test_write_day_base_decisions_have_source_base(tmp_path):
+    """base_portfolio supplied -> base decisions land with decision_source='base'."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(0, "Buy")],
+                base_decisions=[_tick(5, "Sell"), _tick(10, "Hold")],
+            ),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+            base_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+        )
+        rows = conn.execute(
+            "SELECT decision_source, action FROM replay_decisions "
+            "WHERE run_id = ? ORDER BY id", (rid,)
+        ).fetchall()
+        # 1 LLM (Buy) + 2 base (Sell, Hold)
+        assert rows == [
+            ("live_merged", "Buy"),
+            ("base", "Sell"),
+            ("base", "Hold"),
+        ]
+    finally:
+        conn.close()
+
+
+def test_write_day_base_fills_fk_to_base_decisions(tmp_path):
+    """A base-side closed position's fill row's decision_id FK resolves to
+    the BASE-sourced decision, not the LLM-sourced decision with the same
+    per-day decision_id."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        llm_pf = SimulatedPortfolio(starting_cash=100_000.0)
+        base_pf = SimulatedPortfolio(starting_cash=100_000.0)
+        # Each side has one closed position with decision_id=1.
+        llm_pf.closed_positions.append(_closed_position(decision_id=1, ticker="AAPL"))
+        base_pf.closed_positions.append(_closed_position(decision_id=1, ticker="AAPL"))
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(5, "Buy")],
+                base_decisions=[_tick(5, "Buy")],
+            ),
+            llm_portfolio=llm_pf,
+            base_portfolio=base_pf,
+        )
+        # Two fills total.
+        fills = conn.execute(
+            "SELECT decision_id FROM replay_fills WHERE run_id = ? "
+            "ORDER BY id", (rid,)
+        ).fetchall()
+        assert len(fills) == 2
+        # Resolve each fill's decision_source via FK.
+        for (decision_id,) in fills:
+            source = conn.execute(
+                "SELECT decision_source FROM replay_decisions WHERE id = ?",
+                (decision_id,)
+            ).fetchone()[0]
+            assert source in ("live_merged", "base")
+        # Specifically: first fill links to live_merged, second to base
+        # (insertion order: LLM side first per write_day_results).
+        first_source = conn.execute(
+            "SELECT decision_source FROM replay_decisions WHERE id = ?",
+            (fills[0][0],)
+        ).fetchone()[0]
+        second_source = conn.execute(
+            "SELECT decision_source FROM replay_decisions WHERE id = ?",
+            (fills[1][0],)
+        ).fetchone()[0]
+        assert first_source == "live_merged"
+        assert second_source == "base"
+    finally:
+        conn.close()
+
+
+def test_write_day_base_equity_curve_portfolio_name_base(tmp_path):
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                equity_curve=(_equity_point(0),),
+                base_equity_curve=(_equity_point(5), _equity_point(10)),
+            ),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+            base_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+        )
+        rows = conn.execute(
+            "SELECT portfolio_name, COUNT(*) FROM replay_equity_curve "
+            "WHERE run_id = ? GROUP BY portfolio_name ORDER BY portfolio_name",
+            (rid,)
+        ).fetchall()
+        assert rows == [("base", 2), ("llm", 1)]
+    finally:
+        conn.close()
+
+
+def test_write_day_both_portfolios_queryable_independently(tmp_path):
+    """Same DB, same run_id, both portfolios populated: queries by
+    portfolio_name / decision_source partition correctly."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        llm_pf = SimulatedPortfolio(starting_cash=100_000.0)
+        base_pf = SimulatedPortfolio(starting_cash=100_000.0)
+        llm_pf.closed_positions.append(_closed_position(decision_id=1))
+        # Two base entries
+        base_pf.closed_positions.extend([
+            _closed_position(decision_id=1, ticker="AAPL"),
+            _closed_position(decision_id=2, ticker="MSFT"),
+        ])
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(5, "Buy")],
+                base_decisions=[_tick(5, "Buy"), _tick(10, "Buy", ticker="MSFT")],
+            ),
+            llm_portfolio=llm_pf,
+            base_portfolio=base_pf,
+        )
+        # decisions count by source
+        by_source = dict(conn.execute(
+            "SELECT decision_source, COUNT(*) FROM replay_decisions "
+            "WHERE run_id = ? GROUP BY decision_source", (rid,)
+        ).fetchall())
+        assert by_source == {"live_merged": 1, "base": 2}
+        # fills count by joining to decision_source
+        by_source_fills = dict(conn.execute(
+            "SELECT d.decision_source, COUNT(*) FROM replay_fills f "
+            "JOIN replay_decisions d ON f.decision_id = d.id "
+            "WHERE f.run_id = ? GROUP BY d.decision_source", (rid,)
+        ).fetchall())
+        assert by_source_fills == {"live_merged": 1, "base": 2}
+    finally:
+        conn.close()
+
+
+def test_write_day_base_portfolio_none_default_writes_nothing_for_base(tmp_path):
+    """Existing #16 callers (no base_portfolio arg) get the original
+    LLM-only behavior; no rows with portfolio_name='base' or
+    decision_source='base' show up."""
+    conn = init_replay_db(tmp_path / "r.db")
+    try:
+        rid = start_run(conn, config=_config())
+        write_day_results(
+            conn, run_id=rid,
+            day_result=_day_result(
+                decisions=[_tick(0, "Buy")],
+                # Even if base_decisions is populated on day_result,
+                # write_day_results without base_portfolio MUST NOT
+                # write them (no side-effects from absent kwarg).
+                base_decisions=[_tick(5, "Sell")],
+            ),
+            llm_portfolio=SimulatedPortfolio(starting_cash=100_000.0),
+            # base_portfolio omitted -> default None
+        )
+        n_base_decisions = conn.execute(
+            "SELECT COUNT(*) FROM replay_decisions "
+            "WHERE run_id = ? AND decision_source = 'base'", (rid,)
+        ).fetchone()[0]
+        assert n_base_decisions == 0
+        n_base_equity = conn.execute(
+            "SELECT COUNT(*) FROM replay_equity_curve "
+            "WHERE run_id = ? AND portfolio_name = 'base'", (rid,)
+        ).fetchone()[0]
+        assert n_base_equity == 0
+        # LLM side still wrote one decision.
+        n_llm = conn.execute(
+            "SELECT COUNT(*) FROM replay_decisions "
+            "WHERE run_id = ? AND decision_source = 'live_merged'", (rid,)
+        ).fetchone()[0]
+        assert n_llm == 1
     finally:
         conn.close()
