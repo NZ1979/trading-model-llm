@@ -63,5 +63,11 @@ boot_*.log
 # export procedure (Rule 26-compliant cross-fork data handoff).
 data/replay/fixtures/*.sqlite
 data/replay/fixtures/*.json
+data/replay/fixtures/news/
 .replay_cache/
 docs/reports/replay_*.md
+docs/reports/replay_results.db
+
+# Session run logs (Tee-Object output from replay runs / verifier scripts).
+# Regenerable; noisy; not source.
+docs/sessions/*.log
