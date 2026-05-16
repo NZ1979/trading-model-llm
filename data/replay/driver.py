@@ -67,13 +67,15 @@ import pandas as pd
 from data.replay.config import ReplayConfig
 from data.replay.day_state import build_day_state
 from data.replay.fill_simulator import (
+    EodExit,
     RejectedEntry,
-    apply_decisions_to_portfolio,
+    StopOut,
+    apply_day_to_portfolio,
 )
 from data.replay.market_context import load_market_data
 from data.replay.tick_loop import TickDecision, run_day_ticks
 from sim.fills import SimulatedFill
-from sim.portfolio import SimulatedPortfolio
+from sim.portfolio import EquityPoint, SimulatedPortfolio
 from strategy.llm.escalation import EscalationBudget
 from strategy.llm.signal_engine import TierClients
 
@@ -102,17 +104,33 @@ class DayRunResult:
     ``decisions`` but only the former should count against
     coverage in the report.
 
-    ``fills`` and ``rejections`` are populated when the caller passes a
+    ``fills``, ``rejections``, ``stop_outs``, ``eod_exits``, and
+    ``equity_curve`` are populated when the caller passes a
     SimulatedPortfolio AND the day ran successfully. When ``portfolio``
     is None at the run_replay call (the M2.2 sub-task #13 default
-    pattern, kept for backward compatibility), both tuples are empty
-    and no portfolio mutation happens. ``fills`` covers successful
-    entries; flip-exits are visible on ``portfolio.closed_positions``
-    with ``exit_reason="flip"``. ``rejections`` captures Buy/Sell
-    decisions that did not transact (risk-gate rejection, no next bar
-    at the last tick, etc.) -- structured output rather than logged
-    counts, so the report can break down "decisions that didn't
-    transact" by reason without re-parsing logs.
+    pattern, kept for backward compatibility), all five tuples are
+    empty and no portfolio mutation happens.
+
+    Field meanings (all chronological by emission order):
+
+    - ``fills``: successful Buy/Sell entries. Flip-exits are visible
+      on ``portfolio.closed_positions`` with ``exit_reason="flip"``;
+      they are NOT first-class fills here.
+    - ``rejections``: Buy/Sell decisions that did not transact
+      (risk-gate rejection, no next bar at the last tick, missing
+      5-min bar data, etc.) -- structured output rather than logged
+      counts, so the report can break down "decisions that didn't
+      transact" by reason without re-parsing logs.
+    - ``stop_outs`` (sub-task #15): positions closed by
+      ``portfolio.check_stops`` during the per-bar pass, with
+      ``exit_reason="stop_hit"`` on the closed position.
+    - ``eod_exits`` (sub-task #15): positions closed by the end-of-day
+      flatten pass at 15:55 ET, with ``exit_reason="eod_flatten"``.
+    - ``equity_curve`` (sub-task #15): EquityPoints emitted during
+      the day. Typically 78 from the per-bar MTM, plus a final
+      post-flatten point. May contain two points at 15:55 (pre- and
+      post-flatten) when positions were open going into the final
+      bar; the report can dedup or use both.
     """
 
     trading_date: date
@@ -123,6 +141,9 @@ class DayRunResult:
     skip_reason: str | None = None
     fills: tuple[SimulatedFill, ...] = ()
     rejections: tuple[RejectedEntry, ...] = ()
+    stop_outs: tuple[StopOut, ...] = ()
+    eod_exits: tuple[EodExit, ...] = ()
+    equity_curve: tuple[EquityPoint, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -267,23 +288,29 @@ async def run_replay(
             )
             continue
 
-        # Fill simulation: convert decisions to portfolio mutations when
-        # the caller supplied a SimulatedPortfolio. With no portfolio
-        # (the M2.2 #13 default pattern), fills + rejections remain
-        # empty -- backward-compatible with tests that don't yet wire
-        # a portfolio.
+        # Fill + stop + MTM + EOD-flatten simulation when the caller
+        # supplied a SimulatedPortfolio. With no portfolio (the M2.2
+        # #13 default pattern), all five new tuples remain empty --
+        # backward-compatible with tests that don't yet wire a
+        # portfolio.
         if portfolio is not None:
-            fill_result = apply_decisions_to_portfolio(
+            day_result = apply_day_to_portfolio(
                 decisions=decisions,
                 day_state=day_state,
                 portfolio=portfolio,
                 config=config,
             )
-            fills_t = fill_result.fills
-            rejections_t = fill_result.rejections
+            fills_t = day_result.fills
+            rejections_t = day_result.rejections
+            stop_outs_t = day_result.stop_outs
+            eod_exits_t = day_result.eod_exits
+            equity_curve_t = day_result.equity_curve
         else:
             fills_t = ()
             rejections_t = ()
+            stop_outs_t = ()
+            eod_exits_t = ()
+            equity_curve_t = ()
 
         results.append(
             DayRunResult(
@@ -295,13 +322,18 @@ async def run_replay(
                 skip_reason=None,
                 fills=fills_t,
                 rejections=rejections_t,
+                stop_outs=stop_outs_t,
+                eod_exits=eod_exits_t,
+                equity_curve=equity_curve_t,
             )
         )
         logger.info(
             "run_replay: %s complete, %d decisions, %d failed ticker(s), "
-            "%d escalation(s) used, %d fill(s), %d rejection(s)",
+            "%d escalation(s) used, %d fill(s), %d rejection(s), "
+            "%d stop-out(s), %d eod exit(s), %d equity point(s)",
             trading_date, len(decisions), len(day_state.failed_tickers),
             budget.used, len(fills_t), len(rejections_t),
+            len(stop_outs_t), len(eod_exits_t), len(equity_curve_t),
         )
 
     return results

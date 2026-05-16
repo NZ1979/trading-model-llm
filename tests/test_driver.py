@@ -549,14 +549,17 @@ async def test_decisions_accumulated_per_day(monkeypatch):
 
 
 # ===========================================================================
-# Fill simulation wiring (M2.2 sub-task #14)
+# Fill simulation wiring (M2.2 sub-task #14, rewired for #15 to call
+# apply_day_to_portfolio which subsumes apply_decisions_to_portfolio +
+# stops + MTM + EOD flatten)
 # ===========================================================================
 
 
 @pytest.mark.asyncio
 async def test_no_portfolio_yields_empty_fills_and_rejections(monkeypatch):
     """When portfolio=None (the default), the driver does NOT call the
-    fill simulator and the new DayRunResult fields are empty tuples."""
+    day orchestrator and all five new DayRunResult fields are empty
+    tuples."""
     cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
     _install_loader_mocks(monkeypatch)
 
@@ -567,7 +570,7 @@ async def test_no_portfolio_yields_empty_fills_and_rejections(monkeypatch):
         return None  # unreachable -- driver should not call
 
     monkeypatch.setattr(
-        "data.replay.driver.apply_decisions_to_portfolio", _fake_apply
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
     )
 
     results = await run_replay(
@@ -577,16 +580,19 @@ async def test_no_portfolio_yields_empty_fills_and_rejections(monkeypatch):
     r = results[0]
     assert r.fills == ()
     assert r.rejections == ()
+    assert r.stop_outs == ()
+    assert r.eod_exits == ()
+    assert r.equity_curve == ()
 
 
 @pytest.mark.asyncio
-async def test_portfolio_triggers_fill_simulator_call(monkeypatch):
-    """When a portfolio is passed, apply_decisions_to_portfolio is invoked
+async def test_portfolio_triggers_day_orchestrator_call(monkeypatch):
+    """When a portfolio is passed, apply_day_to_portfolio is invoked
     once per non-skipped day with the correct arguments threaded through."""
     cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
     _install_loader_mocks(monkeypatch)
 
-    from data.replay.fill_simulator import FillSimulationResult
+    from data.replay.fill_simulator import DayApplicationResult
     captured: list[dict] = []
 
     def _fake_apply(*, decisions, day_state, portfolio, config):
@@ -596,10 +602,13 @@ async def test_portfolio_triggers_fill_simulator_call(monkeypatch):
             "portfolio": portfolio,
             "config": config,
         })
-        return FillSimulationResult(fills=(), rejections=())
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(),
+            eod_exits=(), equity_curve=(),
+        )
 
     monkeypatch.setattr(
-        "data.replay.driver.apply_decisions_to_portfolio", _fake_apply
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
     )
 
     pf = SimulatedPortfolio(starting_cash=50_000.0)
@@ -618,13 +627,13 @@ async def test_portfolio_triggers_fill_simulator_call(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fills_and_rejections_propagate_to_dayrunresult(monkeypatch):
-    """A FillSimulationResult with known fills/rejections should land on
+    """A DayApplicationResult with known fills/rejections should land on
     DayRunResult unchanged."""
     cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
     _install_loader_mocks(monkeypatch)
 
     from data.replay.fill_simulator import (
-        FillSimulationResult, RejectedEntry,
+        DayApplicationResult, RejectedEntry,
     )
     from sim.fills import SimulatedFill
 
@@ -640,12 +649,13 @@ async def test_fills_and_rejections_propagate_to_dayrunresult(monkeypatch):
     )
 
     def _fake_apply(*, decisions, day_state, portfolio, config):
-        return FillSimulationResult(
-            fills=(fixed_fill,), rejections=(fixed_reject,)
+        return DayApplicationResult(
+            fills=(fixed_fill,), rejections=(fixed_reject,),
+            stop_outs=(), eod_exits=(), equity_curve=(),
         )
 
     monkeypatch.setattr(
-        "data.replay.driver.apply_decisions_to_portfolio", _fake_apply
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
     )
 
     pf = SimulatedPortfolio(starting_cash=50_000.0)
@@ -660,8 +670,8 @@ async def test_fills_and_rejections_propagate_to_dayrunresult(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_skipped_day_has_empty_fills_and_rejections(monkeypatch):
-    """build_day_state failure -> the driver never invokes the fill
-    simulator for that day; fills/rejections stay empty."""
+    """build_day_state failure -> the driver never invokes the day
+    orchestrator for that day; all five new fields stay empty."""
     cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
     _install_loader_mocks(
         monkeypatch,
@@ -674,11 +684,14 @@ async def test_skipped_day_has_empty_fills_and_rejections(monkeypatch):
 
     def _fake_apply(*, decisions, day_state, portfolio, config):
         apply_calls.append(True)
-        from data.replay.fill_simulator import FillSimulationResult
-        return FillSimulationResult(fills=(), rejections=())
+        from data.replay.fill_simulator import DayApplicationResult
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(),
+            eod_exits=(), equity_curve=(),
+        )
 
     monkeypatch.setattr(
-        "data.replay.driver.apply_decisions_to_portfolio", _fake_apply
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
     )
 
     pf = SimulatedPortfolio(starting_cash=50_000.0)
@@ -687,15 +700,19 @@ async def test_skipped_day_has_empty_fills_and_rejections(monkeypatch):
         portfolio=pf,
     )
     assert apply_calls == []
-    assert results[0].skipped is True
-    assert results[0].fills == ()
-    assert results[0].rejections == ()
+    r = results[0]
+    assert r.skipped is True
+    assert r.fills == ()
+    assert r.rejections == ()
+    assert r.stop_outs == ()
+    assert r.eod_exits == ()
+    assert r.equity_curve == ()
 
 
 @pytest.mark.asyncio
-async def test_run_day_ticks_failure_skips_fill_simulator(monkeypatch):
-    """run_day_ticks raising -> the driver doesn't call the fill simulator
-    for that day (skipped result has empty fills/rejections)."""
+async def test_run_day_ticks_failure_skips_day_orchestrator(monkeypatch):
+    """run_day_ticks raising -> the driver doesn't call the day
+    orchestrator for that day (skipped result has empty fields)."""
     cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
     _install_loader_mocks(
         monkeypatch,
@@ -706,11 +723,14 @@ async def test_run_day_ticks_failure_skips_fill_simulator(monkeypatch):
 
     def _fake_apply(*, decisions, day_state, portfolio, config):
         apply_calls.append(True)
-        from data.replay.fill_simulator import FillSimulationResult
-        return FillSimulationResult(fills=(), rejections=())
+        from data.replay.fill_simulator import DayApplicationResult
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(),
+            eod_exits=(), equity_curve=(),
+        )
 
     monkeypatch.setattr(
-        "data.replay.driver.apply_decisions_to_portfolio", _fake_apply
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
     )
 
     pf = SimulatedPortfolio(starting_cash=50_000.0)
@@ -719,6 +739,159 @@ async def test_run_day_ticks_failure_skips_fill_simulator(monkeypatch):
         portfolio=pf,
     )
     assert apply_calls == []
-    assert results[0].skipped is True
-    assert results[0].fills == ()
-    assert results[0].rejections == ()
+    r = results[0]
+    assert r.skipped is True
+    assert r.fills == ()
+    assert r.rejections == ()
+    assert r.stop_outs == ()
+    assert r.eod_exits == ()
+    assert r.equity_curve == ()
+
+
+# ===========================================================================
+# Stops + EOD flatten + equity-curve propagation (M2.2 sub-task #15)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_stop_outs_propagate_to_dayrunresult(monkeypatch):
+    """A DayApplicationResult with known stop_outs lands on DayRunResult."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    from data.replay.fill_simulator import DayApplicationResult, StopOut
+
+    fixed_stop = StopOut(
+        bar_et=datetime(2026, 4, 15, 10, 5, tzinfo=ET),
+        ticker="AAPL", side="buy", qty=10,
+        stop_price=98.0, realized_pl=-20.0,
+    )
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(fixed_stop,),
+            eod_exits=(), equity_curve=(),
+        )
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+    )
+    assert results[0].stop_outs == (fixed_stop,)
+
+
+@pytest.mark.asyncio
+async def test_eod_exits_propagate_to_dayrunresult(monkeypatch):
+    """A DayApplicationResult with known eod_exits lands on DayRunResult."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    from data.replay.fill_simulator import DayApplicationResult, EodExit
+
+    fixed_eod = EodExit(
+        flatten_et=datetime(2026, 4, 15, 15, 55, tzinfo=ET),
+        ticker="AAPL", side="buy", qty=10,
+        exit_price=104.0, realized_pl=40.0,
+    )
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(),
+            eod_exits=(fixed_eod,), equity_curve=(),
+        )
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+    )
+    assert results[0].eod_exits == (fixed_eod,)
+
+
+@pytest.mark.asyncio
+async def test_equity_curve_propagates_to_dayrunresult(monkeypatch):
+    """A DayApplicationResult with a known equity_curve lands on DayRunResult."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    from data.replay.fill_simulator import DayApplicationResult
+    from sim.portfolio import EquityPoint
+
+    points = (
+        EquityPoint(
+            timestamp=datetime(2026, 4, 15, 9, 30, tzinfo=ET),
+            equity=50_000.0, cash=50_000.0, n_open_positions=0,
+        ),
+        EquityPoint(
+            timestamp=datetime(2026, 4, 15, 15, 55, tzinfo=ET),
+            equity=50_100.0, cash=50_100.0, n_open_positions=0,
+        ),
+    )
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(),
+            eod_exits=(), equity_curve=points,
+        )
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+    )
+    assert results[0].equity_curve == points
+    assert len(results[0].equity_curve) == 2
+
+
+@pytest.mark.asyncio
+async def test_dayrunresult_default_new_fields_are_empty_tuples():
+    """Constructing DayRunResult without the new fields gives empty tuples
+    (back-compat with skipped-day code paths)."""
+    r = DayRunResult(trading_date=date(2026, 4, 15), skipped=True)
+    assert r.stop_outs == ()
+    assert r.eod_exits == ()
+    assert r.equity_curve == ()
+
+
+@pytest.mark.asyncio
+async def test_day_orchestrator_receives_portfolio_reference(monkeypatch):
+    """The driver must pass the SAME portfolio instance to the orchestrator
+    (not a copy) so per-bar mutations carry across days."""
+    cfg = _config()  # 5 days
+    _install_loader_mocks(monkeypatch)
+
+    from data.replay.fill_simulator import DayApplicationResult
+    seen_portfolios: list = []
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        seen_portfolios.append(portfolio)
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(),
+            eod_exits=(), equity_curve=(),
+        )
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+    )
+    # 5 weekdays -> 5 orchestrator calls, each with the same portfolio.
+    assert len(seen_portfolios) == 5
+    assert all(seen is pf for seen in seen_portfolios)
