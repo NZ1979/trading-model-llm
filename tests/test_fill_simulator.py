@@ -866,6 +866,8 @@ def test_rejection_dataclass_shape():
         tick_et=datetime(2026, 4, 15, 9, 30, tzinfo=ET),
         ticker="AAPL", side="buy", requested_qty=100,
         reason="position_cap_exceeded",
+        decision_id=1,
     )
     assert rej.ticker == "AAPL"
     assert rej.requested_qty == 100
+    assert rej.decision_id == 1

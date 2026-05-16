@@ -141,6 +141,19 @@ class ReplayConfig:
             raise ValueError("tickers tuple must not be empty")
 
     @property
+    def replay_db_path(self) -> Path:
+        """Filesystem path for ``replay_results.db`` (M2.2 sub-task #16).
+
+        Derived from ``output_dir`` so the SQLite database lives next to
+        the markdown comparison report for any given run. Callers pass
+        this to ``data.replay.persistence.init_replay_db``. Directory
+        creation is the caller's responsibility (``mkdir(parents=True,
+        exist_ok=True)`` before ``init_replay_db`` is the documented
+        idiom).
+        """
+        return self.output_dir / "replay_results.db"
+
+    @property
     def tickers_tuple(self) -> tuple[str, ...]:
         """Return tickers as a tuple regardless of original spec.
 

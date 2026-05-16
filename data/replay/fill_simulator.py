@@ -103,6 +103,11 @@ class RejectedEntry:
     the comparison-report generator can break down "decisions that
     didn't transact" by reason: oversized notional, no next bar at the
     last tick, missing bar data, etc.
+
+    ``decision_id`` (added M2.2 sub-task #16) is the per-day decision
+    index assigned by ``apply_day_to_portfolio`` /
+    ``apply_decisions_to_portfolio``; the persistence layer maps it to
+    the global ``replay_decisions.id`` foreign key when writing.
     """
 
     tick_et: datetime
@@ -110,6 +115,7 @@ class RejectedEntry:
     side: Literal["buy", "sell"]
     requested_qty: int  # 0 when rejection happened before sizing
     reason: str
+    decision_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,6 +424,7 @@ def _attempt_entry(
         return None, RejectedEntry(
             tick_et=tick_et, ticker=ticker, side=side,
             requested_qty=0, reason="invalid_equity",
+            decision_id=decision_id,
         )
 
     requested_qty = size_from_risk(
@@ -430,6 +437,7 @@ def _attempt_entry(
         return None, RejectedEntry(
             tick_et=tick_et, ticker=ticker, side=side,
             requested_qty=0, reason="size_from_risk_zero",
+            decision_id=decision_id,
         )
 
     check = validate_order(
@@ -450,6 +458,7 @@ def _attempt_entry(
         return None, RejectedEntry(
             tick_et=tick_et, ticker=ticker, side=side,
             requested_qty=requested_qty, reason=check.reason,
+            decision_id=decision_id,
         )
 
     current_bar_ts = pd.Timestamp(tick_et).to_pydatetime()
@@ -475,6 +484,7 @@ def _attempt_entry(
             tick_et=tick_et, ticker=ticker, side=side,
             requested_qty=check.quantity,
             reason="simulate_fill_returned_none",
+            decision_id=decision_id,
         )
 
     portfolio.record_entry(sf)
@@ -516,6 +526,7 @@ def _apply_one_decision(
             tick_et=tick_et, ticker=ticker,
             side=_entry_side(action),
             requested_qty=0, reason=bar_lookup,
+            decision_id=decision_id,
         )
 
     if config.fill_at == "next_bar_open" and bar_lookup.next_open is None:
@@ -523,6 +534,7 @@ def _apply_one_decision(
             tick_et=tick_et, ticker=ticker,
             side=_entry_side(action),
             requested_qty=0, reason="no_next_bar_for_fill",
+            decision_id=decision_id,
         )
 
     existing = portfolio.get_position(ticker)

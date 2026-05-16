@@ -73,6 +73,7 @@ from data.replay.fill_simulator import (
     apply_day_to_portfolio,
 )
 from data.replay.market_context import load_market_data
+from data.replay.persistence import write_day_results
 from data.replay.tick_loop import TickDecision, run_day_ticks
 from sim.fills import SimulatedFill
 from sim.portfolio import EquityPoint, SimulatedPortfolio
@@ -178,6 +179,8 @@ async def run_replay(
     clients: TierClients,
     sentiment_conn: sqlite3.Connection,
     portfolio: SimulatedPortfolio | None = None,
+    persistence_conn: sqlite3.Connection | None = None,
+    run_id: int | None = None,
 ) -> list[DayRunResult]:
     """Run the LLM-path replay over ``[config.start_date, config.end_date]``.
 
@@ -199,6 +202,16 @@ async def run_replay(
             not mutate it. In M2.2 sub-task #13 (no fill simulation
             wired yet) this is typically None or a freshly-constructed
             empty portfolio.
+        persistence_conn: optional opened ``replay_results.db``
+            connection from ``data.replay.persistence.init_replay_db``.
+            When set, ``write_day_results`` is invoked after each
+            non-skipped day's result lands. Must be paired with
+            ``run_id`` (both None or both set); passing only one is a
+            programmer bug -- raises ``ValueError``. Caller owns
+            lifecycle (open via init_replay_db; close after).
+        run_id: optional run_id from
+            ``data.replay.persistence.start_run``. Paired with
+            ``persistence_conn``.
 
     Returns:
         ``list[DayRunResult]`` ordered by ``trading_date`` ascending.
@@ -211,6 +224,10 @@ async def run_replay(
             config (separate sub-task).
         RuntimeError: ``load_market_data`` failed (SPY required;
             replay unrunnable without it).
+        ValueError: ``persistence_conn`` and ``run_id`` not paired
+            (exactly one is None). They must both be passed together
+            for persistence to be enabled, or both omitted to disable
+            it.
     """
     if config.tickers == "watchlist":
         raise NotImplementedError(
@@ -218,6 +235,14 @@ async def run_replay(
             "is a follow-up sub-task. Pass an explicit ticker tuple "
             "through ReplayConfig.tickers for now."
         )
+    if (persistence_conn is None) != (run_id is None):
+        raise ValueError(
+            "run_replay: persistence_conn and run_id must be paired "
+            "(both None to disable persistence, or both set to enable). "
+            f"got persistence_conn={'set' if persistence_conn else 'None'}, "
+            f"run_id={run_id}"
+        )
+    persistence_enabled = persistence_conn is not None and run_id is not None
 
     tickers = config.tickers_tuple
     days = _trading_days(config.start_date, config.end_date)
@@ -233,6 +258,25 @@ async def run_replay(
 
     # One EscalationBudget across the run; reset per day.
     budget = EscalationBudget(max_per_day=config.t2_max_per_day)
+
+    def _persist(day_result: DayRunResult) -> None:
+        """Write one day's rows when persistence is enabled.
+
+        No-ops when persistence is disabled OR when the day was skipped
+        (write_day_results itself short-circuits on skipped days).
+        Fills are written from ``portfolio.closed_positions``; without
+        a portfolio there is no fill data to persist, so persistence
+        only fires when both ``persistence_enabled`` and ``portfolio``
+        are set.
+        """
+        if not persistence_enabled or portfolio is None:
+            return
+        write_day_results(
+            persistence_conn,  # type: ignore[arg-type]  # narrowed by persistence_enabled
+            run_id=run_id,  # type: ignore[arg-type]
+            day_result=day_result,
+            llm_portfolio=portfolio,
+        )
 
     results: list[DayRunResult] = []
     for trading_date in days:
@@ -253,13 +297,13 @@ async def run_replay(
             logger.warning(
                 "run_replay: skipping %s -- %s", trading_date, reason
             )
-            results.append(
-                DayRunResult(
-                    trading_date=trading_date,
-                    skipped=True,
-                    skip_reason=reason,
-                )
+            skipped_result = DayRunResult(
+                trading_date=trading_date,
+                skipped=True,
+                skip_reason=reason,
             )
+            results.append(skipped_result)
+            _persist(skipped_result)
             continue
 
         # Per-day tick loop. run_day_ticks shouldn't raise per #12's
@@ -278,14 +322,14 @@ async def run_replay(
             logger.warning(
                 "run_replay: skipping %s -- %s", trading_date, reason
             )
-            results.append(
-                DayRunResult(
-                    trading_date=trading_date,
-                    failed_tickers=dict(day_state.failed_tickers),
-                    skipped=True,
-                    skip_reason=reason,
-                )
+            skipped_result = DayRunResult(
+                trading_date=trading_date,
+                failed_tickers=dict(day_state.failed_tickers),
+                skipped=True,
+                skip_reason=reason,
             )
+            results.append(skipped_result)
+            _persist(skipped_result)
             continue
 
         # Fill + stop + MTM + EOD-flatten simulation when the caller
@@ -312,21 +356,21 @@ async def run_replay(
             eod_exits_t = ()
             equity_curve_t = ()
 
-        results.append(
-            DayRunResult(
-                trading_date=trading_date,
-                decisions=decisions,
-                failed_tickers=dict(day_state.failed_tickers),
-                t2_escalations_used=budget.used,
-                skipped=False,
-                skip_reason=None,
-                fills=fills_t,
-                rejections=rejections_t,
-                stop_outs=stop_outs_t,
-                eod_exits=eod_exits_t,
-                equity_curve=equity_curve_t,
-            )
+        day_result = DayRunResult(
+            trading_date=trading_date,
+            decisions=decisions,
+            failed_tickers=dict(day_state.failed_tickers),
+            t2_escalations_used=budget.used,
+            skipped=False,
+            skip_reason=None,
+            fills=fills_t,
+            rejections=rejections_t,
+            stop_outs=stop_outs_t,
+            eod_exits=eod_exits_t,
+            equity_curve=equity_curve_t,
         )
+        results.append(day_result)
+        _persist(day_result)
         logger.info(
             "run_replay: %s complete, %d decisions, %d failed ticker(s), "
             "%d escalation(s) used, %d fill(s), %d rejection(s), "

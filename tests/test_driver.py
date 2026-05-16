@@ -646,6 +646,7 @@ async def test_fills_and_rejections_propagate_to_dayrunresult(monkeypatch):
         tick_et=datetime(2026, 4, 15, 9, 40, tzinfo=ET),
         ticker="MSFT", side="sell", requested_qty=50,
         reason="total_exposure_cap_exceeded ($95,000 > $90,000)",
+        decision_id=2,
     )
 
     def _fake_apply(*, decisions, day_state, portfolio, config):
@@ -895,3 +896,150 @@ async def test_day_orchestrator_receives_portfolio_reference(monkeypatch):
     # 5 weekdays -> 5 orchestrator calls, each with the same portfolio.
     assert len(seen_portfolios) == 5
     assert all(seen is pf for seen in seen_portfolios)
+
+
+# ===========================================================================
+# Persistence wiring (M2.2 sub-task #16)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_persistence_disabled_no_writes(monkeypatch):
+    """Both persistence_conn and run_id None -> write_day_results NOT
+    called (backward compatible default)."""
+    cfg = _config()  # 5 days
+    _install_loader_mocks(monkeypatch)
+
+    write_calls: list = []
+
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio):
+        write_calls.append((run_id, day_result.trading_date))
+
+    monkeypatch.setattr(
+        "data.replay.driver.write_day_results", _fake_write
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+        # persistence_conn=None, run_id=None  -- default; no writes
+    )
+    assert write_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("which_set", ["conn_only", "run_id_only"])
+async def test_persistence_unpaired_args_raises(monkeypatch, which_set):
+    """Passing only one of (persistence_conn, run_id) is a programmer bug."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    kwargs = {}
+    if which_set == "conn_only":
+        kwargs["persistence_conn"] = sqlite3.connect(":memory:")
+    else:
+        kwargs["run_id"] = 1
+
+    with pytest.raises(ValueError, match="must be paired"):
+        await run_replay(
+            config=cfg, clients=_clients(), sentiment_conn=_conn(),
+            **kwargs,
+        )
+
+
+@pytest.mark.asyncio
+async def test_persistence_enabled_calls_writer_per_day(monkeypatch):
+    """persistence_conn + run_id both set + portfolio set -> write_day_results
+    called once per day, with the right args."""
+    cfg = _config()  # 5 days
+    _install_loader_mocks(monkeypatch)
+
+    write_calls: list[dict] = []
+
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio):
+        write_calls.append({
+            "conn": conn,
+            "run_id": run_id,
+            "trading_date": day_result.trading_date,
+            "portfolio": llm_portfolio,
+        })
+
+    monkeypatch.setattr(
+        "data.replay.driver.write_day_results", _fake_write
+    )
+
+    persistence_conn = sqlite3.connect(":memory:")
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+        persistence_conn=persistence_conn,
+        run_id=42,
+    )
+    assert len(write_calls) == 5
+    for call in write_calls:
+        assert call["conn"] is persistence_conn
+        assert call["run_id"] == 42
+        assert call["portfolio"] is pf
+
+
+@pytest.mark.asyncio
+async def test_persistence_skipped_day_still_calls_writer(monkeypatch):
+    """Skipped days call write_day_results (which no-ops) for symmetry --
+    the writer owns the skipped-day semantics, not the driver."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(
+        monkeypatch,
+        build_day_state_per_day={
+            date(2026, 4, 15): RuntimeError("nothing loadable"),
+        },
+    )
+
+    write_calls: list = []
+
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio):
+        write_calls.append(day_result.skipped)
+
+    monkeypatch.setattr(
+        "data.replay.driver.write_day_results", _fake_write
+    )
+
+    persistence_conn = sqlite3.connect(":memory:")
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+        persistence_conn=persistence_conn,
+        run_id=1,
+    )
+    # One skipped day -> one writer call (it no-ops internally but the
+    # call propagates so the writer can choose the semantics).
+    assert write_calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_persistence_without_portfolio_no_writes(monkeypatch):
+    """If persistence is enabled but portfolio is None, no fills/curve are
+    available -- the driver skips the writer call rather than passing a
+    stub portfolio."""
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    write_calls: list = []
+
+    def _fake_write(conn, *, run_id, day_result, llm_portfolio):
+        write_calls.append(True)
+
+    monkeypatch.setattr(
+        "data.replay.driver.write_day_results", _fake_write
+    )
+
+    persistence_conn = sqlite3.connect(":memory:")
+    await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=None,  # no portfolio -> no fills to persist
+        persistence_conn=persistence_conn,
+        run_id=1,
+    )
+    assert write_calls == []
