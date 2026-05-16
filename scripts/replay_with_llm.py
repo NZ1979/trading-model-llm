@@ -42,6 +42,7 @@ import json
 import logging
 import subprocess
 import sys
+import time
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
@@ -355,11 +356,17 @@ def _git_head_sha() -> str | None:
         return None
 
 
+_PHASE_KEYS: tuple[str, ...] = (
+    "data_prep", "tick_loop", "fill_sim_llm", "t3_labeling", "base_pass",
+)
+
+
 def _build_summary_json(
     results: list[DayRunResult],
     wrapped_clients: TierClients,
     *,
     t3_budget: T3Budget | None = None,
+    total_wall_clock_ms: float | None = None,
 ) -> str:
     """Aggregate per-day counts + cache stats into the run-level summary.
 
@@ -368,6 +375,14 @@ def _build_summary_json(
     wrapped CachedLLMClient instances; if a tier wasn't wrapped (T3
     today) its block is omitted. T3 budget stats (call count, skips,
     estimated cost) are included when ``t3_budget`` is supplied.
+
+    Per-phase wall-clock timings (M2.2 sub-task #23): for each phase
+    present in any DayRunResult.phase_durations_ms, emit three keys
+    -- ``phase_<name>_total_ms``, ``phase_<name>_mean_ms``,
+    ``phase_<name>_n_days``. The mean denominator is the number of
+    days that actually ran that phase (T3 disabled days don't drag
+    the t3_labeling mean down with zeros). Run-level total wall-clock
+    is emitted as ``total_wall_clock_ms`` when supplied.
     """
     n_days_total = len(results)
     n_days_skipped = sum(1 for r in results if r.skipped)
@@ -408,6 +423,24 @@ def _build_summary_json(
         payload["t3_skipped_sample"] = t3_budget.n_skipped_sample
         payload["t3_estimated_cost_usd"] = round(t3_budget.used_dollars, 4)
         payload["t3_cap_dollars"] = t3_budget.cap_dollars
+
+    # Per-phase wall-clock timings (M2.2 sub-task #23).
+    for phase in _PHASE_KEYS:
+        durations = [
+            r.phase_durations_ms[phase]
+            for r in results
+            if r.phase_durations_ms and phase in r.phase_durations_ms
+        ]
+        if not durations:
+            continue
+        total = sum(durations)
+        payload[f"phase_{phase}_total_ms"] = round(total, 2)
+        payload[f"phase_{phase}_mean_ms"] = round(total / len(durations), 2)
+        payload[f"phase_{phase}_n_days"] = len(durations)
+
+    if total_wall_clock_ms is not None:
+        payload["total_wall_clock_ms"] = round(total_wall_clock_ms, 2)
+
     return json.dumps(payload, sort_keys=True)
 
 
@@ -484,7 +517,8 @@ async def _run(cfg: ReplayConfig, args: argparse.Namespace) -> int:
                     per_call_estimate=args.t3_per_call_estimate,
                 )
 
-            # Run replay
+            # Run replay (wall-clock instrumented for M2.2 sub-task #23).
+            _replay_t0 = time.monotonic()
             results = await run_replay(
                 config=cfg,
                 clients=wrapped,
@@ -495,10 +529,13 @@ async def _run(cfg: ReplayConfig, args: argparse.Namespace) -> int:
                 run_id=run_id,
                 t3_budget=t3_budget,
             )
+            total_wall_clock_ms = (time.monotonic() - _replay_t0) * 1000.0
 
             # Complete run with summary
             summary = _build_summary_json(
-                results, wrapped, t3_budget=t3_budget,
+                results, wrapped,
+                t3_budget=t3_budget,
+                total_wall_clock_ms=total_wall_clock_ms,
             )
             complete_run(
                 persistence_conn, run_id=run_id, summary_json=summary,

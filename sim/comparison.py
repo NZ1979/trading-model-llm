@@ -209,14 +209,134 @@ def _section_1_metadata(
     lines.append("### Provenance")
     lines.append("")
     lines.append(f"- **repo_sha:** {repo_sha if repo_sha else '*(not recorded)*'}")
-    if summary_json:
-        lines.append("- **summary_json:** *(see replay_runs.summary_json for run-level aggregates)*")
     lines.append("")
-    lines.append(
-        "*Cache hits/misses and per-tier wall-clock time are not yet "
-        "persisted — deferred to a future sub-task.*"
-    )
+
+    # Cache + timing sub-blocks (M2.2 sub-task #23). Parse summary_json
+    # defensively: it can be None (run never completed with summary),
+    # empty (legacy summary call), or malformed (unlikely but defended
+    # against per Rule 18). On any parse failure render explicit
+    # placeholders rather than crashing the report.
+    summary_payload: dict | None = None
+    if summary_json:
+        try:
+            parsed = json.loads(summary_json)
+            if isinstance(parsed, dict):
+                summary_payload = parsed
+            else:
+                logger.warning(
+                    "_section_1_metadata: summary_json parsed to "
+                    "non-dict %s; ignoring", type(parsed).__name__,
+                )
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "_section_1_metadata: summary_json malformed (%s); "
+                "rendering placeholders", exc,
+            )
+
+    lines.extend(_render_cache_stats(summary_payload))
+    lines.append("")
+    lines.extend(_render_phase_timing(summary_payload))
     return lines
+
+
+def _render_cache_stats(payload: dict | None) -> list[str]:
+    """Render the cache hits/misses table from summary_json.
+
+    Emits a `### Cache stats` header followed by a markdown table with
+    one row per wrapped tier. If neither tier has cache fields in the
+    payload (e.g. legacy runs or runs without ``CachedLLMClient``
+    wrapping), emits a placeholder line instead.
+    """
+    lines = ["### Cache stats", ""]
+    if payload is None:
+        lines.append("*Cache stats not recorded for this run.*")
+        return lines
+
+    rows: list[tuple[str, int, int]] = []
+    for tier in ("t1", "t2"):
+        hits_key = f"cache_{tier}_hits"
+        misses_key = f"cache_{tier}_misses"
+        if hits_key in payload or misses_key in payload:
+            hits = int(payload.get(hits_key, 0))
+            misses = int(payload.get(misses_key, 0))
+            rows.append((tier.upper(), hits, misses))
+
+    if not rows:
+        lines.append("*No cached tiers in this run.*")
+        return lines
+
+    lines.append("| Tier | Hits | Misses | Hit rate |")
+    lines.append("|---|---|---|---|")
+    for tier, hits, misses in rows:
+        total = hits + misses
+        if total == 0:
+            rate_str = "*(no calls)*"
+        else:
+            rate_str = f"{(hits / total) * 100:.1f}%"
+        lines.append(f"| {tier} | {hits} | {misses} | {rate_str} |")
+    return lines
+
+
+def _render_phase_timing(payload: dict | None) -> list[str]:
+    """Render the per-phase wall-clock timing breakdown.
+
+    Emits a `### Phase timing` header followed by one bullet per phase
+    that has data, plus a `Total wall-clock` bullet when the run-level
+    total is present. Phases missing from the payload are silently
+    skipped (e.g. T3 disabled). Empty payload renders a placeholder.
+    """
+    lines = ["### Phase timing", ""]
+    if payload is None:
+        lines.append("*Phase timing not recorded for this run.*")
+        return lines
+
+    # Run-level wall-clock first when available.
+    total_ms = payload.get("total_wall_clock_ms")
+    if total_ms is not None:
+        lines.append(f"- **Total wall-clock:** {_format_ms(total_ms)}")
+
+    # Per-phase rows in a fixed display order.
+    phase_order: tuple[tuple[str, str], ...] = (
+        ("data_prep", "Data prep"),
+        ("tick_loop", "Tick loop"),
+        ("fill_sim_llm", "Fill sim (LLM)"),
+        ("t3_labeling", "T3 labeling"),
+        ("base_pass", "Base pass"),
+    )
+    rendered_any = False
+    for key, label in phase_order:
+        mean_key = f"phase_{key}_mean_ms"
+        n_key = f"phase_{key}_n_days"
+        if mean_key in payload:
+            mean = float(payload[mean_key])
+            n = int(payload.get(n_key, 0))
+            lines.append(
+                f"- **{label}:** {_format_ms(mean)} mean/day "
+                f"({n} day{'s' if n != 1 else ''})"
+            )
+            rendered_any = True
+
+    if total_ms is None and not rendered_any:
+        lines.append(
+            "*No phase timing keys present in summary_json.*"
+        )
+    return lines
+
+
+def _format_ms(ms: float) -> str:
+    """Render a millisecond duration as a human-readable string.
+
+    Sub-second values render as `123 ms`; sub-minute as `4.2 s`;
+    longer durations as `3m 14s`.
+    """
+    if ms < 1000:
+        return f"{ms:.0f} ms"
+    seconds = ms / 1000.0
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    minutes = int(seconds // 60)
+    remainder = seconds - minutes * 60
+    return f"{minutes}m {remainder:.0f}s"
 
 
 # ---------------------------------------------------------------------------

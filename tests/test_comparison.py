@@ -178,13 +178,19 @@ def _seed_run(
     *,
     config: ReplayConfig | None = None,
     completed: bool = True,
+    summary_json: str | None = None,
 ) -> int:
-    """Create + populate an empty run; return run_id."""
+    """Create + populate an empty run; return run_id.
+
+    ``summary_json`` (M2.2 sub-task #23) lets tests stamp a custom
+    summary payload onto the completed run -- used by the section 1
+    cache/timing rendering tests to exercise the parse logic.
+    """
     conn = init_replay_db(db_path)
     try:
         rid = start_run(conn, config=config or _config())
         if completed:
-            complete_run(conn, run_id=rid)
+            complete_run(conn, run_id=rid, summary_json=summary_json)
     finally:
         conn.close()
     return rid
@@ -288,6 +294,162 @@ def test_section_1_shows_prompt_version_and_tier_config(tmp_path):
     assert "v-special" in text
     assert "haiku_stand_in" in text
     assert "claude-haiku-4-5" in text
+
+
+# ===========================================================================
+# Section 1: cache + timing sub-blocks (M2.2 sub-task #23)
+# ===========================================================================
+
+
+def test_section_1_empty_summary_json_renders_placeholders(tmp_path):
+    """A run with no summary_json (default _seed_run) -> both cache
+    and timing sub-blocks render the explicit 'not recorded' note."""
+    import json as _json
+    db = tmp_path / "r.db"
+    rid = _seed_run(db)  # summary_json=None by default
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "### Cache stats" in text
+    assert "Cache stats not recorded for this run" in text
+    assert "### Phase timing" in text
+    assert "Phase timing not recorded for this run" in text
+    # The legacy deferred-note paragraph must be gone.
+    assert "deferred to a future sub-task" not in text
+    _ = _json  # silence unused-import lint
+
+
+def test_section_1_cache_only_summary_renders_cache_table_and_timing_placeholder(
+    tmp_path,
+):
+    """summary_json with only cache fields -> cache table renders,
+    timing sub-block renders its placeholder."""
+    import json as _json
+    payload = {
+        "cache_t1_hits": 245,
+        "cache_t1_misses": 12,
+        "cache_t2_hits": 18,
+        "cache_t2_misses": 3,
+    }
+    db = tmp_path / "r.db"
+    rid = _seed_run(db, summary_json=_json.dumps(payload))
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    # Cache table: 245 hits / 12 misses on T1 -> 245/257 = 95.3%
+    assert "| T1 | 245 | 12 | 95.3% |" in text
+    # T2: 18 hits / 3 misses -> 18/21 = 85.7%
+    assert "| T2 | 18 | 3 | 85.7% |" in text
+    # No phase rows but the section header + placeholder render.
+    assert "Phase timing not recorded" in text or \
+        "No phase timing keys present" in text
+
+
+def test_section_1_timing_only_summary_renders_phase_rows_and_cache_placeholder(
+    tmp_path,
+):
+    """summary_json with timing keys only -> timing bullets render,
+    cache sub-block renders its 'no cached tiers' placeholder."""
+    import json as _json
+    payload = {
+        "phase_data_prep_mean_ms": 8420.0,
+        "phase_data_prep_n_days": 22,
+        "phase_data_prep_total_ms": 185240.0,
+        "phase_tick_loop_mean_ms": 32100.0,
+        "phase_tick_loop_n_days": 22,
+        "phase_tick_loop_total_ms": 706200.0,
+        "total_wall_clock_ms": 342000.0,  # 5m 42s
+    }
+    db = tmp_path / "r.db"
+    rid = _seed_run(db, summary_json=_json.dumps(payload))
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    # Cache sub-block: no cached tiers in the payload.
+    assert "No cached tiers in this run" in text
+    # Timing sub-block: total wall-clock + 2 phase rows.
+    assert "**Total wall-clock:** 5m 42s" in text
+    assert "**Data prep:** 8.4 s mean/day (22 days)" in text
+    assert "**Tick loop:** 32.1 s mean/day (22 days)" in text
+
+
+def test_section_1_full_summary_renders_both_blocks(tmp_path):
+    """summary_json with cache + timing keys -> both render in full."""
+    import json as _json
+    payload = {
+        "cache_t1_hits": 100,
+        "cache_t1_misses": 0,
+        "phase_data_prep_mean_ms": 500.0,
+        "phase_data_prep_n_days": 1,
+        "phase_data_prep_total_ms": 500.0,
+        "total_wall_clock_ms": 1500.0,
+    }
+    db = tmp_path / "r.db"
+    rid = _seed_run(db, summary_json=_json.dumps(payload))
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    # 100 hits / 0 misses = 100.0% hit rate.
+    assert "| T1 | 100 | 0 | 100.0% |" in text
+    # Timing: total 1500ms = 1.5s rendered as "1.5 s".
+    assert "**Total wall-clock:** 1.5 s" in text
+    # Data prep 500ms < 1s -> rendered as "500 ms".
+    assert "**Data prep:** 500 ms mean/day (1 day)" in text
+
+
+def test_section_1_malformed_summary_json_renders_placeholders(tmp_path, caplog):
+    """summary_json that doesn't parse as JSON -> WARNING logged and
+    both sub-blocks render their placeholders. No crash."""
+    db = tmp_path / "r.db"
+    rid = _seed_run(db, summary_json="this is not json {{{ ")
+    out = tmp_path / "out.md"
+    with caplog.at_level("WARNING", logger="sim.comparison"):
+        generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "Cache stats not recorded" in text
+    assert "Phase timing not recorded" in text
+    # And a warning was logged.
+    assert any("malformed" in r.message.lower() for r in caplog.records)
+
+
+def test_section_1_partial_cache_only_t1_renders_one_row(tmp_path):
+    """summary_json with T1 cache fields but no T2 -> only T1 row in
+    the cache table."""
+    import json as _json
+    payload = {"cache_t1_hits": 50, "cache_t1_misses": 5}
+    db = tmp_path / "r.db"
+    rid = _seed_run(db, summary_json=_json.dumps(payload))
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "| T1 | 50 | 5 |" in text
+    # T2 must NOT appear as a row in the cache table.
+    assert "| T2 |" not in text
+
+
+def test_section_1_partial_timing_omits_absent_phases(tmp_path):
+    """summary_json with data_prep + tick_loop only -> only those two
+    phase bullets render; t3_labeling / base_pass / fill_sim_llm are
+    silently skipped (not 'not recorded' since the section itself
+    rendered)."""
+    import json as _json
+    payload = {
+        "phase_data_prep_mean_ms": 100.0,
+        "phase_data_prep_n_days": 1,
+        "phase_tick_loop_mean_ms": 200.0,
+        "phase_tick_loop_n_days": 1,
+    }
+    db = tmp_path / "r.db"
+    rid = _seed_run(db, summary_json=_json.dumps(payload))
+    out = tmp_path / "out.md"
+    generate_report(db_path=db, run_id=rid, output_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "**Data prep:** 100 ms mean/day (1 day)" in text
+    assert "**Tick loop:** 200 ms mean/day (1 day)" in text
+    # Phases absent from payload are absent from the report.
+    assert "**T3 labeling:**" not in text
+    assert "**Fill sim (LLM):**" not in text
+    assert "**Base pass:**" not in text
 
 
 # ===========================================================================

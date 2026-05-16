@@ -201,6 +201,69 @@ def test_build_summary_json_includes_cache_stats_when_wrapped():
     assert summary["cache_t1_misses"] == 3
 
 
+def test_build_summary_json_aggregates_phase_timings():
+    """Per-day phase_durations_ms dicts aggregate into phase_<name>_*
+    triples (total, mean, n_days) in the summary payload.
+
+    Phases absent from a day are not counted -- the mean denominator
+    is the number of days that actually ran that phase, so e.g.
+    t3_labeling on a 5-day run with T3 enabled on only 3 days has
+    n_days=3, not 5. (M2.2 sub-task #23.)
+    """
+    results = [
+        DayRunResult(
+            trading_date=date(2026, 4, 15),
+            phase_durations_ms={
+                "data_prep": 100.0,
+                "tick_loop": 200.0,
+                "t3_labeling": 50.0,
+            },
+        ),
+        DayRunResult(
+            trading_date=date(2026, 4, 16),
+            phase_durations_ms={
+                "data_prep": 200.0,
+                "tick_loop": 400.0,
+                # t3_labeling omitted on day 2
+            },
+        ),
+        DayRunResult(  # skipped day, no phase data
+            trading_date=date(2026, 4, 17),
+            skipped=True,
+        ),
+    ]
+    clients = TierClients(t1=MagicMock(), t2=None, t3=None)
+    summary = json.loads(_build_summary_json(results, clients))
+    # data_prep: 100 + 200 = 300 total, 150 mean, 2 days
+    assert summary["phase_data_prep_total_ms"] == 300.0
+    assert summary["phase_data_prep_mean_ms"] == 150.0
+    assert summary["phase_data_prep_n_days"] == 2
+    # tick_loop: 200 + 400 = 600 total, 300 mean, 2 days
+    assert summary["phase_tick_loop_total_ms"] == 600.0
+    assert summary["phase_tick_loop_mean_ms"] == 300.0
+    assert summary["phase_tick_loop_n_days"] == 2
+    # t3_labeling: only present on day 1
+    assert summary["phase_t3_labeling_total_ms"] == 50.0
+    assert summary["phase_t3_labeling_mean_ms"] == 50.0
+    assert summary["phase_t3_labeling_n_days"] == 1
+    # Phases never present in any day are absent from payload.
+    assert "phase_fill_sim_llm_total_ms" not in summary
+    assert "phase_base_pass_total_ms" not in summary
+
+
+def test_build_summary_json_round_trips_total_wall_clock_ms():
+    """total_wall_clock_ms kwarg lands in the payload, rounded to 2dp."""
+    clients = TierClients(t1=MagicMock(), t2=None, t3=None)
+    summary = json.loads(_build_summary_json(
+        [], clients, total_wall_clock_ms=12345.6789,
+    ))
+    assert summary["total_wall_clock_ms"] == 12345.68
+
+    # Default (kwarg omitted) -> field absent
+    summary_default = json.loads(_build_summary_json([], clients))
+    assert "total_wall_clock_ms" not in summary_default
+
+
 # ===========================================================================
 # _setup_logging (Rule 22)
 # ===========================================================================

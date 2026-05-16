@@ -1385,3 +1385,128 @@ async def test_t3_decisions_propagate_to_dayrunresult(monkeypatch):
     )
     assert results[0].t3_decisions == fixed
     assert len(results[0].t3_decisions) == 2
+
+
+# ===========================================================================
+# Phase timing instrumentation (M2.2 sub-task #23)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_phase_durations_populated_with_all_five_keys_when_all_phases_run(
+    monkeypatch,
+):
+    """Success path with portfolio + base_portfolio + T3 -> all 5 phases
+    fire and phase_durations_ms has all 5 keys."""
+    from data.replay.fill_simulator import DayApplicationResult
+    from data.replay.t3_budget import T3Budget
+
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(),
+            eod_exits=(), equity_curve=(),
+        )
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
+    )
+    monkeypatch.setattr(
+        "data.replay.driver.run_day_base_ticks",
+        lambda **kw: _tick_decisions(kw["day_state"].trading_date, n=1),
+    )
+
+    async def _fake_t3(**kw):
+        return []
+
+    monkeypatch.setattr(
+        "data.replay.driver.run_day_t3_ticks", _fake_t3
+    )
+
+    t3_client = MagicMock()
+    t3_client.backend = "anthropic"
+    t3_client.model_id = "claude-opus-4-6"
+    clients = TierClients(t1=_FakeClient(), t2=None, t3=t3_client)
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    base_pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=clients, sentiment_conn=_conn(),
+        portfolio=pf, base_portfolio=base_pf,
+        t3_budget=T3Budget(cap_dollars=1.0),
+    )
+    pd = results[0].phase_durations_ms
+    assert pd is not None
+    assert set(pd.keys()) == {
+        "data_prep", "tick_loop", "fill_sim_llm",
+        "t3_labeling", "base_pass",
+    }
+    # All values must be non-negative floats.
+    assert all(isinstance(v, float) and v >= 0.0 for v in pd.values())
+
+
+@pytest.mark.asyncio
+async def test_phase_durations_omits_t3_labeling_when_t3_disabled(monkeypatch):
+    """clients.t3=None -> phase_durations_ms has no t3_labeling key."""
+    from data.replay.fill_simulator import DayApplicationResult
+
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(),
+            eod_exits=(), equity_curve=(),
+        )
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+    )
+    pd = results[0].phase_durations_ms
+    assert pd is not None
+    assert "t3_labeling" not in pd
+    assert "data_prep" in pd
+    assert "tick_loop" in pd
+    assert "fill_sim_llm" in pd
+
+
+@pytest.mark.asyncio
+async def test_phase_durations_omits_base_pass_when_base_portfolio_none(
+    monkeypatch,
+):
+    """base_portfolio=None -> phase_durations_ms has no base_pass key."""
+    from data.replay.fill_simulator import DayApplicationResult
+
+    cfg = _config(start_date=date(2026, 4, 15), end_date=date(2026, 4, 15))
+    _install_loader_mocks(monkeypatch)
+
+    def _fake_apply(*, decisions, day_state, portfolio, config):
+        return DayApplicationResult(
+            fills=(), rejections=(), stop_outs=(),
+            eod_exits=(), equity_curve=(),
+        )
+
+    monkeypatch.setattr(
+        "data.replay.driver.apply_day_to_portfolio", _fake_apply
+    )
+
+    pf = SimulatedPortfolio(starting_cash=50_000.0)
+    results = await run_replay(
+        config=cfg, clients=_clients(), sentiment_conn=_conn(),
+        portfolio=pf,
+        # base_portfolio omitted (default None)
+    )
+    pd = results[0].phase_durations_ms
+    assert pd is not None
+    assert "base_pass" not in pd
+    assert "data_prep" in pd
+    assert "tick_loop" in pd
+    assert "fill_sim_llm" in pd

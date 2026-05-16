@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -169,6 +170,14 @@ class DayRunResult:
     base_stop_outs: tuple[StopOut, ...] = ()
     base_eod_exits: tuple[EodExit, ...] = ()
     base_equity_curve: tuple[EquityPoint, ...] = ()
+    # Per-phase wall-clock timings in milliseconds (M2.2 sub-task #23).
+    # Populated on the success path only; skipped days leave it None.
+    # Keys: data_prep, tick_loop, fill_sim_llm, t3_labeling, base_pass.
+    # Phases that did not run (e.g. t3_labeling when T3 disabled) are
+    # omitted from the dict rather than recorded as 0 -- absence is the
+    # signal so the summary builder can count n_days_with_phase
+    # correctly.
+    phase_durations_ms: dict[str, float] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -320,9 +329,14 @@ async def run_replay(
     results: list[DayRunResult] = []
     for trading_date in days:
         budget.reset()
+        # Per-phase wall-clock timings (M2.2 sub-task #23). Phases that
+        # don't run (T3 disabled, base disabled, etc.) are omitted; the
+        # absence is the signal for the summary builder.
+        phase_ms: dict[str, float] = {}
 
         # Per-day data prep. Loud failure here means the day cannot
         # produce meaningful LLMContexts; skip and continue.
+        _t0 = time.monotonic()
         try:
             day_state = await build_day_state(
                 config=config,
@@ -344,9 +358,11 @@ async def run_replay(
             results.append(skipped_result)
             _persist(skipped_result)
             continue
+        phase_ms["data_prep"] = (time.monotonic() - _t0) * 1000.0
 
         # Per-day tick loop. run_day_ticks shouldn't raise per #12's
         # contract, but defensively wrap.
+        _t0 = time.monotonic()
         try:
             decisions = await run_day_ticks(
                 day_state=day_state,
@@ -370,18 +386,21 @@ async def run_replay(
             results.append(skipped_result)
             _persist(skipped_result, regime=day_state.market_regime_label)
             continue
+        phase_ms["tick_loop"] = (time.monotonic() - _t0) * 1000.0
 
         # LLM-side fill + stop + MTM + EOD-flatten simulation when the
         # caller supplied a SimulatedPortfolio. With no portfolio (the
         # M2.2 #13 default pattern), all five LLM-side tuples remain
         # empty.
         if portfolio is not None:
+            _t0 = time.monotonic()
             llm_day_app = apply_day_to_portfolio(
                 decisions=decisions,
                 day_state=day_state,
                 portfolio=portfolio,
                 config=config,
             )
+            phase_ms["fill_sim_llm"] = (time.monotonic() - _t0) * 1000.0
             fills_t = llm_day_app.fills
             rejections_t = llm_day_app.rejections
             stop_outs_t = llm_day_app.stop_outs
@@ -401,6 +420,7 @@ async def run_replay(
         # pure labeling. Same LLMContext the live T1+T2 path saw, so
         # T1 ↔ T3 agreement metrics are apples-to-apples.
         if clients.t3 is not None and t3_budget is not None:
+            _t0 = time.monotonic()
             t3_decisions = await run_day_t3_ticks(
                 day_state=day_state,
                 market_ctx=market_ctx,
@@ -409,6 +429,7 @@ async def run_replay(
                 budget=t3_budget,
                 portfolio=portfolio,
             )
+            phase_ms["t3_labeling"] = (time.monotonic() - _t0) * 1000.0
         else:
             t3_decisions = []
 
@@ -418,6 +439,7 @@ async def run_replay(
         # then drives the SAME apply_day_to_portfolio against the base
         # portfolio so stops + EOD flatten + MTM apply symmetrically.
         if base_portfolio is not None:
+            _t0 = time.monotonic()
             base_decisions = run_day_base_ticks(
                 day_state=day_state,
                 config=config,
@@ -430,6 +452,7 @@ async def run_replay(
                 portfolio=base_portfolio,
                 config=config,
             )
+            phase_ms["base_pass"] = (time.monotonic() - _t0) * 1000.0
             base_fills_t = base_day_app.fills
             base_rejections_t = base_day_app.rejections
             base_stop_outs_t = base_day_app.stop_outs
@@ -462,6 +485,7 @@ async def run_replay(
             base_stop_outs=base_stop_outs_t,
             base_eod_exits=base_eod_exits_t,
             base_equity_curve=base_equity_curve_t,
+            phase_durations_ms=phase_ms,
         )
         results.append(day_result)
         _persist(day_result, regime=day_state.market_regime_label)
