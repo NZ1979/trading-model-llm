@@ -241,6 +241,222 @@ Suggested sequence for the next chat:
 
 ---
 
-**Session wrap:** No code changes. One new doc to commit
+**Session wrap (round 1):** No code changes. One new doc to commit
 (`docs/sessions/2026-05-16-m3-diagnosis.md`). Rule 27 durability block
 to follow.
+
+Committed and pushed round 1: `adafc17`.
+
+---
+
+## Round 2 diagnostics: locate the defects at line-number precision
+
+Continuation in the same chat after round 1 wrap. Pure file-reading
+diagnostics to give the next chat exact line numbers for each fix
+instead of re-deriving them. No code changes in round 2 either.
+
+### Round 2 finding 1: the 280-char cap (defect #1)
+
+Two locations, must move in lockstep:
+
+- **Hard cap:** `strategy/llm/types.py:132` — `reasoning: str = Field(max_length=280)`
+- **Truncation validator:** `strategy/llm/types.py:268-273` — `@field_validator("reasoning", mode="before")` truncates at 277 chars and appends `"..."`, producing exactly 280 chars. This is what produced the mid-word truncation observed in every row (e.g. `...accelerating. Bul...`).
+- **Soft prompt instruction:** `strategy/llm/prompts.py:65` — `Keep reasoning under 280 characters; concerns to <=5 short tags.`
+
+The validator is the hard enforcer. The prompt is just guidance. To
+widen, change all three numbers together (Field max_length, validator
+truncation length and slice index, prompt instruction). Suggested
+target: 800-1200 chars. The same pattern applies to
+`setup_label` (max 50, validator at lines 261-266) and
+`alternative_view` (max 140, validator at lines 275-279), but those
+are deliberately short categorical/summary fields and don't need
+widening.
+
+### Round 2 finding 2: confidence anchoring is intentional and explicit (defect #6)
+
+Read `strategy/llm/prompts.py:34-68`. The T1 system prompt aggressively
+biases toward Hold. Verbatim excerpts:
+
+- Line 36: `You make conservative, high-conviction decisions. You prefer Hold over forcing a marginal trade.`
+- Line 40-41: `Hold is the default. Only return Buy or Sell if you see a setup worth ~0.5% account risk.`
+- Line 42-43: `Confidence below 40 should always be Hold. Low-conviction trades lose money historically.`
+- Line 44-45: `Counter-trend trades ... need exceptional justification, typically a clear catalyst.`
+
+**Verdict:** the 52-confidence ceiling and the 1,427-of-1,742-calls-at-conf<30
+distribution observed in step d are NOT emergent. They are precisely
+what the prompt instructs. The model is following its instructions.
+
+**Two second-order issues this surfaces:**
+
+(a) The prompt sets a 40 floor for directional calls; the T2 escalation
+band is [50, 75]. There is a 10-point gap (40-49) where the model will
+fire a Buy/Sell but never escalate to T2. The MSFT Buy at conf=52
+barely crossed into the T2 band; structurally, the prompt's incentive
+pushes directional commits right against the lower escalation edge.
+
+(b) "Low-conviction trades lose money historically." Based on what
+historical data? This fork is new. If inherited from the base
+gap-and-go engine's stats, the empirical basis may not apply to the
+LLM model's setup space. Worth tracing the provenance of this claim
+before deciding whether to keep, soften, or replace it.
+
+**Implication for the small-cap re-run:** the confidence anchor will
+travel with the model into the new universe. A wider universe alone
+will not break the ceiling. If the goal is to gather signal-quality
+data on directional calls (the M3 entry-sequence requirement), the
+prompt's bias toward Hold needs to be addressed at the same time as
+or before the universe change. Otherwise the next run produces the
+same 1-trade-per-1,742-calls outcome on a different watchlist.
+
+### Round 2 finding 3: tool-use config is correct, schema failures are model hallucinations (defect #2 refined)
+
+Read `strategy/llm/clients.py` end-to-end. The Anthropic client is
+correctly configured:
+
+- `clients.py:252-260` sets `tool_choice={"type": "tool", "name": "submit_decision"}` (forces tool use) with the schema generated from `LLMDecision.model_json_schema()` minus platform-only fields.
+- `clients.py:202-213` correctly parses the tool_use block from the response.
+- `clients.py:216-230` constructs `LLMDecision` from `tool_block.input`, attaching usage metadata as `raw_response`.
+
+**There is no JSON-mode-vs-tool-use config bug.** The two
+schema_invalid_t1 failures are Haiku producing malformed string
+content *inside* a valid tool-use envelope:
+
+- AMZN: `time_horizon='intraday</time_horizon>\n</invoke>'`. The model wrote XML closing tags as part of the literal string value for an enum field. The SDK passed it through; pydantic rejected it because it's not in the enum.
+- TSLA: `concerns='["gap-down without recov...RSI but no reversal"]}\n'`. The model wrote a stringified JSON list (a string whose content is JSON) instead of an actual list, with extra `}\n` trailing garbage.
+
+**Suggested mitigations (in order of robustness):**
+
+1. Add a string-cleanup `field_validator(..., mode="before")` for
+   string fields that strips `</[a-z_]+>` tag patterns and
+   `</invoke>` artifacts before the literal-enum check fires.
+2. Add a `field_validator("concerns", mode="before")` that
+   detects stringified-JSON-list inputs (starts with `[`,
+   contains `]`) and `json.loads` them. This pattern is already
+   implemented for the Qwen path at `clients.py:337-363`
+   (`_coerce_qwen_param`) — port the same logic to a Pydantic
+   validator so it works for both backends.
+3. Add a one-shot JSON-repair retry: on `SchemaInvalidError`,
+   re-call the model with a follow-up message showing the
+   pydantic error and asking for a corrected response. This is a
+   larger change and may not be worth it for a 0.11% failure
+   rate.
+
+(1) and (2) together would catch both observed failure shapes with
+small, well-contained code changes that fit the existing validator
+pattern.
+
+### Round 2 finding 4: defects #3, #4, #5 collapse to a single line-numbered persistence bug
+
+Read `data/replay/persistence.py:421-447`. The INSERT statement for
+`replay_decisions` writes 11 columns and 11 placeholders:
+
+```
+INSERT INTO replay_decisions
+(run_id, trading_date, tick_et, ticker, decision_source,
+ action, setup_label, confidence, reasoning,
+ tier_provenance, regime)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+```
+
+The table has 13 data columns (per PRAGMA from step b). `raw_response`
+and `risk_check_result` are **simply omitted** from both the column
+list and the VALUES tuple. The columns exist in the schema; the
+INSERT silently never writes to them; every row therefore has NULL in
+both columns.
+
+**Diagnosis revision:** the original diagnosis listed three separate
+defects:
+
+- #3 persist raw_response
+- #4 persist LLMContext
+- #5 populate risk_check_result on Buys
+
+Defects #3 and #5 are **the same one-line fix**: amend the INSERT
+statement to include the two columns. The data is already being
+populated upstream (the Anthropic client populates `raw_response` at
+`clients.py:218-229`, and `risk_check_result` populated by the
+signal_engine / risk module — to be confirmed but not relevant for the
+persistence-layer fix). Defect #4 (LLMContext payload) is a separate
+add since the context isn't on the `LLMDecision` model; it needs its
+own column or a sidecar JSON file.
+
+The same INSERT bug exists in the T3 path at lines 376-395, which
+also omits both columns. Fix in both places.
+
+### Round 2 finding 5: error-path also discards raw input on validation failure (companion to defect #3)
+
+`strategy/llm/clients.py:231-234`:
+
+```python
+except ValidationError as exc:
+    raise SchemaInvalidError(
+        f"LLMDecision validation failed: {exc}"
+    ) from exc
+```
+
+When `LLMDecision(**tool_block.input, raw_response=...)` raises on bad
+input, the raw `tool_block.input` dict is discarded. Only the pydantic
+error message string survives the exception chain. That's why the two
+`schema_invalid_t1` rows had truncated pydantic error excerpts as their
+"reasoning" and nothing else useful for diagnosis.
+
+**Fix:** capture `tool_block.input` (and the usage metadata) before
+raising, attach to the exception, and surface to the signal_engine so
+it can write the synthetic-Hold row with the original malformed input
+preserved in the `raw_response` column. Pairs naturally with the
+persistence-INSERT fix above.
+
+### Round 2 finding 6: LocalClient has defensive parsing that should back-port
+
+The dormant `LocalClient` (LM Studio / Qwen path, lines 402-587) is
+much more defensive than the AnthropicClient. Specifically:
+
+- `_coerce_qwen_param` (lines 337-363) JSON-decodes stringified
+  list/object values. Exactly the TSLA failure shape.
+- `_parse_qwen_tool_call` (lines 366-394) parses XML-style tool calls
+  from text content as a fallback when the SDK's tool_calls list is
+  empty. Adjacent to but not the same as the AMZN failure.
+- Lines 514-532 build a rich diagnostic dump on no-tool-call failures
+  (finish_reason, tool_calls list, token counts, message dump) instead
+  of a one-line error.
+
+The Anthropic path predates some of this. Worth a sweep to bring it
+to parity.
+
+### Revised defect inventory after round 2
+
+Net effect of round 2: the seven defects from round 1 reduce to **five**
+with much sharper localization. Three of the original five become a
+single INSERT-statement fix; what was vague becomes line-numbered.
+
+| # | Defect | Location | Notes |
+|---|---|---|---|
+| 1 | Reasoning truncated to 280 chars | `types.py:132,268-273` + `prompts.py:65` | Widen all three together. Same pattern for setup_label/alternative_view exists but they're correctly short. |
+| 2 | T1 schema_invalid failures (XML tags, stringified-JSON) | `types.py` validators | Add `mode="before"` validators: strip XML tag patterns on string fields, JSON-decode stringified-list values on `concerns`. Pattern already exists for numerics + lengths. |
+| 3 | Raw response + risk_check + LLMContext not persisted | `persistence.py:425-444` (and 376-395 for T3) | INSERT omits 2 existing columns. Add them. Then add a sidecar column or JSON for LLMContext (separate concern). |
+| 4 | Error-path discards raw input on validation failure | `clients.py:231-234` | Capture `tool_block.input` before raising; surface through exception. |
+| 5 | Confidence-anchoring language pulls ceiling to ~52 | `prompts.py:36,40-43` | Intentional, not a bug. Decide whether to soften for the next M3 entry-sequence run, since the existing anchor will produce the same "1 trade per 1,742 calls" outcome on any universe. |
+| 6 | setup_label freeform sprawl | `types.py:131` | Already-known. Constrain to enum. Low priority. |
+| 7 | (Bonus) AnthropicClient less defensive than LocalClient | `clients.py` | Back-port `_coerce_qwen_param`-style JSON-decode logic and richer no-tool-call diagnostics. Subset of #2 mitigations. |
+
+### Round 2 conclusion
+
+Same overall recommendation as round 1: fix defects 1-4 first, decide
+on #5 (the prompt anchoring is the most consequential one), then
+re-run on the wider universe. Round 2 made each fix mechanically
+specific:
+
+- Defect #1: edit 3 line locations (one Field, one validator, one prompt line)
+- Defect #2: add 2 validators in `types.py`
+- Defect #3: edit 2 INSERT statements in `persistence.py`, plus a separate small change to add an LLMContext column or sidecar
+- Defect #4: change 4 lines in `clients.py` error handler
+- Defect #5: prompt edit + a conversation with the user about what the right calibration is
+
+Plus the back-port from finding 6 if there's appetite. None of these
+are large changes individually; the full set is probably a half-day of
+focused work in a fresh chat.
+
+---
+
+**Session wrap (round 2):** No code changes in round 2 either. Doc
+amended in place. Rule 27 durability block to follow.
