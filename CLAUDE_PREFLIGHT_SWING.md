@@ -117,7 +117,7 @@ This rule slot is reserved for re-issuance once the swing model's deployment tar
 ## Rule 10: [Reserved — see note below]
 
 **Note (2026-05-17, scrub to LLM_SWING_MODEL):**
-The original Rule 10 was a snapshot of the gap-and-go fork's deployment status as of 2026-04-29 (Hetzner CPX21 Ashburn VA, 503-ticker watchlist, dedup bug diagnosis, Databento cancellation, options-walls Phase 7 deferral, Anthropic credit burn rate). None of that applies to this project.
+The original Rule 10 was a snapshot of the gap-and-go fork's deployment status as of 2026-04-29 (Hetzner CPX21 Ashburn VA, 503-ticker watchlist, dedup bug diagnosis, dormant Databento futures subsystem, options-walls Phase 7 deferral, Anthropic credit burn rate). None of that applies to this project. (Note: the original Rule 10 stated "Databento subscription CANCELED on 2026-04-28," which was discovered on 2026-05-17 to have been documented prematurely; the subscription was still active. Cancellation was performed on 2026-05-17 once verified; see `docs/SCRUB_AND_SCAFFOLD_PLAN_2026-05-17.md` §10 for the audit trail.)
 
 The LLM Swing Model has no live deployment. Current status is "research and scaffolding phase, Phase R1 complete, Phase R2 not yet started." Reserved for re-issuance with the swing model's actual deployment state when paper trading begins in Phase R5.
 

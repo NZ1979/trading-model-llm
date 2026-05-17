@@ -49,7 +49,7 @@ on_5min_bar(bar):
   → if Buy/Sell: validate_order → submit_bracket_order → log to SQLite
 ```
 
-Polygon Stocks Starter is 15-min delayed (historical only; never primary intraday). Databento was canceled — `walls=None` is permanent. Finnhub provides earnings calendar.
+Polygon Stocks Starter is 15-min delayed (historical only; never primary intraday). The Databento futures subsystem is dormant in this fork (`futures.enabled: false`); `walls=None` is permanent in the swing-model architecture regardless of subscription status. Finnhub provides earnings calendar. (Note: this doc originally stated "Databento was canceled," which was inherited from project docs but later determined incorrect on 2026-05-17; the subscription was active and was cancelled that day. See `docs/SCRUB_AND_SCAFFOLD_PLAN_2026-05-17.md` §10.)
 
 ### Logging discipline (Rule 22)
 

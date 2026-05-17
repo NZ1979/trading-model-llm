@@ -98,7 +98,7 @@ The "Reason for removal" column below is now "Reason for non-migration" — thes
 | `data/bar_types.py` | `MinuteBar`, `FiveMinBar` dataclasses. |
 | `data/watchlist_builder.py` | Gap-and-go's daily dynamic watchlist generator. |
 | `data/pm_rvol_thresholds.py` | Per-ticker premarket RVOL gates. Gap-and-go-specific. |
-| `data/databento_feed.py` | Dormant Databento integration (futures walls, canceled). |
+| `data/databento_feed.py` | Dormant Databento integration (futures walls). Subscription was cancelled on 2026-05-17 per §10; the swing model does not use Databento. |
 | `data/news_feed.py` | Alpaca News WebSocket. KEEP THE CONCEPT but rewrite for the new arch's news flow. Removing this file forces a clean rewrite rather than accidental reuse. |
 | `data/news_pipeline.py` | Sentiment pipeline that batched to Haiku every 60s. Will be rebuilt as a continuous research pipeline. |
 | `data/finnhub_feed.py` | Earnings calendar adapter. Concept transfers; file will be rewritten as part of the catalyst detection layer. |
@@ -549,3 +549,77 @@ Recommendation is (b). Confirm or override.
 - User runs Step 6 (git init + commit + push).
 
 Note: Step 5 cannot happen in this session because Cowork is currently anchored at `C:\trading\LLM model\`. Writing scaffold files to the new folder requires Cowork to be switched first.
+
+---
+
+## 10. Design decisions captured this session (2026-05-17)
+
+### 10a. Databento subscription audit and cancellation
+
+**Audit finding:** Multiple project documents (`CLAUDE.md`, `PROJECT_BLUEPRINT.md`, the original `CLAUDE_PREFLIGHT.md`, `docs/NARRATIVE_OVERVIEW.md`, and several derived files in `docs/sessions/`) consistently stated that the Databento CME Globex MDP3.0 subscription was cancelled on 2026-04-28. On 2026-05-17, Neale confirmed the subscription was in fact still active and being billed at $179/month. The "canceled" claim was a documentation error — likely a planned cancellation that got documented as a completed action without verification follow-through. The error propagated through every doc that copied the original claim forward.
+
+**Rule classification:** This is a Rule 7 violation (silently locked-in default — "we decided to cancel" became "we cancelled" without revisit) compounded by a Rule 14 violation (verification before conclusion — the conclusion "subscription cancelled" was never tested against billing or the Databento dashboard). It is also the exact failure mode Rule 1 was written to prevent: never claiming current state about an external service without verifying it.
+
+**Decision:** Neale is cancelling the Databento subscription on 2026-05-17 because (a) the legacy intraday architecture is parked and the futures-walls scanner code is dormant, and (b) the new LLM Swing Model architecture does not consume Databento data (rationale in §10b below). Cancellation is the user's action; this plan does not include cancellation steps because Databento UI navigation is subject to Rule 1 (the UI may have changed since training data).
+
+**Documentation correction scope:** The following migrated docs had stale "Databento cancelled" claims that were corrected this session, with audit-trail notes pointing here:
+- `CLAUDE_PREFLIGHT_SWING.md` — Rule 10 reserved-placeholder narrative
+- `docs/STRATEGY_STATUS_2026-05-16.md` — architecture section
+- `docs/SCRUB_AND_SCAFFOLD_PLAN_2026-05-17.md` (this doc) — §3b file description
+
+Docs that stay in the legacy archive (`docs/NARRATIVE_OVERVIEW.md`, the m2.2 session series, the original `PROJECT_BLUEPRINT.md`, the original `CLAUDE_PREFLIGHT.md`) retain the stale claims as historical record. The legacy archive is read-only per Rule 26; future swing-model sessions will not be misled by those docs because they will not be read in operational context.
+
+`docs/sessions/2026-05-16-strategy-review.md` retains the original "Databento was canceled" framing in its analytical response to ChatGPT, as historical record of conclusions reached under the incorrect assumption. The substantive analysis (microstructure data unusable at 5-min cadence regardless of source) is not affected by the correction.
+
+### 10b. Macro context data layer — to be included in swing architecture
+
+**Decision:** The LLM Swing Model architecture will include a macro context layer that incorporates three free data sources as inputs to the daily research loop and the decision engine. This decision replaces the prior implicit framing where Databento futures data was treated as a potential macro context source.
+
+**Sources (all free):**
+
+| Source | Vendor | What it provides | Cadence |
+|---|---|---|---|
+| **SPY ETF** | Alpaca Daily (free) or Polygon Stocks Starter ($29/mo, already subscribed) | S&P 500 directional context; overnight gap; intraday-RTH change | Daily bars; intraday available if useful |
+| **VIX index** | FRED (free), Yahoo (free), or Polygon (already subscribed) | Volatility regime — implied 30-day forward vol on S&P | Daily close, plus intraday if helpful |
+| **TLT ETF (or 10Y yield via FRED)** | Alpaca Daily (free) or FRED 10Y daily series (free) | Rate environment, rate-sensitive sector tilt input | Daily |
+
+**Computed metrics (designed in Phase R3, implemented in Phase R3):**
+
+- **SPY trend regime:** distance from 50-day SMA, distance from 200-day SMA, 20-day return percentile vs 1-year history
+- **SPY overnight gap:** prior-day close to today's pre-market open (as %, signed)
+- **VIX regime:** current level percentile vs trailing 1-year; classify as low (<20), normal (20-25), elevated (25-35), stressed (>35)
+- **VIX delta:** 5-day change in level (rapid spikes are catalyst signals in their own right)
+- **TLT direction:** 5-day, 20-day price change; signals rate expectations shift
+- **Yield curve slope (optional):** if 2Y yield is also pulled from FRED, compute 10Y-2Y as a recession indicator
+
+**How these factor into the model:**
+
+1. **Daily research loop input.** Every pre-market research run starts with a macro snapshot. The LLM is told "VIX is at 28 (elevated regime), SPY is below its 50-day SMA, TLT rallied 1.2% yesterday on rate-cut speculation." This shapes how it interprets individual-name catalysts.
+
+2. **Position-sizing modifier.** In elevated-VIX regimes, base position sizes get scaled down (e.g., multiply by 0.7). In low-VIX trending regimes, sizes can run closer to the cap. Specific multipliers tuned during Phase R4 backtest.
+
+3. **Catalyst-weight modifier.** Risk-on catalysts (growth-sector positive guidance) get up-weighted in risk-on regimes and down-weighted when macro is stressed. Risk-off catalysts (defensive-sector strength, rate-sensitive moves) tilt the other way.
+
+4. **Sector rotation signal.** TLT direction informs which sectors get bias adjustments. Falling TLT (rising rates) favors financials, hurts utilities and REITs. Rising TLT (falling rates) reverses that.
+
+5. **Circuit-breaker pre-condition.** If VIX is in stressed regime AND SPY is in a defined drawdown (e.g., >5% from recent high), trigger a "reduce activity" mode that suppresses all new entries until regime normalizes. This is on top of the 25% portfolio drawdown circuit breaker from `STRATEGY_RESET_2026-05-16.md`.
+
+**Implementation footprint (added to scaffold work in next session):**
+
+The macro layer adds these to the seven-module scaffold:
+
+- **`data/macro_feed.py`** (new file) — pulls daily SPY, VIX, TLT bars/values. Lightweight; reuses Polygon or Alpaca clients we already need.
+- **`knowledge_base/macro_state.py`** (new file) — computes the metrics above from raw data, stores in the time-series DB, provides query API for the research loop and decision engine.
+- **`docs/ARCHITECTURE.md`** — section on macro context layer, the five uses above.
+- **`docs/DATA_SOURCES.md`** — entries for SPY, VIX, TLT specifying source vendor, cadence, refresh logic.
+- **`config/settings.yaml`** — macro-context section: source choices (which free source per metric), thresholds (VIX regime boundaries), sizing multipliers.
+
+These are minor additions, not architectural changes. They drop in cleanly to Phases R2 (ingestion) and R3 (research loop + decision engine integration). No impact on the timeline in `STRATEGY_RESET_2026-05-16.md`.
+
+### 10c. Process note for future sessions
+
+Two lessons from today's session worth tracking:
+
+1. **Documentation cascade audit.** When a project document contains a claim about external service state (subscription status, account balance, deploy state, API key validity), any other document that references that claim inherits the error. The Databento "canceled" claim propagated across at least seven docs without anyone verifying the underlying account. Periodic audits should treat "current state of external service" claims as expiring assertions that require re-verification.
+
+2. **The free-alternative test.** Before adding a paid data source to an architecture, ask: "What free source captures 80%+ of the value?" In this case, SPY+VIX+TLT capture roughly 90% of the macro context value of Databento ES/VX/ZN futures, at $0 vs $179/month. The expensive part of Databento (MBP-10 Level 2) is the part the swing model architecturally cannot use. Pre-paid optionality on capability the architecture cannot consume is the worst kind of subscription.
