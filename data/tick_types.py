@@ -17,10 +17,19 @@ directly storable in SQLite's INTEGER column. `as_datetime()` exists for
 display and interop only, and truncates to microseconds by construction —
 never sort or dedupe on its result.
 
-Sizes are in SHARES throughout. This differs from Schwab's level one, where
-bid/ask sizes are in lots — that conversion belongs in the Schwab adapter,
-not here, so nothing downstream has to remember which vendor a size came
-from.
+Sizes are in SHARES throughout — trades and quotes alike.
+
+This contradicts Alpaca's field reference, which describes quote sizes as
+"in round lots". Observation settles it: on 2026-08-14 post-market, SNDK
+showed a bid of 1665.00 x 1280 during a window whose entire tape was 274
+shares. As round lots that would be 128,000 shares resting on one level
+against 274 traded — not credible. As shares it is ordinary. Treat the
+"round lots" phrasing as a documentation error.
+
+This differs from Schwab's level one, where bid/ask sizes genuinely ARE in
+lots while last size is in shares. That conversion belongs in the Schwab
+adapter, not here, so nothing downstream has to remember which vendor a size
+came from.
 """
 
 from __future__ import annotations
