@@ -9,7 +9,7 @@
 broker:
   mode: paper                                      # paper | live
   alpaca_base_url: https://paper-api.alpaca.markets
-  alpaca_data_feed: iex                            # sip (Algo Trader Plus) | iex (free, IEX-only). Flipped to iex 2026-05-14: PA3QAZ941NFN doesn't have Algo Trader Plus. Shadow path doesn't need full SIP for verification.
+  alpaca_data_feed: sip                            # sip (Algo Trader Plus) | iex (free, IEX-only). Restored to sip 2026-08-14: Algo Trader Plus verified Active across all three Alpaca accounts, so the 2026-05-14 downgrade rationale is void. IEX understates pre-market volume to 5-15% of true (see data/alpaca_market_data.py docstring), which silently corrupted every RVOL-gated signal while in effect.
 
 market_data:
   polygon_baseline_days: 20                        # days of pre-market history for RVOL denominator

@@ -71,3 +71,8 @@ docs/reports/replay_results.db
 # Session run logs (Tee-Object output from replay runs / verifier scripts).
 # Regenerable; noisy; not source.
 docs/sessions/*.log
+# Tick corpus (v4 feed daemon). SQLite WAL sidecars are NOT covered by the
+# *.db-journal rule above - WAL mode produces -wal/-shm instead. Multi-GB.
+*.db-wal
+*.db-shm
+data/ticks/

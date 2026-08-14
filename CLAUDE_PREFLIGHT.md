@@ -472,6 +472,15 @@ State all three verifications inline in the first substantive response of the se
 
 ## Rule 26: Hard partition between LLM-model (Godzilla) and gap-and-go (old laptop + VPS)
 
+> **AMENDMENT 2026-08-14 - the rule stands, its premise changed.** The user reports the gap-and-go fork was shut down on or about 2026-08-12. PA3REQ1LMPKO is described as free for any use. Three consequences:
+>
+> 1. **The prohibitions in this rule remain in force.** "Shut down" is not "verified gone." Until the VPS at `5.161.199.155` is confirmed decommissioned in writing, treat every tripwire string below as live. A dormant service is still a service, and its DB is still contaminating data.
+> 2. **No account crossing is required, so do not do it.** Alpaca Algo Trader Plus is Active across all three accounts as of 2026-08-14, so the LLM fork streams market data on its own account (`PA3QAZ941NFN`) keys. There is no entitlement reason to reach for PA3REQ1LMPKO credentials. If a future task appears to need them, that is a scoped, deliberate crossing per the "only legitimate crossing point" clause - not an ambient convenience.
+> 3. **Vendor market data is not fork state.** Alpaca ticks, Polygon bars, and Schwab book snapshots are vendor data and carry no fork identity. The contamination this rule prevents is *operational state* - decisions, orders, balances, `trading.db` rows, journalctl. Do not over-apply the rule to vendor feeds; do not under-apply it to anything else.
+>
+> Revisit this amendment once the VPS is confirmed torn down. At that point clauses 1-2 and 6 can be retired and the rule reduces to a repo/remote separation rule.
+
+
 The two forks of `trading-platform` running in this project operate on separate machines, separate Cowork sessions, and separate Alpaca accounts. They do not share operational threads, not even read-only ones. Rules 20 and 25 stated the separation at a planning level; this rule makes it operational and enforceable.
 
 **The two forks:**

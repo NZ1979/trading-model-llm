@@ -17,7 +17,7 @@ The user is paper-trading first to validate signals before going live. **No real
 | Component | Service | Cost/mo |
 |---|---|---|
 | Equity broker | Alpaca paper | $0 |
-| Equity real-time bars | Alpaca SIP (Algo Trader Plus) | $99 |
+| Equity real-time bars | Alpaca SIP (Algo Trader Plus) | $99 | *Active on all 3 accounts, verified 2026-08-14*
 | Equity historical | Polygon Stocks Starter | $29 |
 | News firehose | Alpaca News WebSocket (Benzinga) | $0 |
 | Sentiment | Claude Haiku 4.5 (`claude-haiku-4-5-20251001`) | ~$2-4/day |
@@ -31,10 +31,14 @@ The user is paper-trading first to validate signals before going live. **No real
 - Polygon Stocks Starter is 15-minute DELAYED. Used for HISTORICAL ONLY. Real-time bars come from Alpaca SIP.
 - Databento Standard ($179) does NOT include live MBP-10. Plus ($1,500) does. The user canceled Databento on 2026-04-28.
 - Claude Pro/Max subscription does NOT include API access. Separate billing at console.anthropic.com.
+- **2026-08-14**: `alpaca_data_feed` was on `iex` from 2026-05-14 to 2026-08-14 on the stated basis that PA3QAZ941NFN lacked Algo Trader Plus. That was wrong or became wrong: the subscription is Active across all three Alpaca accounts. IEX is a single exchange and understates pre-market volume to 5-15% of true, so every RVOL-gated signal computed in that window ran against a fraction of real volume. Restored to `sip`. Do not re-flip to `iex` without re-checking the Alpaca dashboard first.
+- **2026-08-14**: Schwab Trader API app `trading-feed-daemon` created (Production, Ready For Use, Order Limit 0). Schwab has NO time-and-sales service - level one is officially conflated and there is no tape endpoint anywhere in the API. Schwab's role is `NASDAQ_BOOK` depth only (MPID, per-MM size, per-MM quote time). The tape comes from Alpaca SIP. Do not re-litigate this.
 
 ---
 
 ## 3. Current deployment state (as of 2026-04-28 ~22:00 UTC / 6 PM ET)
+
+> **STALE as of 2026-08-14.** This section describes April. The repo was dormant from mid-May to mid-August, and the gap-and-go fork has since been shut down. Treat every status line below as historical until re-verified against the live systems. Do not act on it.
 
 ### VPS
 
