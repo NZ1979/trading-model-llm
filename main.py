@@ -1783,8 +1783,21 @@ def setup_logging(level: str) -> None:
     # journalctl / log files. Each library below logs at INFO by default;
     # WARNING keeps real errors visible while hiding routine request URLs.
     # Bug fix 2026-05-04 after a Polygon key leaked via httpx INFO logs.
+    #
+    # 2026-08-14 Rule 22 audit, on adding schwab-py (pulls flask + werkzeug):
+    # schwab-py runs a local Flask server to catch the OAuth redirect, and
+    # Schwab returns the authorization code as a URL QUERY PARAMETER. Werkzeug
+    # logs every request line at INFO including the full path and query, so an
+    # unsuppressed werkzeug logger writes the auth code to disk in plaintext:
+    #     127.0.0.1 - - [..] "GET /?code=C0.b2F1dGgy... HTTP/1.1" 200 -
+    # Same failure shape as the Polygon leak above. The code is single-use and
+    # short-lived, but it is still a credential in a log file.
+    # `authlib` and `schwab` are included defensively - neither is confirmed to
+    # log credentials, but both sit on the token path and the cost of
+    # suppressing them is zero.
     for noisy_logger in ("httpx", "httpcore", "aiohttp", "anthropic",
-                         "urllib3"):
+                         "urllib3", "werkzeug", "flask", "authlib",
+                         "schwab"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 

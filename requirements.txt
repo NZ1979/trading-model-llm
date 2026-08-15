@@ -10,6 +10,11 @@ lxml>=5.0.0            # required by pandas.read_html in watchlist_builder.py (P
 # API SDKs
 anthropic>=0.39.0      # claude-haiku-4-5 sentiment scoring
 databento>=0.50.0      # ES futures order book (optional - skip if futures.enabled=false)
+schwab-py>=1.5.1        # Schwab Trader API: option chains (/chains),
+                        # NASDAQ_BOOK streaming. Pulls flask+werkzeug
+                        # for the OAuth callback server - see the Rule 22
+                        # audit note in main.py setup_logging before
+                        # changing the logger suppression list.
 
 # Standard library zoneinfo backport for Windows
 tzdata>=2024.1
