@@ -547,3 +547,65 @@ Capture the resulting commit SHA in the session summary as a literal line: **`Co
 - Apply symmetrically to both forks. Gap-and-go session wraps must verify push to the gap-and-go remote URL; LLM-model session wraps must verify push to the LLM-fork remote URL (`https://github.com/NZ1979/trading-model-llm.git`). Run `git remote -v` once to confirm which local label points at the intended URL (on the current Godzilla clone it is `origin`; on other clones it may differ — never hardcode the local label, push by intent). Cross-pushing between forks (the gap-and-go remote URL from an LLM-model session, or vice versa) is a Rule 26 violation; same-fork pushing is mandatory per this rule.
 - Rule 24 still applies: run `git status` and the commit/push from PowerShell on the workstation, NOT from the Cowork bash sandbox. The bash mount can hold stale snapshots; a 0-byte `.git/index.lock` from prior sandbox activity may need `Remove-Item .git\index.lock -ErrorAction SilentlyContinue` from PowerShell before commits work.
 - If the user explicitly requests that a specific change NOT be committed (a WIP experiment, a config flip pending decision, a debug `print()` to roll back), capture that exception explicitly in the summary: "**Per user request, NOT committed:** `<files>` — `<reason>`." Anything else is the failure mode this rule was written to catch.
+
+## Rule 28: Plausible mechanism is not evidence — run the disconfirming check before attaching any confidence to a hypothesis
+
+Closes a gap in Rule 14. Rule 14 governs **fix and diagnosis** claims — "the bug is X," "this fixes Y," "the platform is working" — and demands a reproducer. It does not govern **explanatory** claims: "X is the case *because of* Y," "this is almost certainly Z," "the likely cause is W." Those slip past Rule 14 wearing a `HYPOTHESIS:` label and land in the conversation as conclusions anyway, because the confidence language does the persuading while the label does the disclaiming.
+
+The underlying error is specific and worth naming precisely: **treating the plausibility of a mechanism as evidence for it.** When a coherent causal story explains the observation, the story feels supported. It is not. Many stories explain any single observation. An explanatory story becomes evidence only after competing stories have been checked and found to explain the observation *worse*. Skipping that step and going straight to "almost certainly" is the failure this rule exists to stop.
+
+`HYPOTHESIS:` and `UNVERIFIED:` are **debt markers, not disclaimers.** Writing one does not discharge the obligation to investigate — it records that the obligation is outstanding. Pairing a debt marker with confidence language ("almost certainly, HYPOTHESIS") is the worst of both: it transfers belief while appearing to hedge.
+
+The correction is not to suppress hedged language. Uncertainty is real, and a system that cannot express it produces vagueness instead — which is worse, because vague claims cannot be falsified and therefore never get corrected. The correction is to make hedged language **fire an alarm on the speaker**: reaching for "probably" is the signal that the investigation is not finished, and the investigation is what has to change, not the vocabulary.
+
+**The rule, hard:**
+
+1. **"Probably" is a tripwire, not a forbidden word.** Uncertainty is real and must stay expressible. Banning the vocabulary would only hide the uncertainty rather than resolve it, and would push the answer toward vagueness — which is worse than a confident wrong answer, because vagueness cannot be falsified and therefore cannot be corrected.
+
+   Instead: the moment a hedge is reached for — "probably," "almost certainly," "most likely," "my money is on," "strongly suggests," "in order of likelihood," a ranked list of causes — **that is a stop signal.** Do not finish the sentence and move on. Halt and run the item-2 checks, with the explicit goal of converting the hedge into something conclusive.
+
+   The trigger is the **reasoning mode, not the word.** The word is a lagging indicator; the probabilistic reasoning precedes it and often never surfaces as a hedge at all. Catch it at the mode where possible. Noticing the word only after it has been typed still counts — go back and run the checks then.
+
+   Exactly three outcomes are permitted after the pause:
+
+   - **(a) Conclusion with evidence cited inline.** The hedge is deleted because it is no longer true.
+   - **(b) Bare `UNVERIFIED:`**, naming the specific unanswered question and the test that would answer it. The hedge is deleted and replaced by a named, addressable gap.
+   - **(c) The hedge survives** — permitted **only** when the investigation was actually run and genuinely could not resolve the question. It must then carry its investigation with it: what was checked, what that ruled out, and what residual uncertainty remains and why.
+
+   What is never permitted is a hedge word with no investigation standing behind it. **A surviving "probably" must carry its investigation with it.**
+
+2. **Three checks before any hypothesis is stated with confidence, in this order:**
+   - **(a) Does data already in hand refute it?** This is the cheapest check and the most embarrassing to skip. Before collecting anything new, re-read what has already been collected this session and ask specifically whether it contradicts the hypothesis.
+   - **(b) What is the cheapest disconfirming test?** Name it explicitly. If it costs less than ~2 minutes — one API call, one command, one arithmetic operation — **run it before stating the hypothesis**, not after, and not as a proposed follow-up for the user.
+   - **(c) What competing hypothesis explains the same observation, and what single observation separates them?** If no discriminating observation can be named, the hypothesis is not yet testable and must be labelled bare `UNVERIFIED:` with that fact stated.
+
+3. **Validate the instrument before reasoning from the measurement.** Clocks, file mounts, documentation, vendor claims and tool output are all instruments, and every one of them can be wrong. A measurement inherits the error of its reference. Before building an inference on any reference, check that reference against something independent — and prefer a reference that has itself been verified this session over one that merely looks authoritative.
+
+4. **With three or more data points, compute the trend before concluding from the latest one.** A level and a rate of change answer different questions. Concluding "no correction is being applied" from a rising number, when the *rate of rise* is falling, is a category error that the data already in hand refutes.
+
+5. **Do the arithmetic before raising the alarm.** If a claim that something is a problem depends on a number, compute the number first. A retracted false alarm costs more credibility than a slower correct one.
+
+6. **A hypothesis that would change what gets built earns a full research pass before it is stated, not after pushback.** The trigger is consequence, not confidence. If believing X means designing around X, X gets investigated first.
+
+7. **On correction, lead with it.** State the correction at the top of the next message, not buried. Then enumerate every downstream claim, design decision or plan that was built on the wrong hypothesis, and mark each as re-open or still-valid. A silently corrected premise leaves the conclusions standing.
+
+**Specific traps already fallen into (all 2026-08-15, one session):**
+
+*1. Schwab `isDelayed` — the expensive one.* Stated that delayed options data was "almost certainly inherent, not an entitlement toggle," supported by a coherent OPRA-licensing story: OPRA requires a signed subscriber agreement, Schwab absorbs it inside thinkorswim as a brokerage client benefit, an API app is a different distribution channel. Plausible, internally consistent, labelled `HYPOTHESIS`, and then *acted upon* — the next move was designing an architecture to route around the problem. **The user had to explicitly demand a deeper investigation.** That investigation, a single research pass, found: Schwab's `/chains` endpoint takes an `entitlement` parameter documented as "applicable only for retail token, entitlement of client PP-PayingPro, NP-NonPro, PN-NonPayingPro" — Schwab classifies the *client account*, not the developer app; the quote schema carries per-symbol `realtime` and `quoteType` fields where `quoteType` is documented "NBBO - realtime, NFL - Non-fee liable quote"; Schwab API Support states on record that API entitlement mirrors schwab.com entitlement; and Lumibot's Schwab integration documentation says plainly "No extra entitlements required for individual developers." The hypothesis was wrong, the disconfirming evidence was public and findable in one pass, and the cheapest discriminating test — one `/quotes` call comparing an equity and an option symbol on the same token — was eventually *proposed* rather than run. Cost: an architecture nearly designed around a problem that may be a free account-level toggle.
+
+*2. The container clock — instrument failure.* Asserted that Godzilla was on Eastern time and that two hours had elapsed between two clock measurements, then built a drift-rate analysis on top of both. The reference was the Cowork container's own clock, which had never been validated and was itself roughly two hours wrong. Godzilla is on Mountain time; four minutes had elapsed, not two hours. **The disconfirming evidence was already in the transcript** — the user's stated timezone and the workstation's own NTP-verified output, both available before the claim was made. Rule 23 was satisfied in form (a `date` command was run) and violated in substance (nothing asked whether `date` was telling the truth).
+
+*3. "w32time is not disciplining the oscillator" — refutable by arithmetic on data already collected.* Concluded from an offset that grew monotonically across three measurements. But the interval drift rate across those same three points was *falling* — 40.7 → 28.7 → 21.2 ppm — which is the signature of active frequency discipline that is merely too slow. Free-running drift would have held flat near 41 ppm. No new data was required to refute this; only the derivative of data already in hand.
+
+*4. The `SpecialPollInterval` false alarm.* Flagged `SpecialPollInterval: 1024` as a problem requiring correction, then retracted one message later after finally doing the multiplication: 1024 s × 41 ppm = 42 ms, comfortably inside the 500 ms budget. An alarm raised before ten seconds of arithmetic.
+
+**What worked, and why — the counter-example from the same session.** Diagnosing why the clock correction had not persisted produced three competing hypotheses: the time service was trigger-started and stopped again; a competing time provider was winning; the hardware clock was genuinely bad. Rather than ranking them and proceeding on the leader, a single command was chosen **specifically because its output would discriminate among all three**. `Get-Service W32Time` returned `Stopped` / `Manual` and settled it in one round trip. The lesson is precise: **the discriminating test did the work, not the ranking.** The ranking was decoration, and the leader being correct was partly luck. Item 2(c) exists to make the discriminating test mandatory and the ranking optional, rather than the reverse.
+
+**How to apply:**
+
+- Treat "probably" and its relatives as an alarm on yourself, not as a word to avoid. When one appears — or when the reasoning is running probabilistically and no hedge has been typed yet — stop and investigate *at that point*, not after sending. Ship the hedge only if the investigation ran and failed, and say what it ruled out.
+- Any sentence of the form "here is a mechanism that would explain this" must be followed in the same message by "and here is what would be observable if that mechanism were wrong." If that second sentence cannot be written, the first one is not ready to send.
+- Before reasoning from any clock, mount, document, vendor claim or tool output, name what validates it. Prefer a reference already verified this session over one that merely looks authoritative.
+- When three or more measurements exist, compute the rate of change before drawing a conclusion from the newest value.
+- When a hypothesis would change what gets built, research it to exhaustion before stating it. Being pushed into that investigation by the user is itself the failure.
+- On correction: lead the next message with it, then walk the downstream consequences explicitly. Do not let a corrected premise leave its conclusions standing.
