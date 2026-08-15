@@ -609,3 +609,39 @@ The correction is not to suppress hedged language. Uncertainty is real, and a sy
 - When three or more measurements exist, compute the rate of change before drawing a conclusion from the newest value.
 - When a hypothesis would change what gets built, research it to exhaustion before stating it. Being pushed into that investigation by the user is itself the failure.
 - On correction: lead the next message with it, then walk the downstream consequences explicitly. Do not let a corrected premise leave its conclusions standing.
+
+## Rule 29: A message containing a command ends with that command
+
+Mechanical, not discretionary. This rule exists because the equivalent instruction was given conversationally, acknowledged, and then violated three more times in the same session. An instruction that depends on remembering to follow it has already failed here; this one is a checkable property of the message.
+
+**The rule, hard:**
+
+1. **One command block per message. Never two.**
+2. **The command block is the last thing in the message.** Nothing follows it — no questions, no design decisions, no parallel topics, no status updates, no "while that runs," no next steps, no summaries.
+3. **Everything the user needs goes before the block:** which machine and which window it runs in (Rule 16), what the command does, what output is expected, and what each possible outcome means.
+4. **Wait for the result.** Never batch an anticipatory follow-up question alongside a command.
+5. **Two things to ask means two messages**, and the second only after the outstanding command has returned.
+6. **Multi-line blocks are permitted only when the lines form one logical operation with nothing to decide between them.** Independent commands stacked in one block hide failures: a permission error on line 1 stays invisible while lines 2 through 4 also fail against unset state.
+7. **No exceptions.** "It is only one small question" is the specific rationalization this rule exists to block.
+
+**The mechanical check:** after composing, look at the last line of the message. If the message contains a command block and the last line is not that block's closing fence, delete everything after the fence or move it above. There is no case in which text after the command is correct.
+
+**Why it happens — the accurate mechanism, not an intent story.** This is a property of next-token generation. When the context holds an unresolved item — an open question, a pending agenda entry, an undelivered finding — the probability mass following a closing code fence favors continuation over end-of-message. No decision to append is taken; the continuation is simply likelier than the stop. Two consequences follow, and both are load-bearing:
+
+- **Instructing the model to "be more careful" does not work**, and demonstrably did not work in this session. Care is a disposition; this failure is distributional. Only a discrete post-composition check alters the outcome, because a check is a step rather than a disposition.
+- **Unresolved items persist in context across turns and are re-emitted repeatedly.** The same deferred question surfaced three times because it stayed live in context. Explicitly parking an item — naming it as deferred and to which turn it returns — removes the attractor. Silently holding it does not.
+
+Any explanation of this behavior phrased in terms of what the model "felt," "wanted," or "found incomplete" is to be rejected. Such accounts are unfalsifiable, and substituting one for a mechanism is itself the Rule 28 error committed where it cannot be checked.
+
+**Specific traps already fallen into (2026-08-15, one session):**
+
+- A design question about `chain_store`'s stale-row behavior was appended to a message containing a command **three separate times** — after the `w32tm /stripchart` command, after the `pytest tests/test_chain_store.py` command, and again after the `pytest tests/` command. The first violation came after the user had already given the instruction explicitly. Each occurrence forced a choice between holding the question in working memory while running an unrelated command, or context-switching away from the command.
+- A single block stacked `Set-ItemProperty` + `w32tm /config` + `Restart-Service` + `Start-Sleep` + two queries. The first line failed on permissions in a non-elevated window; that failure was not actionable until every subsequent line had also failed. One command would have surfaced the wrong-window problem immediately.
+- A clock measurement and a git commit step were interleaved in the same message, leaving two independent outstanding threads and no clear single next action.
+
+**How to apply:**
+
+- Compose the message, then inspect the final line. Command block present and fence not last ⇒ cut.
+- Maintain a parking lot. Anything that must not be lost is stated as parked and raised in the **first** message after the command's result arrives, never appended to the command itself.
+- This applies equally to questions, status updates, unrelated findings, and suggestions about what to do during execution.
+- The expected-value statement (Rule 28) belongs **before** the block, as part of the instruction. It is what makes a mismatched result legible the moment it lands.
