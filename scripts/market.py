@@ -50,9 +50,27 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.alpaca_rest import AlpacaRESTClient, EquitySnapshot, OptionQuote  # noqa: E402
+from analysis.option_walls import (  # noqa: E402
+    ChainRow, check_spot_consistency, from_alpaca, risk_reversal,
+)
 
 ET = ZoneInfo("America/New_York")
 SNAPSHOT_DIR = REPO_ROOT / "data" / "snapshots"
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """Minimal greedy wrap. textwrap would do, but this keeps the guard
+    message readable without importing a module for four lines."""
+    out, line = [], ""
+    for word in text.split():
+        if line and len(line) + 1 + len(word) > width:
+            out.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    if line:
+        out.append(line)
+    return out
 
 
 def _fmt_age(ms: float | None) -> str:
@@ -125,41 +143,69 @@ def print_snapshot(s: EquitySnapshot) -> None:
           f"prior close {_fmt_money(s.prev_close)}")
 
 
+def _to_rows(quotes: list[OptionQuote], today: date) -> list[ChainRow]:
+    rows = []
+    for q in quotes:
+        y, m, d = (int(x) for x in q.expiration.split("-"))
+        rows.append(from_alpaca(q, dte=(date(y, m, d) - today).days))
+    return rows
+
+
 def print_chain(quotes: list[OptionQuote], underlying_px: float | None,
-                top: int = 12) -> None:
+                top: int = 12, *, today: date | None = None) -> None:
     if not quotes:
         print("\n  No option contracts returned.")
         return
 
+    rows = _to_rows(quotes, today or date.today())
+    check = check_spot_consistency(rows, underlying_px)
+
+    print(f"\n{'=' * 62}")
+    print("  OPTION CHAIN — Alpaca OPRA, real-time")
+    print("  NO OPEN INTEREST — that comes from Schwab /chains")
+    print(f"{'=' * 62}")
+
+    # The guard prints BEFORE the table. A caveat underneath a table of
+    # plausible numbers gets read after the numbers have already landed.
+    print()
+    for line in _wrap(check.explain(), 58):
+        print(f"  {line}")
+
+    if not check.trustworthy:
+        print()
+        print("  IV, delta and gamma below are shown for completeness and")
+        print("  are NOT usable. Skew and risk-reversal are suppressed.")
+
     calls = sorted((q for q in quotes if q.is_call), key=lambda q: q.strike)
     puts = sorted((q for q in quotes if not q.is_call), key=lambda q: q.strike)
 
-    print(f"\n{'=' * 62}")
-    print(f"  OPTION CHAIN — IV and greeks (Alpaca OPRA, real-time)")
-    print(f"  NO OPEN INTEREST — that comes from Schwab /chains")
-    print(f"{'=' * 62}")
-
-    def block(name: str, rows: list[OptionQuote]) -> None:
-        if not rows:
+    def block(name: str, group: list[OptionQuote]) -> None:
+        if not group:
             return
         if underlying_px:
-            rows = sorted(rows, key=lambda q: abs(q.strike - underlying_px))
-        rows = rows[:top]
-        rows = sorted(rows, key=lambda q: q.strike)
+            group = sorted(group, key=lambda q: abs(q.strike - underlying_px))
+        group = sorted(group[:top], key=lambda q: q.strike)
         print(f"\n  {name}")
         print(f"  {'strike':>9} {'bid':>8} {'ask':>8} {'IV':>7} "
-              f"{'delta':>7} {'gamma':>8} {'exp':>11}")
-        for q in rows:
+              f"{'delta':>7} {'gamma':>8} {'exp':>11} {'age':>9}")
+        for q in group:
             iv = "—" if q.implied_volatility is None \
                 else f"{q.implied_volatility * 100:.1f}"
             d = "—" if q.delta is None else f"{q.delta:+.3f}"
             g = "—" if q.gamma is None else f"{q.gamma:.5f}"
             print(f"  {q.strike:>9,.1f} {_fmt_money(q.bid):>8} "
                   f"{_fmt_money(q.ask):>8} {iv:>7} {d:>7} {g:>8} "
-                  f"{q.expiration:>11}")
+                  f"{q.expiration:>11} {_fmt_age(q.quote_age_ms):>9}")
 
     block("CALLS (nearest the money)", calls)
     block("PUTS (nearest the money)", puts)
+
+    rr = risk_reversal(rows, check)
+    if rr is not None:
+        print(f"\n  25d risk reversal — {rr.expiration} ({rr.dte}d): "
+              f"{rr.value_vol_points:+.1f} vol points ({rr.direction})")
+        print(f"    put {rr.put_strike:,.0f} IV {rr.put_iv * 100:.1f} / "
+              f"call {rr.call_strike:,.0f} IV {rr.call_iv * 100:.1f}")
 
 
 async def run(args: argparse.Namespace) -> int:
