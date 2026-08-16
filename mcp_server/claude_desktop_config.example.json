@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "llm-model-market-data": {
+      "command": "C:\\trading\\LLM model\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\trading\\LLM model\\mcp_server\\server.py"]
+    }
+  }
+}
