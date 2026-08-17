@@ -27,6 +27,7 @@ werkzeug request line, so both mitigations are needed.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -53,6 +54,12 @@ class AuthState(str, Enum):
     AUTH_EXPIRED = "AUTH_EXPIRED"       # >7 days: every call will fail
     NO_TOKEN = "NO_TOKEN"               # never authenticated on this machine
     NO_CREDENTIALS = "NO_CREDENTIALS"   # env file missing or incomplete
+    # Added 2026-08-16 after a two-day silent outage. The token file existed,
+    # was 1.9 days old, and this module reported OK with 5.11 days remaining
+    # for 46 hours after every Schwab call had started failing. The file
+    # contained no refresh_token at all, so there was never anything to renew.
+    TOKEN_INCOMPLETE = "TOKEN_INCOMPLETE"   # file exists, no refresh_token
+    TOKEN_UNREADABLE = "TOKEN_UNREADABLE"   # file exists, cannot be parsed
 
 
 @dataclass(frozen=True)
@@ -142,29 +149,125 @@ def load_credentials(
     return SchwabCredentials(api_key, app_secret, callback_url, token_path)
 
 
-def token_age_seconds(token_path: str | os.PathLike) -> float | None:
-    """Age of the token file in seconds, or None if it does not exist.
+@dataclass(frozen=True)
+class TokenFile:
+    """Facts about the token file. Never holds a token value.
 
-    Uses mtime rather than parsing the token: schwab-py owns that file's
-    format, and mtime advances on every refresh write, which is exactly the
-    quantity the 7-day rule is measured against.
+    `created_at` comes from schwab-py's own `creation_timestamp` field, which
+    is written once at authentication and NOT updated on subsequent access-
+    token refreshes. That is the quantity the 7-day refresh rule is actually
+    measured against.
     """
-    p = Path(token_path)
-    if not p.is_file():
-        return None
-    return max(0.0, time.time() - p.stat().st_mtime)
+
+    exists: bool
+    readable: bool
+    has_refresh_token: bool
+    created_at: float | None
+    access_expires_at: float | None
+    age_source: str  # "creation_timestamp" | "file_mtime" | "none"
+
+    @property
+    def access_token_expired(self) -> bool | None:
+        if self.access_expires_at is None:
+            return None
+        return time.time() >= self.access_expires_at
+
+    @property
+    def age_seconds(self) -> float | None:
+        if self.created_at is None:
+            return None
+        return max(0.0, time.time() - self.created_at)
+
+
+def read_token_file(token_path: str | os.PathLike) -> TokenFile:
+    """Inspect the token file's structure. Returns facts, never values.
+
+    Reads `creation_timestamp` rather than the file's mtime. The previous
+    implementation used mtime with the stated rationale that "mtime advances
+    on every refresh write, which is exactly the quantity the 7-day rule is
+    measured against." That is backwards: mtime tracks the last ACCESS-token
+    write, so a token in active use looks perpetually young while its refresh
+    token's 7-day clock runs out underneath.
+
+    Falls back to mtime only when `creation_timestamp` is absent, and records
+    which was used in `age_source` so a caller can tell a measured age from a
+    guessed one.
+    """
+    p = Path(token_path) if token_path else None
+    if p is None or not p.is_file():
+        return TokenFile(False, False, False, None, None, "none")
+
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        # Rule 18: do not silently treat an unparseable token as absent. The
+        # two need different fixes — one is "log in", the other is "something
+        # corrupted this file."
+        logger.error("Schwab token file at %s is unreadable: %s", p, exc)
+        return TokenFile(True, False, False, None, None, "none")
+
+    if not isinstance(raw, dict):
+        return TokenFile(True, False, False, None, None, "none")
+
+    token = raw.get("token")
+    token = token if isinstance(token, dict) else {}
+    created = raw.get("creation_timestamp")
+    source = "creation_timestamp"
+    if not isinstance(created, (int, float)):
+        created = p.stat().st_mtime
+        source = "file_mtime"
+
+    expires_at = token.get("expires_at")
+    if not isinstance(expires_at, (int, float)):
+        expires_at = None
+
+    return TokenFile(
+        exists=True,
+        readable=True,
+        has_refresh_token=bool(token.get("refresh_token")),
+        created_at=float(created),
+        access_expires_at=float(expires_at) if expires_at is not None else None,
+        age_source=source,
+    )
+
+
+def token_age_seconds(token_path: str | os.PathLike) -> float | None:
+    """Age of the REFRESH token in seconds, or None if unavailable.
+
+    Kept for callers that predate `read_token_file`. Now measured from
+    `creation_timestamp`, not the file's mtime — see `read_token_file`.
+    """
+    return read_token_file(token_path).age_seconds
 
 
 def auth_state(creds: SchwabCredentials | None) -> tuple[AuthState, float | None]:
-    """Current auth state and token age in days. Never raises."""
+    """Current auth state and refresh-token age in days. Never raises.
+
+    This inspects a FILE. It does not prove Schwab will accept the token —
+    use `verify_live()` for that. The distinction is not academic: on
+    2026-08-14 this function reported OK for 46 hours after every API call
+    had begun failing.
+    """
     if creds is None:
         return AuthState.NO_CREDENTIALS, None
 
-    age_s = token_age_seconds(creds.token_path)
-    if age_s is None:
+    tf = read_token_file(creds.token_path)
+    if not tf.exists:
         return AuthState.NO_TOKEN, None
+    if not tf.readable:
+        return AuthState.TOKEN_UNREADABLE, None
 
-    age_days = age_s / 86400.0
+    age_days = (tf.age_seconds / 86400.0) if tf.age_seconds is not None else None
+
+    # Checked BEFORE age. A token with no refresh_token is unusable at any
+    # age, and reporting "OK, 5.11 days remaining" for one is the exact
+    # failure this rewrite exists to prevent.
+    if not tf.has_refresh_token:
+        return AuthState.TOKEN_INCOMPLETE, age_days
+
+    if age_days is None:
+        return AuthState.TOKEN_UNREADABLE, None
+    age_s = age_days * 86400.0
     if age_s >= SEVEN_DAYS_S:
         return AuthState.AUTH_EXPIRED, age_days
     if age_s >= WARN_TOKEN_AGE_S:
@@ -172,18 +275,73 @@ def auth_state(creds: SchwabCredentials | None) -> tuple[AuthState, float | None
     return AuthState.OK, age_days
 
 
-def health(creds: SchwabCredentials | None = None) -> dict:
-    """Auth block for get_health. Contains no secrets."""
+def verify_live(creds: SchwabCredentials | None = None) -> dict:
+    """Make one real Schwab call and report whether it worked.
+
+    The ONLY function here that proves anything about access. Everything else
+    inspects a file, and a file that looks correct is not working access —
+    that conflation cost two days of silent outage.
+
+    Costs one network round trip, so it is opt-in rather than folded into
+    `health()`. Never raises; failures are returned.
+    """
+    creds = creds if creds is not None else load_credentials()
+    if creds is None or not creds.is_complete():
+        return {"live_ok": False, "detail": "no credentials"}
+    try:
+        client = get_client(creds)
+        resp = client.get_quote("SPY")
+        code = getattr(resp, "status_code", None)
+        if code == 200:
+            return {"live_ok": True, "detail": "quote request returned 200"}
+        return {"live_ok": False,
+                "detail": f"quote request returned {code}"}
+    except Exception as exc:  # noqa: BLE001 - report anything, never raise
+        return {"live_ok": False,
+                "detail": f"{type(exc).__name__}: {exc}"[:300]}
+
+
+def health(creds: SchwabCredentials | None = None,
+           *, live: bool = False) -> dict:
+    """Auth block for get_health. Contains no secrets.
+
+    By default this reports FILE STATE ONLY — `checked_live` says so
+    explicitly, so a reader cannot mistake it for proof of access. Pass
+    `live=True` to spend one network round trip on the real answer.
+    """
     creds = creds if creds is not None else load_credentials()
     state, age_days = auth_state(creds)
+    tf = read_token_file(creds.token_path) if creds else TokenFile(
+        False, False, False, None, None, "none")
     out = {
         "auth_state": state.value,
         "token_age_days": round(age_days, 2) if age_days is not None else None,
         "days_until_expiry": (round(7.0 - age_days, 2)
                               if age_days is not None else None),
         "token_path_configured": bool(creds and creds.token_path),
+        # The three fields whose absence hid a two-day outage.
+        "has_refresh_token": tf.has_refresh_token,
+        "token_age_source": tf.age_source,
+        "access_token_expired": tf.access_token_expired,
+        "checked_live": False,
     }
-    if state is AuthState.AUTH_EXPIRED:
+    if live:
+        out.update(verify_live(creds))
+        out["checked_live"] = True
+    if state is AuthState.TOKEN_INCOMPLETE:
+        out["action_required"] = (
+            "Token file exists but contains NO refresh_token, so it cannot be "
+            "renewed and Schwab access is already dead or will die within the "
+            "hour. This is what a half-completed OAuth flow leaves behind. "
+            "Move the file aside and re-run `python -m scripts.schwab_login` — "
+            "schwab-py will not repair it in place."
+        )
+    elif state is AuthState.TOKEN_UNREADABLE:
+        out["action_required"] = (
+            "Token file exists but could not be parsed. Move it aside and "
+            "re-run `python -m scripts.schwab_login`."
+        )
+    elif state is AuthState.AUTH_EXPIRED:
         out["action_required"] = (
             "Refresh token older than 7 days. Every Schwab call will fail with "
             "invalid_client until you re-authenticate: run "
