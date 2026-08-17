@@ -21,12 +21,12 @@ import argparse
 import json
 import os
 import sys
-from collections import defaultdict
 from datetime import date, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from log_hygiene import setup_logging  # noqa: E402
+from analysis.option_walls import coverage_table, from_schwab  # noqa: E402
 from data.schwab_auth import get_client, health  # noqa: E402
 from data.chain_store import ChainStore  # noqa: E402
 from data.schwab_chains import fetch_chain  # noqa: E402
@@ -124,72 +124,69 @@ def main() -> int:
 
     # ---------------- OI walls, aggregated across expirations -------------
     #
-    # METRIC TRAP #5, and it bites harder than "the window truncates the
-    # edges". Schwab applies strikeCount PER EXPIRATION, around that
-    # expiration's at-the-money. A strike near spot therefore appears in
-    # every expiration while a strike 11% away appears in one. Summing OI
+    # METRIC TRAP #5. Schwab applies strikeCount PER EXPIRATION, around that
+    # expiration's own at-the-money. A strike near spot therefore appears in
+    # every expiration while a strike 11% away appears in one, so summing OI
     # across expirations ranks strikes partly by how many expirations happen
-    # to contain them -- and as spot drifts during the session a FIXED strike
-    # gains or loses expirations, so its total changes with no market
-    # activity at all.
+    # to contain them. Worse, as spot drifts intraday a FIXED strike gains or
+    # loses expirations and its total moves -- on a T+1 figure that cannot
+    # change intraday. Measured on SNDK 2026-08-17: strike 1900 read 2,915 at
+    # spot 1770.86 and 3,318 at spot 1808.82 seventy-five minutes later.
     #
-    # Measured on SNDK 2026-08-17: strike 1900 read 2,915 at spot 1770.86 and
-    # 3,318 at spot 1808.82 seventy-five minutes later. Open interest is a
-    # T+1 figure and CANNOT change intraday. It "grew" because the strike
-    # moved closer to the money and picked up expirations. Coverage that day:
-    # 1700/1800/1900 in 8 of 8 expirations, 2000 in 3, 1600 in 1.
-    #
-    # Fix: rank only strikes present in EVERY expiration, so totals are
-    # comparable both to each other and across fetches at different spots.
-    # Partial-coverage strikes are shown separately and never ranked against
-    # full ones -- dropping them silently would hide real open interest.
+    # The 63d01e8 guard ranked full-coverage strikes ONLY and listed the rest
+    # unranked underneath. That cured the incomparability by amputation, and
+    # it hid the largest concentration in the book: strike 1600 carried 11,743
+    # contracts at 3/8 coverage while the top RANKED strike carried 6,231.
+    # Coverage is now a COLUMN. Every strike appears, and the basis travels
+    # with the number instead of being enforced by exclusion.
+    rows_cr = [from_schwab(c) for c in chain.contracts]
     n_exp = len(chain.expirations())
-    call_oi: dict[float, int] = defaultdict(int)
-    put_oi: dict[float, int] = defaultdict(int)
-    cover: dict[float, set] = defaultdict(set)
-    for c in chain.contracts:
-        cover[c.strike].add(c.expiration)
-        if c.put_call == "CALL":
-            call_oi[c.strike] += c.open_interest
-        else:
-            put_oi[c.strike] += c.open_interest
-    full = {k for k, e in cover.items() if len(e) == n_exp}
 
-    def _walls(title: str, book: dict[float, int]) -> None:
-        print(f"\n{title} — full-coverage strikes only "
-              f"({len(full)} of {len(cover)} strikes appear in all {n_exp} "
-              f"expirations)")
-        rows = [(k, oi) for k, oi in book.items() if k in full]
-        if not rows:
-            print("  (none — no strike appears in every expiration)")
+    def _walls(title: str, side: str) -> None:
+        table = coverage_table(rows_cr, px, side=side, top=args.top)
+        print(f"\n{title} — ranked on total OI in the fetched window")
+        if not table:
+            print("  (no open interest on this side)")
             return
-        for strike, oi in sorted(rows, key=lambda kv: -kv[1])[:args.top]:
-            rel = f"{(strike / px - 1) * 100:+6.2f}%" if px else "    n/a"
-            print(f"  {strike:>10.2f}  {rel}  OI {oi:>9,}")
+        print(f"  {'STRIKE':>10}  {'%SPOT':>8}  {'OI':>9}  {'COV':>5}"
+              f"  {'OI/EXP':>8}")
+        for s in table:
+            rel = (f"{s.distance_pct:+7.2f}%" if s.distance_pct is not None
+                   else "     n/a")
+            print(f"  {s.strike:>10.2f}  {rel}  {s.open_interest:>9,}  "
+                  f"{s.coverage:>5}  {s.oi_per_expiration:>8,.0f}"
+                  f"{'' if s.is_full_coverage else '  *'}")
 
-    _walls("CALL WALLS (resistance)", call_oi)
-    _walls("PUT WALLS (support)", put_oi)
+    _walls("CALL WALLS (resistance)", "CALL")
+    _walls("PUT WALLS (support)", "PUT")
 
-    partial = sorted(((k, call_oi[k] + put_oi[k], len(cover[k]))
-                      for k in cover if k not in full),
-                     key=lambda t: -t[1])[:args.top]
-    if partial:
-        print("\nNOT RANKED — partial expiration coverage. These totals "
-              "are NOT comparable\n  to the tables above or to another fetch "
-              "at a different spot.")
-        for k, oi, n in partial:
-            rel = f"{(k / px - 1) * 100:+6.2f}%" if px else "    n/a"
-            print(f"  {k:>10.2f}  {rel}  OI {oi:>9,}  in {n}/{n_exp} "
-                  f"expirations")
+    all_strikes = {r.strike for r in rows_cr}
+    full_strikes = {s.strike for s in coverage_table(rows_cr, side="CALL")
+                    if s.is_full_coverage}
+    print(f"\n  * partial coverage — this strike is absent from some "
+          f"expirations, so its\n    total understates it relative to a "
+          f"full-coverage strike AND moves as spot\n    drifts. OI/EXP "
+          f"divides by the expirations actually summed, which compares\n"
+          f"    across coverage but says nothing about WHICH expirations.")
+    print(f"  {len(full_strikes)} of {len(all_strikes)} strikes appear in all "
+          f"{n_exp} expirations, strike window +/-{args.strikes}.")
 
-    tc = sum(call_oi[k] for k in full)
-    tp = sum(put_oi[k] for k in full)
-    if tc:
-        print(f"\n  put/call OI ratio: {tp / tc:.3f}  (calls {tc:,} / puts "
-              f"{tp:,})\n  full-coverage strikes only, strike window "
-              f"+/-{args.strikes}. Quoting this number without both\n  "
-              f"qualifiers is meaningless — it moves with the fetch, not "
-              f"the market.")
+    def _pc(rows) -> tuple[int, int]:
+        c = sum(r.open_interest or 0 for r in rows if r.is_call)
+        p = sum(r.open_interest or 0 for r in rows if not r.is_call)
+        return c, p
+
+    fc, fp = _pc([r for r in rows_cr if r.strike in full_strikes])
+    ac, ap = _pc(rows_cr)
+    if fc and ac:
+        print(f"\n  put/call OI ratio: {fp / fc:.3f} on full-coverage strikes"
+              f"  |  {ap / ac:.3f} on all strikes")
+        print(f"    full-coverage calls {fc:,} / puts {fp:,};  "
+              f"all-strike calls {ac:,} / puts {ap:,}")
+        print(f"    Both are functions of the fetch, not the market. SPCX read"
+              f" 0.890 at 25 strikes\n    and 0.968 at 40 on the same chain "
+              f"twenty minutes apart. Never quote either\n    without the "
+              f"strike window (+/-{args.strikes}) and the coverage basis.")
 
     # ---------------- flow: today's volume vs existing OI -----------------
     #

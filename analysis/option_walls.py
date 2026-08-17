@@ -390,6 +390,108 @@ def detect_oi_walls(
     ]
 
 
+@dataclass(frozen=True, slots=True)
+class StrikeCoverage:
+    """One strike's open interest, carrying the basis it was summed over.
+
+    METRIC TRAP #5. Schwab applies ``strikeCount`` PER EXPIRATION, around each
+    expiration's own at-the-money, so a strike near spot appears in every
+    expiration while one 11% away appears in one. Summing OI across
+    expirations therefore ranks strikes partly by how many expirations happen
+    to contain them, and as spot drifts intraday a FIXED strike gains or loses
+    expirations — changing a T+1 figure that cannot change intraday.
+
+    Measured on SNDK 2026-08-17: strike 1900 read OI 2,915 at spot 1770.86 and
+    3,318 at spot 1808.82 seventy-five minutes later. Only 11 of 79 strikes
+    appeared in all 8 expirations.
+
+    The earlier guard ranked full-coverage strikes only and exiled the rest to
+    an unranked list. That traded one distortion for another: strike 1750 at
+    7/8 coverage with 3,256 contracts was excluded while 1740 at 8/8 with 478
+    ranked. This type keeps every strike and makes the basis a FIELD, so a
+    reader can see what a total is made of instead of trusting that the
+    ranking already accounted for it.
+    """
+
+    side: Side
+    strike: float
+    open_interest: int
+    expirations_covered: int
+    expirations_total: int
+    distance_pct: float | None
+
+    @property
+    def is_full_coverage(self) -> bool:
+        """True when this strike appears in every expiration in the fetch."""
+        return self.expirations_covered >= self.expirations_total
+
+    @property
+    def coverage(self) -> str:
+        """Human basis label, e.g. ``"7/8"``. Never print a total without it."""
+        return f"{self.expirations_covered}/{self.expirations_total}"
+
+    @property
+    def oi_per_expiration(self) -> float:
+        """Total divided by the expirations it was actually summed over.
+
+        The coverage-normalised view. Comparable ACROSS coverage counts in a
+        way the raw total is not, which is what makes a 3/8 strike carrying
+        11,743 contracts legible next to an 8/8 strike carrying 6,231. Not a
+        replacement for the total: it says nothing about which expirations,
+        and open interest is not uniformly distributed across the curve.
+        """
+        if not self.expirations_covered:
+            return 0.0
+        return self.open_interest / self.expirations_covered
+
+
+def coverage_table(
+    rows: Sequence[ChainRow],
+    spot: float | None = None,
+    *,
+    side: Side = "CALL",
+    top: int | None = None,
+) -> list[StrikeCoverage]:
+    """Every strike on one side, ranked on total OI, WITH its coverage basis.
+
+    The denominator is the number of distinct expirations across the whole
+    chain — both sides — because the truncation that creates the problem is a
+    property of the fetch, not of one side of it.
+
+    Contracts whose open interest is None are skipped rather than counted as
+    zero. Alpaca supplies no OI at all, and reading its chain as zero-OI would
+    produce a table of zeros that looks like an answer.
+
+    Ties are broken on strike ascending so the ordering is deterministic
+    between runs, which matters when the output is diffed across fetches.
+    """
+    expirations_total = len({r.expiration for r in rows})
+    if not expirations_total:
+        return []
+
+    totals: dict[float, int] = {}
+    covered: dict[float, set[str]] = {}
+    for r in rows:
+        if r.put_call != side or r.open_interest is None:
+            continue
+        totals[r.strike] = totals.get(r.strike, 0) + r.open_interest
+        covered.setdefault(r.strike, set()).add(r.expiration)
+
+    table = [
+        StrikeCoverage(
+            side=side,
+            strike=k,
+            open_interest=oi,
+            expirations_covered=len(covered[k]),
+            expirations_total=expirations_total,
+            distance_pct=((k / spot - 1.0) * 100.0) if spot else None,
+        )
+        for k, oi in totals.items()
+    ]
+    table.sort(key=lambda s: (-s.open_interest, s.strike))
+    return table[:top] if top is not None else table
+
+
 def put_call_oi_ratio(rows: Sequence[ChainRow]) -> float | None:
     """Total put OI over total call OI. None when calls have no OI."""
     calls = sum(r.open_interest or 0 for r in rows if r.is_call)

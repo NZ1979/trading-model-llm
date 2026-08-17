@@ -29,7 +29,9 @@ import pytest
 from analysis.option_walls import (
     DEFAULT_SPOT_TOLERANCE,
     ChainRow,
+    StrikeCoverage,
     check_spot_consistency,
+    coverage_table,
     detect_oi_walls,
     flow_outliers,
     from_alpaca,
@@ -387,3 +389,132 @@ def test_zero_dte_reported_separately_on_raw_volume():
     calls, puts, zero = zero_dte_volume(rows)
     assert (calls, puts) == (168_217, 67_309)
     assert [r.volume for r in zero] == [168_217, 67_309]
+
+
+# --------------------------------------------------------------- trap #5
+#
+# coverage_table replaces the full-coverage-only ranking that shipped in
+# 63d01e8. That guard was right about the disease and wrong about the cure: it
+# stopped ranking incomparable totals against each other by DROPPING most of
+# them, which hid real open interest. These tests pin the replacement.
+#
+# Magnitudes are taken from the live SNDK chain of 2026-08-17 at spot ~1786.85
+# so the fixture doubles as a record of the case that motivated the change.
+
+
+def _coverage_chain():
+    """5 strikes over 8 expirations, two of them deliberately truncated.
+
+    Coverage and magnitudes follow the live 2026-08-17 SNDK chain:
+
+        1700  8/8   6,231     ranked by the old guard
+        1800  8/8   4,970     ranked by the old guard
+        1740  8/8     478     ranked by the old guard
+        1750  7/8   3,256     EXILED by the old guard
+        1600  3/8  11,743     EXILED by the old guard, and the largest
+                              single concentration in the chain
+
+    That last row is the case for the change: the biggest number in the book
+    was in the bucket the previous design refused to rank.
+    """
+    exps = [f"2026-09-{d:02d}" for d in range(1, 9)]
+    rows = []
+    for e in exps:
+        rows.append(_row("CALL", 1700.0, exp=e, oi=6231 // 8))
+        rows.append(_row("CALL", 1800.0, exp=e, oi=4970 // 8))
+        rows.append(_row("CALL", 1740.0, exp=e, oi=478 // 8))
+        rows.append(_row("PUT", 1700.0, exp=e, oi=100))
+    for e in exps[:7]:
+        rows.append(_row("CALL", 1750.0, exp=e, oi=3256 // 7))
+    for e in exps[:3]:
+        rows.append(_row("CALL", 1600.0, exp=e, oi=11743 // 3))
+    return rows
+
+
+def test_partial_coverage_strike_is_ranked_not_exiled():
+    """The exact regression: 1750 at 7/8 outranks 1740 at 8/8."""
+    table = coverage_table(_coverage_chain(), 1786.85, side="CALL")
+    strikes = [s.strike for s in table]
+    assert 1750.0 in strikes, "partial-coverage strike was dropped"
+    assert strikes.index(1750.0) < strikes.index(1740.0)
+
+
+def test_no_strike_is_silently_dropped():
+    rows = _coverage_chain()
+    expected = {r.strike for r in rows if r.is_call}
+    assert {s.strike for s in coverage_table(rows, side="CALL")} == expected
+
+
+def test_coverage_label_carries_the_basis():
+    table = {s.strike: s for s in coverage_table(_coverage_chain(), side="CALL")}
+    assert table[1750.0].coverage == "7/8"
+    assert table[1700.0].coverage == "8/8"
+    assert table[1750.0].is_full_coverage is False
+    assert table[1700.0].is_full_coverage is True
+
+
+def test_the_largest_concentration_in_the_chain_is_the_one_that_was_exiled():
+    """1600 at 3/8 coverage carries more OI than any full-coverage strike."""
+    table = coverage_table(_coverage_chain(), 1786.85, side="CALL")
+    assert table[0].strike == 1600.0
+    assert table[0].is_full_coverage is False
+
+
+def test_oi_per_expiration_normalises_across_coverage():
+    """1600 is 3,914 per expiration against 1700's 779 — a 5x gap the raw
+    total understates as 11,743 against 6,231, under 2x."""
+    table = {s.strike: s for s in coverage_table(_coverage_chain(), side="CALL")}
+    assert table[1600.0].oi_per_expiration == pytest.approx(11743 // 3)
+    assert table[1700.0].oi_per_expiration == pytest.approx(6231 // 8)
+    assert (table[1600.0].oi_per_expiration
+            > 4 * table[1700.0].oi_per_expiration)
+
+
+def test_denominator_counts_expirations_across_both_sides():
+    """The truncation is a property of the fetch, not of one side of it."""
+    rows = [_row("CALL", 100.0, exp="2026-09-01", oi=10),
+            _row("PUT", 100.0, exp="2026-09-08", oi=10)]
+    call = coverage_table(rows, side="CALL")
+    assert call[0].expirations_total == 2
+    assert call[0].expirations_covered == 1
+
+
+def test_absent_open_interest_is_not_read_as_zero():
+    """Alpaca has no OI field. A table of zeros would look like an answer."""
+    rows = [_row("CALL", 100.0, exp="2026-09-01", oi=None),
+            _row("CALL", 110.0, exp="2026-09-01", oi=7)]
+    table = coverage_table(rows, side="CALL")
+    assert [s.strike for s in table] == [110.0]
+
+
+def test_ties_break_on_strike_so_ordering_is_deterministic():
+    rows = [_row("CALL", 120.0, exp="2026-09-01", oi=50),
+            _row("CALL", 110.0, exp="2026-09-01", oi=50)]
+    assert [s.strike for s in coverage_table(rows, side="CALL")] == [110.0, 120.0]
+
+
+def test_distance_pct_is_none_without_a_spot():
+    table = coverage_table(_coverage_chain(), side="CALL")
+    assert all(s.distance_pct is None for s in table)
+
+
+def test_distance_pct_is_signed_against_spot():
+    table = {s.strike: s for s in coverage_table(_coverage_chain(), 1786.85,
+                                                 side="CALL")}
+    assert table[1800.0].distance_pct == pytest.approx(0.7359, abs=1e-3)
+    assert table[1700.0].distance_pct < 0
+
+
+def test_top_limits_without_reordering():
+    table = coverage_table(_coverage_chain(), side="CALL", top=2)
+    assert [s.strike for s in table] == [1600.0, 1700.0]
+
+
+def test_empty_chain_returns_empty_table():
+    assert coverage_table([], side="CALL") == []
+
+
+def test_put_side_is_selectable():
+    table = coverage_table(_coverage_chain(), side="PUT")
+    assert [s.strike for s in table] == [1700.0]
+    assert table[0].side == "PUT"
