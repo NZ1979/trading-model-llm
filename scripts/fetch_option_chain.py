@@ -131,28 +131,73 @@ def main() -> int:
     print("=" * 78)
 
     # ---------------- OI walls, aggregated across expirations -------------
+    #
+    # METRIC TRAP #5, and it bites harder than "the window truncates the
+    # edges". Schwab applies strikeCount PER EXPIRATION, around that
+    # expiration's at-the-money. A strike near spot therefore appears in
+    # every expiration while a strike 11% away appears in one. Summing OI
+    # across expirations ranks strikes partly by how many expirations happen
+    # to contain them -- and as spot drifts during the session a FIXED strike
+    # gains or loses expirations, so its total changes with no market
+    # activity at all.
+    #
+    # Measured on SNDK 2026-08-17: strike 1900 read 2,915 at spot 1770.86 and
+    # 3,318 at spot 1808.82 seventy-five minutes later. Open interest is a
+    # T+1 figure and CANNOT change intraday. It "grew" because the strike
+    # moved closer to the money and picked up expirations. Coverage that day:
+    # 1700/1800/1900 in 8 of 8 expirations, 2000 in 3, 1600 in 1.
+    #
+    # Fix: rank only strikes present in EVERY expiration, so totals are
+    # comparable both to each other and across fetches at different spots.
+    # Partial-coverage strikes are shown separately and never ranked against
+    # full ones -- dropping them silently would hide real open interest.
+    n_exp = len(chain.expirations())
     call_oi: dict[float, int] = defaultdict(int)
     put_oi: dict[float, int] = defaultdict(int)
-    for c in chain.calls():
-        call_oi[c.strike] += c.open_interest
-    for p in chain.puts():
-        put_oi[p.strike] += p.open_interest
+    cover: dict[float, set] = defaultdict(set)
+    for c in chain.contracts:
+        cover[c.strike].add(c.expiration)
+        if c.put_call == "CALL":
+            call_oi[c.strike] += c.open_interest
+        else:
+            put_oi[c.strike] += c.open_interest
+    full = {k for k, e in cover.items() if len(e) == n_exp}
 
-    print("\nCALL WALLS (resistance) — highest open interest")
-    for strike, oi in sorted(call_oi.items(), key=lambda kv: -kv[1])[:args.top]:
-        rel = f"{(strike / px - 1) * 100:+6.2f}%" if px else "    n/a"
-        print(f"  {strike:>10.2f}  {rel}  OI {oi:>9,}")
+    def _walls(title: str, book: dict[float, int]) -> None:
+        print(f"\n{title} — full-coverage strikes only "
+              f"({len(full)} of {len(cover)} strikes appear in all {n_exp} "
+              f"expirations)")
+        rows = [(k, oi) for k, oi in book.items() if k in full]
+        if not rows:
+            print("  (none — no strike appears in every expiration)")
+            return
+        for strike, oi in sorted(rows, key=lambda kv: -kv[1])[:args.top]:
+            rel = f"{(strike / px - 1) * 100:+6.2f}%" if px else "    n/a"
+            print(f"  {strike:>10.2f}  {rel}  OI {oi:>9,}")
 
-    print("\nPUT WALLS (support) — highest open interest")
-    for strike, oi in sorted(put_oi.items(), key=lambda kv: -kv[1])[:args.top]:
-        rel = f"{(strike / px - 1) * 100:+6.2f}%" if px else "    n/a"
-        print(f"  {strike:>10.2f}  {rel}  OI {oi:>9,}")
+    _walls("CALL WALLS (resistance)", call_oi)
+    _walls("PUT WALLS (support)", put_oi)
 
-    total_call_oi = sum(call_oi.values())
-    total_put_oi = sum(put_oi.values())
-    if total_call_oi:
-        print(f"\n  put/call OI ratio: {total_put_oi / total_call_oi:.3f}  "
-              f"(calls {total_call_oi:,} / puts {total_put_oi:,})")
+    partial = sorted(((k, call_oi[k] + put_oi[k], len(cover[k]))
+                      for k in cover if k not in full),
+                     key=lambda t: -t[1])[:args.top]
+    if partial:
+        print("\nNOT RANKED — partial expiration coverage. These totals "
+              "are NOT comparable\n  to the tables above or to another fetch "
+              "at a different spot.")
+        for k, oi, n in partial:
+            rel = f"{(k / px - 1) * 100:+6.2f}%" if px else "    n/a"
+            print(f"  {k:>10.2f}  {rel}  OI {oi:>9,}  in {n}/{n_exp} "
+                  f"expirations")
+
+    tc = sum(call_oi[k] for k in full)
+    tp = sum(put_oi[k] for k in full)
+    if tc:
+        print(f"\n  put/call OI ratio: {tp / tc:.3f}  (calls {tc:,} / puts "
+              f"{tp:,})\n  full-coverage strikes only, strike window "
+              f"+/-{args.strikes}. Quoting this number without both\n  "
+              f"qualifiers is meaningless — it moves with the fetch, not "
+              f"the market.")
 
     # ---------------- flow: today's volume vs existing OI -----------------
     #
