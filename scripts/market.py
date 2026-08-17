@@ -23,15 +23,34 @@ price 11.3 seconds stale against raw prints arriving 0.3 seconds ago. Age is
 printed next to every timestamped field, and a stale marker is applied rather
 than left for the reader to work out.
 
-Data sources, and why they are split
-------------------------------------
-    quotes, bars, IV, greeks   ->  Alpaca, real-time OPRA (Algo Trader Plus)
-    open interest              ->  Schwab /chains, T+1
+Data sources, split by question rather than by vendor
+-----------------------------------------------------
+    tape and bars          ->  Alpaca SIP    per-print size, exchange,
+                               condition codes; bars at any timeframe
+    equity snapshot        ->  Schwab /quotes  real-time NBBO, TODAY's
+                               cumulative volume, a volume baseline, and the
+                               change computed against the real prior close
+    options IV and greeks  ->  Alpaca OPRA, real-time (Algo Trader Plus)
+    option open interest   ->  Schwab /chains
+
+Both equity sources are shown because each carries what the other cannot.
+Alpaca has the tape; Schwab has today's volume. Alpaca's ``dailyBar`` does
+not roll at the pre-market open, so between 04:00 ET and the roll its
+``day_volume`` is the PREVIOUS session's and its gap/change figures are
+suppressed — while Schwab's ``totalVolume`` and ``netPercentChange`` are
+correct throughout, because Schwab carries ``closePrice`` as its own field.
+
+Verified 2026-08-17 06:51 ET: Schwab ``quoteType: NBBO``, ``realtime: true``,
+timestamps 48 seconds old.
 
 Alpaca has no open-interest field anywhere in its market data API, so
 ``--chain`` reports IV and greeks but NOT walls. Open-interest walls come from
 ``scripts/fetch_option_chain.py`` and ``data/chain_store.py``. Do not read the
 absence of OI here as "no open interest today."
+
+The Schwab quote is fetched opportunistically and never breaks the run: its
+auth expires weekly and must be renewed by hand, so a failure degrades to
+Alpaca-only with a printed note. ``--no-schwab`` skips it outright.
 """
 
 from __future__ import annotations
@@ -153,6 +172,65 @@ def print_snapshot(s: EquitySnapshot) -> None:
           f"prior close {_fmt_money(s.prev_close)}")
 
 
+def fetch_schwab_quote(symbol: str):
+    """Schwab real-time NBBO, or None. NEVER raises.
+
+    Schwab auth expires every 7 days and must be renewed by hand, so a hard
+    dependency here would take the whole tool down on a Sunday. Alpaca alone
+    still answers most of the question; Schwab adds today's volume, a
+    baseline, and a change figure computed against the real prior close.
+    """
+    try:
+        from data.schwab_auth import get_client
+        from data.schwab_quotes import fetch_quote
+        return fetch_quote(get_client(), symbol)
+    except Exception as exc:  # noqa: BLE001 - degrade, never break
+        print(f"\n  (Schwab quote unavailable: {type(exc).__name__}. "
+              f"Alpaca figures below are unaffected.)")
+        return None
+
+
+def print_schwab_quote(q) -> None:
+    """The fields Alpaca's snapshot cannot supply during pre-market."""
+    rt = "real-time NBBO" if q.is_realtime else \
+        f"** NOT REAL-TIME (realtime={q.realtime}, type={q.quote_type}) **"
+    halt = "  ** HALTED **" if q.is_halted else ""
+
+    print(f"\n{'=' * 62}")
+    print(f"  SCHWAB — {rt}{halt}")
+    print(f"{'=' * 62}")
+    print(f"  last      {_fmt_money(q.last_price):>12}   "
+          f"{_fmt_age(q.trade_age_ms)}   {q.last_mic or ''}")
+    print(f"  bid/ask   {_fmt_money(q.bid):>12} / {_fmt_money(q.ask)}   "
+          f"{_fmt_age(q.quote_age_ms)}   {q.bid_mic or ''}/{q.ask_mic or ''}")
+    print()
+    print(f"  prior close {_fmt_money(q.close_price):>10}   "
+          f"change {_fmt_pct(q.change_from_close_pct)}")
+    print(f"  volume TODAY {q.total_volume or 0:>9,}   "
+          f"10-day avg {q.avg_10day_volume or 0:,.0f}")
+    if q.volume_vs_avg_full_day is not None:
+        # Named for what it is. See data/schwab_quotes.py - this is NOT RVOL
+        # and must not be read as one.
+        print(f"  that is {q.volume_vs_avg_full_day * 100:>11.2f}%   "
+              f"of an average FULL day (not RVOL - no time-of-day baseline)")
+    if q.week52_high and q.week52_low:
+        print(f"  52wk      {_fmt_money(q.week52_low):>12} / "
+              f"{_fmt_money(q.week52_high)}")
+    bits = []
+    if q.pe_ratio:
+        bits.append(f"PE {q.pe_ratio:.1f}")
+    if q.eps:
+        bits.append(f"EPS {q.eps:.2f}")
+    if q.last_earnings_date:
+        bits.append(f"earnings {q.last_earnings_date[:10]}")
+    if q.is_hard_to_borrow:
+        bits.append("HARD TO BORROW")
+    elif q.is_shortable is False:
+        bits.append("NOT SHORTABLE")
+    if bits:
+        print(f"  {'  |  '.join(bits)}")
+
+
 def _to_rows(quotes: list[OptionQuote], today: date) -> list[ChainRow]:
     rows = []
     for q in quotes:
@@ -241,6 +319,9 @@ async def run(args: argparse.Namespace) -> int:
                 payload["symbols"][sym] = {"error": "no data returned"}
                 continue
             print_snapshot(snap)
+            sq = None if args.no_schwab else fetch_schwab_quote(sym)
+            if sq is not None:
+                print_schwab_quote(sq)
             entry = asdict(snap)
             entry.update({
                 "mid": snap.mid, "spread": snap.spread,
@@ -251,6 +332,15 @@ async def run(args: argparse.Namespace) -> int:
                 "day_bar_session": snap.day_bar_session,
                 "day_bar_matches_last": snap.day_bar_matches_last,
             })
+            if sq is not None:
+                entry["schwab"] = asdict(sq) | {
+                    "is_realtime": sq.is_realtime,
+                    "is_halted": sq.is_halted,
+                    "mid": sq.mid, "spread": sq.spread,
+                    "spread_bps": sq.spread_bps,
+                    "change_from_close_pct": sq.change_from_close_pct,
+                    "volume_vs_avg_full_day": sq.volume_vs_avg_full_day,
+                }
             payload["symbols"][sym] = entry
 
             if args.chain:
@@ -280,6 +370,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="With --chain: max days to expiration (default 45). "
                         "Narrow rather than raising the page cap — skew and "
                         "walls live near the money and the front expiries.")
+    p.add_argument("--no-schwab", action="store_true",
+                   help="Skip the Schwab quote. Schwab auth expires weekly; "
+                        "the tool degrades to Alpaca-only automatically, so "
+                        "this is only for avoiding the round trip.")
     p.add_argument("--strikes", type=int, default=12,
                    help="With --chain: strikes per side to print (default 12)")
     args = p.parse_args(argv)

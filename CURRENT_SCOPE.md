@@ -55,11 +55,25 @@ what to build.
 
 Decided on evidence, 2026-08-16/17.
 
+Split by QUESTION, not by vendor. Both equity sources are used, because each
+carries what the other cannot.
+
 | Need | Source | Why |
 |---|---|---|
-| Equity price, quotes, bars, tape | **Alpaca SIP** | Schwab has no time-and-sales endpoint at all and its level one is officially conflated (`FEED_SPEC_V4` §0). Alpaca gives the full consolidated tape with per-print size, exchange and condition codes. |
+| Equity tape and bars | **Alpaca SIP** | Schwab has no time-and-sales endpoint and its level one is conflated (`FEED_SPEC_V4` §0). Only Alpaca gives per-print size, exchange and condition codes, and bars at any timeframe. |
+| Equity snapshot — price, NBBO, TODAY's volume, change, baselines, fundamentals, borrow | **Schwab `/quotes`** | `VERIFIED 2026-08-17 06:51 ET`: `quoteType: NBBO`, `realtime: true`, timestamps 48s old. Carries `totalVolume` (today's, live), `avg10DaysVolume`, and `netPercentChange` against a real `closePrice`. Alpaca's `dailyBar` does not roll at the pre-market open, so its volume is the PREVIOUS session's and its change figures are suppressed until it does. |
 | Option open interest | **Schwab `/chains`** | Alpaca has NO open-interest field anywhere in its market data API. Its OI lives on the trading API at T+2 with no history. |
 | Option IV, greeks, quotes | **Schwab `/chains`**, Alpaca as cross-check | Schwab returns real-time with OI, IV and delta in one call. Alpaca's OPRA feed is also real-time with greeks and is a useful second opinion — it caught a stale-spot problem on 2026-08-16 that a single vendor would have hidden. |
+
+**Neither vendor alone answers "what is this stock doing".** Schwab has no
+tape; Alpaca has no live daily volume before its bar rolls. `scripts/market.py`
+fetches both.
+
+**`totalVolume / avg10DaysVolume` is NOT RVOL.** It compares a partial session
+against a full-day average. Real RVOL needs a time-of-day baseline, which is
+what `scripts/build_pm_rvol_thresholds.py` builds from Polygon and which
+Schwab cannot supply. The field is named `volume_vs_avg_full_day` for that
+reason.
 
 **Use the Schwab DEVELOPER API, not thinkorswim.** thinkorswim's RTD COM
 server is real and Schwab-documented, but it only works while the desktop app
@@ -75,9 +89,9 @@ Both subscriptions are already paid for:
 - **Schwab Trader API**, free, app `trading-feed-daemon`, Order Limit 0.
 
 `VERIFIED 2026-08-16:` Schwab `/chains` returns `delayed=False`.
-`UNVERIFIED:` Schwab equity quotes (`/quotes` never called), and whether
-Schwab options stay real-time during regular hours — the only sample is a
-Sunday evening.
+`VERIFIED 2026-08-17:` Schwab `/quotes` returns real-time NBBO equity data.
+`UNVERIFIED:` whether Schwab options stay real-time during regular hours —
+the only sample is a Sunday evening.
 
 ## How it works today
 
@@ -96,7 +110,8 @@ Do not treat registering it as a prerequisite for anything.
 
 ## The modules that belong to THIS project
 
-    data/alpaca_rest.py        equity snapshots, bars, OPRA option chains
+    data/alpaca_rest.py        equity tape, bars, OPRA option chains
+    data/schwab_quotes.py      real-time NBBO equity snapshots
     data/schwab_auth.py        7-day token state machine
     data/schwab_chains.py      /chains fetch and parse
     data/chain_store.py        rolling SQLite for day-over-day OI change
