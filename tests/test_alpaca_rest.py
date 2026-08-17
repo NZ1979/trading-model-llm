@@ -58,9 +58,13 @@ SNAPSHOT_BODY = {
                             "p": 1666.5, "s": 100, "x": "D", "c": ["@", "T"]},
             "latestQuote": {"t": "2026-08-14T20:00:00.500000000Z",
                             "bp": 1665.0, "bs": 12, "ap": 1667.0, "as": 15},
-            "dailyBar": {"o": 1600.0, "h": 1680.0, "l": 1590.0,
+            # Alpaca stamps daily bars at 04:00 UTC = midnight ET, so this
+            # is the 2026-08-14 session - the same one the trade above is in.
+            "dailyBar": {"t": "2026-08-14T04:00:00Z",
+                         "o": 1600.0, "h": 1680.0, "l": 1590.0,
                          "c": 1666.5, "v": 5_300_000, "vw": 1640.0},
-            "prevDailyBar": {"c": 1580.0, "v": 4_100_000},
+            "prevDailyBar": {"t": "2026-08-13T04:00:00Z",
+                             "c": 1580.0, "v": 4_100_000},
         }
     }
 }
@@ -421,3 +425,91 @@ def test_occ_symbol_parsing(sym, expected):
 def test_occ_rejects_non_option_symbol():
     with pytest.raises(ValueError):
         parse_occ_symbol("SNDK")
+
+
+# --------------------------------------- regression: the pre-market trap
+#
+# Measured live on SNDK, 2026-08-17 06:18 ET. Alpaca's dailyBar had not rolled
+# to the new session, so a last price 1.8 seconds old sat beside Friday's
+# OHLCV and Thursday's prevDailyBar. change_pct across them read +12.84% - a
+# Monday price against a Thursday close, spanning the whole of Friday's +8.4%
+# session. It renders identically to "today's move". The true pre-market move
+# was +4.06%, against a Friday close the snapshot does not carry.
+
+PREMARKET_BODY = {
+    "snapshots": {
+        "SNDK": {
+            # Monday pre-market, live
+            "latestTrade": {"t": "2026-08-17T10:18:43.000000000Z",
+                            "p": 1724.30, "s": 50, "x": "D", "c": ["@"]},
+            "latestQuote": {"t": "2026-08-17T10:18:43.000000000Z",
+                            "bp": 1724.0, "bs": 2, "ap": 1727.23, "as": 3},
+            # ...beside FRIDAY's daily bar and THURSDAY's previous
+            "dailyBar": {"t": "2026-08-14T04:00:00Z", "o": 1646.93,
+                         "h": 1667.19, "l": 1565.00, "c": 1657.00,
+                         "v": 21_087_731, "vw": 1623.14},
+            "prevDailyBar": {"t": "2026-08-13T04:00:00Z", "c": 1528.11,
+                             "v": 22_185_381},
+        }
+    }
+}
+
+
+def test_stale_daily_bar_is_detected():
+    snap = _run(_client(
+        lambda r: httpx.Response(200, json=PREMARKET_BODY)).snapshot("SNDK"))
+    assert snap.last_session == "2026-08-17"
+    assert snap.day_bar_session == "2026-08-14"
+    assert snap.day_bar_matches_last is False
+
+
+def test_change_pct_suppressed_when_daily_bar_is_stale():
+    """+12.84% here is a Monday price against a Thursday close. Correct
+    arithmetic, wrong interval, and indistinguishable from today's move."""
+    snap = _run(_client(
+        lambda r: httpx.Response(200, json=PREMARKET_BODY)).snapshot("SNDK"))
+    naive = (1724.30 - 1528.11) / 1528.11 * 100
+    assert naive == pytest.approx(12.84, abs=0.01)   # what it used to return
+    assert snap.change_pct is None                   # what it returns now
+
+
+def test_gap_pct_suppressed_when_daily_bar_is_stale():
+    """Friday's gap printed as if it were today's."""
+    snap = _run(_client(
+        lambda r: httpx.Response(200, json=PREMARKET_BODY)).snapshot("SNDK"))
+    naive = (1646.93 - 1528.11) / 1528.11 * 100
+    assert naive == pytest.approx(7.78, abs=0.01)
+    assert snap.gap_pct is None
+
+
+def test_raw_ohlcv_is_still_available_when_stale():
+    """Suppress the derived percentages, not the data. The OHLCV is valid for
+    the session it describes, and day_bar_session says which that is."""
+    snap = _run(_client(
+        lambda r: httpx.Response(200, json=PREMARKET_BODY)).snapshot("SNDK"))
+    assert snap.day_open == 1646.93
+    assert snap.day_volume == 21_087_731
+    assert snap.last_price == 1724.30
+
+
+def test_weekend_case_is_not_suppressed():
+    """The condition is NOT 'is the daily bar today's'. On a weekend the last
+    print and the daily bar are both Friday's, so the percentages correctly
+    describe Friday and must survive."""
+    snap = _run(_client(
+        lambda r: httpx.Response(200, json=SNAPSHOT_BODY)).snapshot("SNDK"))
+    assert snap.day_bar_matches_last is True
+    assert snap.gap_pct == pytest.approx(1.2658, abs=0.001)
+    assert snap.change_pct == pytest.approx(5.4747, abs=0.001)
+
+
+def test_missing_daily_bar_timestamp_is_untrustworthy():
+    """No timestamp means the session cannot be confirmed. Untrustworthy, not
+    assumed-fine - the same default as everything else here."""
+    body = {"snapshots": {"X": {
+        "latestTrade": {"t": "2026-08-17T14:00:00Z", "p": 10.0},
+        "dailyBar": {"o": 9.0, "c": 10.0},
+        "prevDailyBar": {"c": 8.0}}}}
+    snap = _run(_client(lambda r: httpx.Response(200, json=body)).snapshot("X"))
+    assert snap.day_bar_matches_last is False
+    assert snap.change_pct is None

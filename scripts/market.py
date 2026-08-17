@@ -132,6 +132,16 @@ def print_snapshot(s: EquitySnapshot) -> None:
         print(f"  spread    {_fmt_money(s.spread):>12}   "
               f"({s.spread_bps:.1f} bps)")
     print()
+    if not s.day_bar_matches_last:
+        # Printed BEFORE the block it qualifies. A caveat underneath a table
+        # of plausible numbers gets read after the numbers have landed.
+        print(f"  ** OHLCV BELOW IS THE {s.day_bar_session or 'UNKNOWN'} "
+              f"SESSION, not {s.last_session or 'the current one'} **")
+        print("  Alpaca's daily bar has not rolled yet, so the last price")
+        print("  above and the block below are from different sessions.")
+        print("  Gap and change are suppressed: computed across these they")
+        print("  would span an extra session and read as today's move.")
+        print()
     print(f"  open      {_fmt_money(s.day_open):>12}   "
           f"gap {_fmt_pct(s.gap_pct)} vs prior close")
     print(f"  high/low  {_fmt_money(s.day_high):>12} / "
@@ -237,6 +247,9 @@ async def run(args: argparse.Namespace) -> int:
                 "spread_bps": snap.spread_bps, "gap_pct": snap.gap_pct,
                 "change_pct": snap.change_pct, "is_stale": snap.is_stale,
                 "last_is_odd_lot": snap.last_is_odd_lot,
+                "last_session": snap.last_session,
+                "day_bar_session": snap.day_bar_session,
+                "day_bar_matches_last": snap.day_bar_matches_last,
             })
             payload["symbols"][sym] = entry
 

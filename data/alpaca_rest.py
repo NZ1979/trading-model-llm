@@ -67,9 +67,25 @@ from typing import Any, Iterable, Sequence
 
 import httpx
 
+from zoneinfo import ZoneInfo
+
 logger = logging.getLogger(__name__)
 
 ALPACA_DATA_BASE = "https://data.alpaca.markets"
+ET = ZoneInfo("America/New_York")
+
+
+def _et_session(ts_ns: int | None) -> str | None:
+    """ET calendar date of a nanosecond timestamp, as YYYY-MM-DD.
+
+    The US equity session runs 04:00-20:00 ET, so every print falls inside
+    the ET calendar date of its own session. A UTC date would split one
+    session across two dates at 20:00 ET.
+    """
+    if ts_ns is None:
+        return None
+    return (datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
+            .astimezone(ET).strftime("%Y-%m-%d"))
 
 # Odd lots never update last on the consolidated tape. Observed live
 # 2026-08-14; see docs/FEED_SPEC_V4.md §1a. Kept in sync with
@@ -190,9 +206,11 @@ class EquitySnapshot:
     day_close: float | None
     day_volume: int | None
     day_vwap: float | None
+    day_ts_ns: int | None
 
     prev_close: float | None
     prev_volume: int | None
+    prev_day_ts_ns: int | None
 
     stale_threshold_ms: int = DEFAULT_STALE_MS
 
@@ -239,19 +257,68 @@ class EquitySnapshot:
         return (spread / mid) * 10_000.0
 
     @property
-    def gap_pct(self) -> float | None:
-        """Open versus prior close. None when either is missing.
+    def last_session(self) -> str | None:
+        """ET session date of the most recent print."""
+        return _et_session(self.last_ts_ns)
 
-        Returns None rather than 0.0 on a missing prior close: 'no gap' and
-        'gap unknown' are different answers and a gate keyed on 0.0 would
-        treat them identically.
+    @property
+    def day_bar_session(self) -> str | None:
+        """ET session date the OHLCV block describes."""
+        return _et_session(self.day_ts_ns)
+
+    @property
+    def day_bar_matches_last(self) -> bool:
+        """True when the daily bar covers the same session as `last_price`.
+
+        THE PRE-MARKET TRAP. Alpaca's `dailyBar` does not roll to the new
+        session the instant pre-market opens, so between 04:00 ET and the
+        roll you get a LIVE last price beside the PREVIOUS session's OHLCV
+        and the one before that as `prevDailyBar`. Every percentage derived
+        from both then spans the wrong interval.
+
+        Measured on SNDK, 2026-08-17 06:18 ET: last 1724.30 (1.8s old) with
+        day_open 1646.93, day_volume 21,087,731 and prev_close 1528.11 — all
+        of which belong to Friday and Thursday. `change_pct` computed across
+        them read +12.84%, which is a Monday price against a Thursday close
+        spanning the whole of Friday's +8.4% session. The true pre-market
+        move was +4.06%, against a Friday close the snapshot does not carry.
+
+        Note this is NOT "is the daily bar today's". On a weekend the last
+        print and the daily bar are both Friday's, so the percentages are
+        correct and describe Friday. What breaks them is the two coming from
+        DIFFERENT sessions, which is exactly what this compares.
         """
+        a, b = self.last_session, self.day_bar_session
+        if a is None or b is None:
+            return False
+        return a == b
+
+    @property
+    def gap_pct(self) -> float | None:
+        """Session open versus prior close, in percent.
+
+        None when the daily bar covers a different session than the last
+        print — the figure would be a previous session's gap presented as
+        the current one. Returns None rather than 0.0 on a missing prior
+        close too: 'no gap' and 'gap unknown' are different answers, and a
+        gate keyed on 0.0 would treat them identically.
+        """
+        if not self.day_bar_matches_last:
+            return None
         if not self.prev_close or self.day_open is None:
             return None
         return ((self.day_open - self.prev_close) / self.prev_close) * 100.0
 
     @property
     def change_pct(self) -> float | None:
+        """Last price versus prior close, in percent.
+
+        None when the daily bar is from a different session than the last
+        print, because `prev_close` is then two sessions behind `last_price`
+        and the result silently spans an extra session.
+        """
+        if not self.day_bar_matches_last:
+            return None
         if not self.prev_close or self.last_price is None:
             return None
         return ((self.last_price - self.prev_close) / self.prev_close) * 100.0
@@ -471,8 +538,10 @@ class AlpacaRESTClient:
             day_close=day.get("c"),
             day_volume=day.get("v"),
             day_vwap=day.get("vw"),
+            day_ts_ns=_ns(day.get("t")),
             prev_close=prev.get("c"),
             prev_volume=prev.get("v"),
+            prev_day_ts_ns=_ns(prev.get("t")),
             stale_threshold_ms=self._stale_threshold_ms,
         )
 
