@@ -160,7 +160,54 @@ def _write_atomic(path: Path, payload: dict) -> None:
     os.replace(tmp, path)
 
 
-async def run(symbol: str, interval: float, history: int) -> int:
+async def _refresh_chain(client, symbol: str, dte: int, strikes: int,
+                         state: dict) -> None:
+    """Rewrite data/live/<SYMBOL>_chain.json. Runs as a background task so a
+    ~1s chain fetch never delays the 5s equity poll.
+
+    Records `strike_window` in the file. Metric trap #5 (CURRENT_SCOPE.md):
+    any chain-wide aggregate is a function of the strike window, so a reader
+    that cannot see the window cannot know what the number means.
+
+    Deliberately does NOT write to chain_store. The daily OI capture is a
+    separate, deliberate act via fetch_option_chain; a watcher rewriting that
+    row every 60 seconds would churn it for no gain, since open interest is
+    static intraday.
+    """
+    from datetime import timedelta
+
+    from data.schwab_chains import fetch_chain
+    try:
+        chain = await asyncio.to_thread(
+            fetch_chain, client, symbol,
+            strike_count=strikes,
+            # ET date, never date.today(): between 22:00 MT and midnight the
+            # ET date is already tomorrow and the DTE window would be wrong.
+            to_date=datetime.now(ET).date() + timedelta(days=dte))
+        payload = {
+            "symbol": symbol,
+            "underlying_price": chain.underlying_price,
+            "is_delayed": chain.is_delayed,
+            "fetched_at_epoch": chain.fetched_at.timestamp(),
+            "fetched_at_mt": chain.fetched_at.astimezone(MT).strftime(
+                "%Y-%m-%d %H:%M:%S %Z"),
+            "strike_window": strikes,
+            "dte_max": dte,
+            "expirations": chain.expirations(),
+            "contracts": [{k: getattr(c, k) for k in c.__slots__}
+                          for c in chain.contracts],
+        }
+        _write_atomic(LIVE_DIR / f"{symbol}_chain.json", payload)
+        state["chain_polls"] += 1
+        state["chain_contracts"] = len(chain.contracts)
+        state["chain_error"] = None
+    except Exception as e:
+        state["chain_errors"] += 1
+        state["chain_error"] = f"{type(e).__name__}: {e}"
+
+
+async def run(symbol: str, interval: float, history: int,
+              chain_interval: float, chain_dte: int, chain_strikes: int) -> int:
     LIVE_DIR.mkdir(parents=True, exist_ok=True)
     out_path = LIVE_DIR / f"{symbol}.json"
     series: deque = deque(maxlen=history)
@@ -176,6 +223,10 @@ async def run(symbol: str, interval: float, history: int) -> int:
     schwab = get_client()
 
     started = datetime.now(timezone.utc)
+    cstate = {"chain_polls": 0, "chain_errors": 0, "chain_error": None,
+              "chain_contracts": None}
+    chain_task = None
+    last_chain = -1e9
     polls = errors = 0
     last_error = None
     stop = False
@@ -209,6 +260,15 @@ async def run(symbol: str, interval: float, history: int) -> int:
                 errors += 1
                 last_error = f"alpaca: {type(e).__name__}: {e}"
 
+            # Background chain refresh: fire-and-forget, never overlapping.
+            if (chain_interval
+                    and (chain_task is None or chain_task.done())
+                    and (time.monotonic() - last_chain) >= chain_interval):
+                last_chain = time.monotonic()
+                chain_task = asyncio.create_task(
+                    _refresh_chain(schwab, symbol, chain_dte, chain_strikes,
+                                   cstate))
+
             now = datetime.now(timezone.utc)
             last = (sq.last_price if sq else None) or (
                 asnap.last_price if asnap else None)
@@ -232,6 +292,12 @@ async def run(symbol: str, interval: float, history: int) -> int:
                 "polls": polls,
                 "errors": errors,
                 "last_error": last_error,
+                "chain_file": (f"data/live/{symbol}_chain.json"
+                               if chain_interval else None),
+                "chain_polls": cstate["chain_polls"],
+                "chain_errors": cstate["chain_errors"],
+                "chain_last_error": cstate["chain_error"],
+                "chain_contracts": cstate["chain_contracts"],
                 "schwab": _plain(sq),
                 "alpaca": _plain(asnap),
                 "derived": _derive(series),
@@ -246,7 +312,9 @@ async def run(symbol: str, interval: float, history: int) -> int:
 
             px = f"{last:,.2f}" if last is not None else "   n/a"
             line = (f"\r{now_mt.strftime('%H:%M:%S')} {symbol} {px}  "
-                    f"polls {polls}  errors {errors}   ")
+                    f"polls {polls}  errors {errors}  "
+                    f"chain {cstate['chain_polls']}/"
+                    f"{cstate['chain_errors']}   ")
             sys.stdout.write(line)
             if polls % 60 == 0:
                 sys.stdout.write("\n")
@@ -266,13 +334,24 @@ def main() -> int:
                          "5s is 12/min per endpoint.")
     ap.add_argument("--history", type=int, default=1440,
                     help="samples kept in memory (1440 = 2h at 5s)")
+    ap.add_argument("--chain-interval", type=float, default=60.0,
+                    help="seconds between option-chain refreshes. 0 disables "
+                         "the chain entirely.")
+    ap.add_argument("--chain-dte", type=int, default=60,
+                    help="only expirations within N days")
+    ap.add_argument("--chain-strikes", type=int, default=40,
+                    help="strikes above AND below ATM. 40, not the 25 used "
+                         "elsewhere: a narrow window silently changes every "
+                         "chain-wide aggregate (metric trap #5).")
     a = ap.parse_args()
     if a.interval < 1.0:
         print("FAILED: --interval below 1s serves no purpose and risks a "
               "rate limit.", file=sys.stderr)
         return 2
     try:
-        return asyncio.run(run(a.symbol.upper(), a.interval, a.history))
+        return asyncio.run(run(a.symbol.upper(), a.interval, a.history,
+                               a.chain_interval, a.chain_dte,
+                               a.chain_strikes))
     except KeyboardInterrupt:
         return 0
 
