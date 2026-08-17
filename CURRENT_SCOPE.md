@@ -90,8 +90,15 @@ Both subscriptions are already paid for:
 
 `VERIFIED 2026-08-16:` Schwab `/chains` returns `delayed=False`.
 `VERIFIED 2026-08-17:` Schwab `/quotes` returns real-time NBBO equity data.
-`UNVERIFIED:` whether Schwab options stay real-time during regular hours —
-the only sample is a Sunday evening.
+`VERIFIED 2026-08-17 09:48 ET:` Schwab `/chains` still reports
+`delayed=False` during REGULAR HOURS, on SPCX and SNDK. The Sunday-evening
+sample was not a fluke. This question is closed.
+`VERIFIED 2026-08-17 09:48 ET:` the spot-consistency guard has now been
+observed PASSING (printed 145.34 vs parity-implied 145.06, +0.19%), not
+only failing. Both arms of the guard are exercised against live data.
+`VERIFIED 2026-08-17 09:48 ET:` Alpaca's daily bar DOES roll after the
+open — `day_bar_matches_last` went True, and gap/change stopped being
+suppressed. The suppression is a pre-market condition, not a permanent one.
 
 ## Sources evaluated and REJECTED
 
@@ -151,6 +158,19 @@ three agreeing vendors would have sailed past. See
 the Cowork device bridge. **One command, then ask the question.** No MCP
 server, no registration, no copy/paste.
 
+`scripts/fetch_option_chain.py` is the OPTIONS half and the only path that
+carries open interest. Since 6b28873 it stores every fetched chain to
+`data/chains/chains.db` by default (`--no-store` opts out), because open
+interest is a T+1 figure: stable intraday, overwritten overnight, and an
+uncaptured session is gone permanently. Day-over-day OI change is the only
+measurement that separates opening from closing flow — volume cannot,
+because volume carries no direction. First captures: SPCX and SNDK, both
+2026-08-17, 640 contracts each.
+
+**`scripts/market.py --chain` still calls ALPACA**, which has no open
+interest, so it cannot show walls. `from_schwab()` remains unwired. Use
+`fetch_option_chain` for anything involving positioning.
+
 `mcp_server/server.py` is a skeleton of the smoother version — it would let
 Claude make the call itself. It is not registered and is **convenience only**.
 Do not treat registering it as a prerequisite for anything.
@@ -196,10 +216,34 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
   independent references. Do not re-investigate it; the 500 ms budget that
   made it urgent belongs to the deferred microstructure layer, and nothing
   in on-demand analysis breaks at 86 ms.
-- **The metric traps are real and there are three.** The 0DTE volume/OI
-  artifact, IV explosion at expiry, and vendor IV computed against a stale
-  underlying. All three produced confident, plausible, wrong output before
-  being caught. `analysis/option_walls.py` guards all three.
+- **The metric traps are real and there are FIVE.** Each produced
+  confident, plausible, wrong output before being caught.
+
+  1. The 0DTE volume/OI artifact. Guarded in `fetch_option_chain`.
+  2. IV explosion at expiry. Guarded in `analysis/option_walls.py`.
+  3. Vendor IV computed against a stale underlying. Guarded by
+     `check_spot_consistency`.
+  4. Alpaca's daily bar not rolling at the pre-market open, making gap and
+     change span two sessions. Guarded by `day_bar_matches_last`.
+  5. **NEW 2026-08-17, UNGUARDED: the strike window silently changes the
+     answer.** `--strikes` truncates the chain symmetrically around ATM, so
+     any statistic aggregated across the whole chain is a function of the
+     fetch parameter rather than the market. Two live instances on SPCX,
+     twenty minutes apart:
+
+     - put/call OI ratio read **0.890** at `--strikes 25` and **0.968** at
+       `--strikes 40`. The wider fetch pulled in put OI at 130, 85 and 70
+       that the narrow one never saw. The number was quoted as evidence of
+       call-heavy positioning. It was evidence of a fetch parameter.
+     - the IV skew looked like a MONOTONIC call ramp at 25 strikes, because
+       the put wing was truncated at 135. At 40 strikes it is a SMILE with
+       both wings bid, minimum near 143. Call skew is real but roughly 6 vol
+       points, not the one-way slope first described.
+
+     `tests/test_option_walls.py:155` already names `strike_count=25` as too
+     narrow for the parity check. Same defect, two more surfaces. Until it is
+     guarded: never quote a chain-wide aggregate without the strike window
+     attached, and prefer `--strikes 40` or wider for anything but a glance.
 
 ## Where the truth lives
 
