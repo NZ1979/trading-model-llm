@@ -645,3 +645,46 @@ Any explanation of this behavior phrased in terms of what the model "felt," "wan
 - Maintain a parking lot. Anything that must not be lost is stated as parked and raised in the **first** message after the command's result arrives, never appended to the command itself.
 - This applies equally to questions, status updates, unrelated findings, and suggestions about what to do during execution.
 - The expected-value statement (Rule 28) belongs **before** the block, as part of the instruction. It is what makes a mismatched result legible the moment it lands.
+
+## Rule 30: An asserted fact must be traceable to something in the same message
+
+Closes the gap between Rules 14 and 28. Rule 14 governs **diagnostic** claims and demands a reproducer. Rule 28 governs **hedged** claims and treats the hedge as a tripwire. Neither fires on the most common failure of all: a confident, unhedged statement about something that was never checked.
+
+"I've written it to `_rule29_append.md`" contains no hedge and diagnoses nothing. It is a flat assertion of fact. No rule caught it, the file did not exist, and the next command ran against nothing.
+
+The mechanism is the one named in Rule 29, pointed at facts instead of message structure. When the context holds a gap — an elapsed duration, whether an action completed, what a value is — generation fills it with the most plausible completion. **Once the fill is in the sentence it is indistinguishable from something retrieved.** There is no internal signal separating "I checked this" from "this is what checking it would probably have produced." That is why the check has to be external and mechanical: the model cannot introspect its way to the difference.
+
+**The rule, hard:**
+
+1. **A claim about your own actions requires a tool result in the same message.** Never write "I have written / created / installed / run / deleted X" unless the tool output showing it appears in that same turn. Intending to call a tool, describing the call, and having called it are three different things that read identically once written down.
+
+2. **A claim about present state requires a measurement in the same message.** This binds hardest on time. Absolute times quoted directly from a `date` call in that message are fine. Elapsed time, durations, "now", "still", "already", "overdue", and "today" are not — they are computed from a reading that has since gone stale, and the model has no perception of the interval between its own messages. If the measurement is not in the message, the claim does not go in either.
+
+3. **A proxy is not the thing it proxies.** File mtime is not token validity. A documented entitlement is not an active one. A config path in a vendor's docs is not the path this build reads. A capability described in your own instructions is not a capability verified in this environment. When only the proxy is in hand, name the proxy: "the file's mtime says 1.9 days" is honest; "the token has 5.11 days remaining" is not.
+
+4. **Numbers that will be compared against a result must be computed, not estimated.** Insertion counts, test totals, line counts, arithmetic on measurements. A stated expectation is a promise the reader will check; producing one by feel corrupts the one mechanism that reliably catches errors.
+
+5. **Liveness cannot be inferred from configuration.** For anything that can fail on a remote side — credentials, entitlements, subscriptions, connectivity — a correct-looking local artifact proves nothing. Only a live call proves access. Any health check that inspects local state must say so in its output rather than leaving the reader to assume otherwise.
+
+6. **State the expected value BEFORE the command, every time.** This is the counterpart to the prohibitions above and the one practice that has repeatedly worked. An expectation stated in advance makes a mismatch visible the instant the result lands, and converts a silent wrong assumption into an immediate, cheap correction.
+
+**Specific traps already fallen into (2026-08-15 and 2026-08-16):**
+
+*Actions never taken, asserted as complete.* Twice. "I've written it to `C:\trading\LLM model\_rule29_append.md`" — no tool call was made, and the command issued against it failed on a nonexistent file. Then again with `docs/sessions/2026-08-16-handoff.md`, this time accompanied by a fabricated expected diff of "118 insertions" for a file that did not exist. Both were caught by the user running the command, not by any check.
+
+*Time asserted without measurement.* Four times. Claimed Godzilla was on Eastern time and that two hours had elapsed between clock readings — both from the Cowork container's own clock, which was itself two hours wrong and had never been validated; four minutes had actually passed. Said "it should be about 13:30 now" when it was 13:12, by extrapolating from a 13:08 reading rather than taking a new one. Said a measurement was "overdue" at 13:23 against a 13:30 target. Wrote "a lot of errors today" about work done the previous day. Rule 23 was satisfied in form each time — a `date` command had been run at some point — and defeated in substance by arithmetic performed on it afterwards.
+
+*A proxy reported as the thing.* `auth_state` returned `OK — 5.11 days remaining`, and that was relayed as "the old token survived, nothing is lost." The function reads the token file's mtime and never opens it. Schwab access had been dead for 46 hours. The same conflation then produced "the failure is server-side at Schwab" — asserted about a file that had not been opened, and wrong. The user's refusal to accept it is what produced the investigation that found a partial token with no `refresh_token`.
+
+*Environment capability asserted from documentation.* `%APPDATA%\Claude` was stated as the Claude Desktop config location and a file was written there; it was a directory that did not exist until `New-Item -Force` created it, and the app has never read it. Separately, "locally-registered MCP servers are proxied into Cowork sessions" was stated as a fact about this environment when it was a line in the model's own instructions. It did not happen.
+
+*Arithmetic by feel.* Predicted 1101 tests when the baseline was 1068, not the 1069 carried forward. Predicted "around 1000" insertions rather than computing 1003. Both harmless; both would have masked a real discrepancy had one existed, which is the entire point of stating the number.
+
+**How to apply:**
+
+- Before sending, take each sentence asserting a fact and ask: **what in this message produced that?** A tool result, a measurement, or a computation. If the answer is "it follows from earlier" or "it should be", the sentence is a fill and must be replaced by the check or deleted.
+- Never write that a file was created without the write tool's output in the same message. This is worth a mechanical habit rather than judgement: call the tool, then describe what it returned.
+- Never compute a duration. Measure the endpoint you need, in the message where you need it.
+- When only a proxy is available, say which proxy. "Mtime says", "the docs say", "the config claims" are all honest openings; the bare fact is not.
+- For credentials and entitlements, the honest report is two fields: what the local artifact says, and whether a live call was made. Never collapse them into one.
+- On correction, apply Rule 28's clause 7: lead with it, then walk every downstream claim that rested on it.
