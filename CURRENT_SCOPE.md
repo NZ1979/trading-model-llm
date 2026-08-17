@@ -183,9 +183,13 @@ Do not treat registering it as a prerequisite for anything.
     data/schwab_chains.py      /chains fetch and parse
     data/chain_store.py        rolling SQLite for day-over-day OI change
     analysis/option_walls.py   walls, flow, skew + the spot-consistency guard
-    scripts/market.py          the CLI above
+    scripts/market.py          one-shot equity + Alpaca chain snapshot
+    scripts/fetch_option_chain.py  Schwab chain: walls, flow, skew; stores OI
+    scripts/watch.py           live poller -> data/live/<SYM>.json, the
+                               zero-round-trip path. Refreshes the chain too.
+    scripts/daily.py           daily bars, multi-day context, --level history
     scripts/schwab_login.py    weekly re-auth
-    mcp_server/                MCP skeleton, unregistered
+    mcp_server/                MCP skeleton, ONE tool (get_health only)
 
 Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
 `main.py`, `strategy/`, `execution/`, and phases 3 and 5-8 of `FEED_SPEC_V4`.
@@ -216,7 +220,7 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
   independent references. Do not re-investigate it; the 500 ms budget that
   made it urgent belongs to the deferred microstructure layer, and nothing
   in on-demand analysis breaks at 86 ms.
-- **The metric traps are real and there are SIX.** Each produced
+- **The metric traps are real and there are SEVEN.** Each produced
   confident, plausible, wrong output before being caught.
 
   1. The 0DTE volume/OI artifact. Guarded in `fetch_option_chain`.
@@ -311,6 +315,43 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
      were caught only by asking what the number MEASURES rather than what it
      appears to show, and in both cases that check was available from the
      start and cost almost nothing.
+
+  7. **NEW 2026-08-17, GUARDED by `scripts/daily.py`: a measurement compared
+     against nothing is not evidence.** Two errors the same afternoon, same
+     root — until that script existed EVERY tool here was intraday, so every
+     comparison was implicitly against the last 84 minutes or against no
+     baseline at all.
+
+     **Instance A, wrong timescale.** Asked whether strike 1800 was acting as
+     a magnet for SNDK, a mean-reversion test was run over the live watcher's
+     84-minute window. It found excursions PERSISTING rather than reverting
+     and reported "1800 is not acting as a magnet." But SNDK had been below
+     1800 for 24 sessions and arrived there that morning after a **+41% four
+     session run**. At that timescale directional drift dominates entirely;
+     persistence is what a trend produces. The test could not separate trend
+     from attraction and its negative result was reported as though it could.
+     **The user caught this, not the model.** A claim about Friday needs days.
+
+     **Instance B, no baseline.** SNDK's ~98 implied vol was called "extreme"
+     three separate times. Measured against realized: **104 over ten sessions,
+     152 over twenty**, with mean absolute daily moves of 6.6% and 8.0%
+     against the 6.2% implied. The four-day implied move of 12.4% sat against
+     FIVE four-day moves of 30%+ in the same window (+41.3, +40.5, -36.9,
+     +32.6, -31.5). Implied was at or BELOW realized. "High IV" is not a
+     property of a number; it is a comparison, and no comparison had been
+     made. This also reversed a characterization of the far-OTM call buying
+     as lottery tickets.
+
+     Sub-trap inside B: five-session realized reads only **54**, which looks
+     like the stock calmed down. It did not. Realized vol measures DISPERSION
+     of returns, not their size, and five consecutive days of +2.6/+5.6/
+     +12.8/+7.1/+9.0 have huge drift and low variance. Never read a
+     centred-vol number on a strongly trending sample without checking the
+     mean absolute move beside it.
+
+     Standing rule: **before reporting that a level, a rate or a statistic is
+     high, low, unusual or attracting, name the baseline and the window, and
+     check that the window is at least as long as the claim.**
 
 ## Where the truth lives
 
