@@ -142,6 +142,7 @@ class EquityQuote:
     is_shortable: bool | None
     is_hard_to_borrow: bool | None
     htb_quantity: int | None
+    htb_rate: float | None
     optionable: bool | None
 
     week52_high: float | None
@@ -284,6 +285,12 @@ def parse_quote(symbol: str, block: dict,
         is_shortable=r.get("isShortable"),
         is_hard_to_borrow=r.get("isHardToBorrow"),
         htb_quantity=_i(r, "htbQuantity"),
+        # NOT _f(): that helper maps 0.0 -> None because a PRICE of zero means
+        # "absent". A borrow RATE of zero means "free to borrow", which is a
+        # real and important value. Passing it through _f would erase the
+        # single most informative state this field has.
+        htb_rate=(float(r["htbRate"])
+                  if isinstance(r.get("htbRate"), (int, float)) else None),
         optionable=r.get("optionable"),
         week52_high=_f(q, "52WeekHigh"),
         week52_low=_f(q, "52WeekLow"),

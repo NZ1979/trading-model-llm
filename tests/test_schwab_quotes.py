@@ -278,3 +278,56 @@ def test_borrow_and_reference_data_survives():
     assert q.htb_quantity == 5268067
     assert q.description == "SANDISK CORP"
     assert q.optionable is True
+
+
+# ---------------------------------------------------------- the borrow block
+#
+# Retracted story, 2026-08-17. htbQuantity on SNDK fell 5,268,067 -> 372,188
+# over one morning while the stock rallied 10%, and that was reported four
+# times as a draining lending pool and a developing squeeze. It was not
+# checked against anything until the user asked for it to be settled.
+
+
+def test_htb_rate_zero_survives_unlike_a_price():
+    """0.0 must NOT become None here.
+
+    _f() maps 0.0 -> None because an equity never trades at zero, so a price
+    of 0.0 means "absent". A borrow RATE of zero is a different thing: it is
+    a value the API actually returns, and mapping it away would hide the
+    field's real behaviour behind a None that reads as "not supplied".
+    """
+    q = _q(reference={**SNDK_BLOCK["reference"], "htbRate": 0.0})
+    assert q.htb_rate == 0.0
+    assert q.htb_rate is not None
+
+
+def test_htb_rate_absent_is_none():
+    """Distinguishable from the 0.0 above. That distinction is the whole
+    reason the field is parsed by hand rather than through _f()."""
+    assert _q().htb_rate is None
+
+
+def test_htb_rate_zero_does_not_mean_free_to_borrow():
+    """VERIFIED 2026-08-17: Schwab returned htbRate 0.0 for BOTH symbols --
+    SNDK with isHardToBorrow False, and SPCX with isHardToBorrow TRUE and
+    htbQuantity 11,193,376. A genuinely hard-to-borrow security does not cost
+    zero to borrow, so 0.0 here is Schwab's "no value" sentinel, the same one
+    it uses on the price fields. It is not a rate.
+
+    Consequence, and the reason this test exists: of Schwab's three borrow
+    fields only the isHardToBorrow BOOLEAN carries signal. htbQuantity moves
+    without any cost corroboration and cannot be read as scarcity; htbRate is
+    a constant zero. Do not rebuild a borrow narrative on either number. If
+    real borrow data is needed it must come from a source that is not this
+    API.
+    """
+    ref = SNDK_BLOCK["reference"]
+    htb = _q(reference={**ref, "isHardToBorrow": True,
+                        "htbQuantity": 11_193_376, "htbRate": 0.0})
+    free = _q(reference={**ref, "isHardToBorrow": False,
+                         "htbQuantity": 405_470, "htbRate": 0.0})
+    # Identical rate, opposite flags, quantities differing 27x in the
+    # direction OPPOSITE to what "shares available to short" would predict.
+    assert htb.htb_rate == free.htb_rate == 0.0
+    assert htb.is_hard_to_borrow is True and free.is_hard_to_borrow is False
+    assert htb.htb_quantity > free.htb_quantity
