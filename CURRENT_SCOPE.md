@@ -177,8 +177,25 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
   **2026-08-23**. `auth_state` reporting `OK` is not sufficient on its own —
   check `has_refresh_token`, because a partial token once reported five days
   of runway on dead access for 46 hours.
-- **Godzilla is on Mountain time.** Market hours are ET. Measure, never
-  extrapolate.
+- **Godzilla is on Mountain time. Market hours are ET.** Measure, never
+  extrapolate — and measure THIS, in the message where the time is cited:
+
+      TZ=America/New_York date      # via device_bash
+
+  `VERIFIED 2026-08-17:` the Cowork `device_bash` VM runs on Godzilla and its
+  clock tracks Godzilla's — `device_bash` read 07:31:30 ET against a Windows
+  `Get-Date` of 07:32:55 ET, the 85-second gap being the round trip. So a
+  session can self-serve Godzilla time rather than asking for it, and must
+  not substitute its own container clock: that one was **two hours wrong** at
+  the start of the 2026-08-15 session and produced three incorrect time
+  claims before anyone noticed. See Rule 30 clause 2.
+
+  Godzilla's clock itself is NTP-disciplined and trustworthy — W32Time was
+  found `Stopped`/`Manual` on 2026-08-15 with the machine free-running at
+  ~41 ppm, and after the fix it held to 86 ms over 24 hours against two
+  independent references. Do not re-investigate it; the 500 ms budget that
+  made it urgent belongs to the deferred microstructure layer, and nothing
+  in on-demand analysis breaks at 86 ms.
 - **The metric traps are real and there are three.** The 0DTE volume/OI
   artifact, IV explosion at expiry, and vendor IV computed against a stale
   underlying. All three produced confident, plausible, wrong output before
