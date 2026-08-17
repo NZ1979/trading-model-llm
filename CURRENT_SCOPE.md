@@ -216,7 +216,7 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
   independent references. Do not re-investigate it; the 500 ms budget that
   made it urgent belongs to the deferred microstructure layer, and nothing
   in on-demand analysis breaks at 86 ms.
-- **The metric traps are real and there are FIVE.** Each produced
+- **The metric traps are real and there are SIX.** Each produced
   confident, plausible, wrong output before being caught.
 
   1. The 0DTE volume/OI artifact. Guarded in `fetch_option_chain`.
@@ -273,6 +273,44 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
      rule: **never quote a chain-wide aggregate without both the strike
      window and the expiration-coverage basis attached**, and prefer
      `--strikes 40` or wider for anything but a glance.
+
+  6. **NEW 2026-08-17, GUARDED: a field's NAME is not its definition.**
+     Schwab's `htbQuantity` on SNDK fell 5,268,067 -> 372,188 across one
+     morning while the stock rallied 10%. It was reported FOUR times as a
+     draining lending pool and a developing short squeeze, escalating from
+     HYPOTHESIS to claimed evidence on nothing but additional points from the
+     same uninterpreted series.
+
+     `VERIFIED 2026-08-17:` Schwab's OpenAPI spec defines the field only as
+     *"Hard to borrow quantity."* — a restatement of its name. The data
+     disproves the reading outright: `htbRate` returns **0.0 for BOTH** SNDK
+     (`isHardToBorrow` false) and SPCX (`isHardToBorrow` TRUE, `htbQuantity`
+     11,193,376). A genuinely hard-to-borrow security does not cost zero, so
+     0.0 is Schwab's no-value sentinel, the same one it uses on price fields.
+     The quantities also run 27x in the direction OPPOSITE to what "shares
+     available to short" would predict.
+
+     **Of Schwab's three borrow fields only the `isHardToBorrow` boolean
+     carries signal.** htbQuantity moving is not evidence of scarcity;
+     htbRate is a constant zero. There is NO borrow analysis available from
+     this API — not a wrong one, none. Anything needing real borrow data must
+     come from a source outside this stack. Guarded by three tests in
+     `tests/test_schwab_quotes.py`.
+
+     Also recorded: the confirming test was nearly banked as a success. The
+     prediction "SNDK's htbRate will read 0" was made, came true, and would
+     have been called validation of "SNDK is free to borrow". Only checking
+     the SECOND symbol showed 0.0 means "not populated". **A confirmed
+     prediction is not a validated hypothesis** — it is one observation
+     consistent with several stories, and the discriminating test is the one
+     that separates them.
+
+     The general lesson, worth more than the finding: a plausible field name
+     plus a series that moves is enough to manufacture a narrative, and
+     nothing in the numbers will contradict it. Same shape as trap #5. Both
+     were caught only by asking what the number MEASURES rather than what it
+     appears to show, and in both cases that check was available from the
+     start and cost almost nothing.
 
 ## Where the truth lives
 
