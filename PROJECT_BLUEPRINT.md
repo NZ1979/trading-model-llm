@@ -1,3 +1,27 @@
+> **CORRECTED 2026-08-16.** Read `SESSION_RESUME_2026-08-16.md` alongside this
+> file. Four corrections affecting §2 and §3:
+>
+> - **Schwab token expiry.** §2's "Token valid 7 days" premise is wrong. The
+>   2026-08-14 flow wrote a partial token with no `refresh_token` and access
+>   died the same evening at 21:44. Re-authed 2026-08-16; expires 2026-08-23.
+>   `auth_state` was fixed in `c446793` — it now reads the file rather than
+>   its mtime, and `OK` alone is no longer sufficient. Check
+>   `has_refresh_token`.
+> - **Schwab options data is real-time**, not delayed. `/chains` returns
+>   `delayed=False` with open interest, volume, IV and delta together.
+> - **§3's SSH line is stale.** `~\.ssh\hetzner_trader` does not exist. SSH
+>   authenticates with a different key, so the documented command works by
+>   accident. Correct the path before anyone follows it.
+> - **Nothing is trading anywhere as of 2026-08-16.** `main.py` is not running
+>   on Godzilla. `trader.service` on the VPS at `5.161.199.155` is `inactive`
+>   AND `disabled`, so it will not restart on boot; the box is up with 112
+>   days uptime and load 0.00, still costing ~$8/mo. It is therefore NOT
+>   decommissioned, and Rule 26's prohibitions stand in full. The only live
+>   process on Godzilla is `C:\trading\LLM_SWING_MODEL` running
+>   `research.daily_loop watch`, up since 2026-07-15 — a separate codebase
+>   that Rule 26's partition does not mention.
+
+
 # Trading Platform — Project Blueprint
 
 **Read this file first.** Everything Claude needs to pick up this project is here. Do not refer to past conversations — they don't exist in this Cowork session.

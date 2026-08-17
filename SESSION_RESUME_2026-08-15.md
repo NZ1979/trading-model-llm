@@ -1,3 +1,31 @@
+> **CORRECTED 2026-08-16 — the options-entitlement research below is not a
+> finding.** Read `SESSION_RESUME_2026-08-16.md` first. This file is
+> deliberately left unedited as a record of what was believed on 08-15.
+>
+> The section "Options data — the investigation that overturned yesterday's
+> conclusion" explains `isDelayed: true` through OPRA licensing, the
+> `entitlement` parameter and `PP-PayingPro`/`NP-NonPro` client
+> classifications. The likely cause was far simpler: the 08-14 token was
+> **partial**, carrying no `refresh_token`, and a degraded grant appears to
+> have returned degraded data. A complete token returns `delayed=False`.
+> **Treat that section as explaining an artifact, not as research.**
+>
+> What in it DOES stand, independently confirmed against live data on 08-16:
+>
+> - Algo Trader Plus already includes real-time OPRA options data — quotes,
+>   trades, greeks, implied vol. Confirmed by a live call.
+> - Alpaca's market data API has NO open-interest field. Its OI lives on the
+>   trading API at T+2 with no history.
+> - Open interest is a once-daily T+1 figure for everyone, at every price
+>   point. That reframing is correct and load-bearing.
+>
+> Also superseded: the architecture note "OI walls from Schwab / IV and greeks
+> from Alpaca" was premised on Schwab being delayed. Schwab covers both.
+> Alpaca is still worth having for a real-time SIP underlying and as a
+> cross-check — which proved its worth the same day, via the spot-consistency
+> guard — but it is no longer load-bearing.
+
+
 # LLM Model — Session Resume Snapshot (2026-08-15)
 
 ## How to use this file

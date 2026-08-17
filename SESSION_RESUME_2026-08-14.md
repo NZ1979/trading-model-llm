@@ -1,3 +1,29 @@
+> **CORRECTED 2026-08-16 — two claims in this file are FALSE.**
+> Read `SESSION_RESUME_2026-08-16.md` first. This file is deliberately left
+> unedited as a record of what was believed on 08-14; the corrections live
+> there.
+>
+> 1. **"Authenticated 2026-08-14. Token valid 7 days from then — expires
+>    2026-08-21."** Wrong. That OAuth flow wrote a PARTIAL token — keys were
+>    `access_token, expires_at, expires_in, scope, token_type`, with no
+>    `refresh_token` and no `id_token`. The access token expired on its normal
+>    one-hour schedule and Schwab access died at **21:44 on 2026-08-14**.
+>    Nothing noticed for 46 hours because `auth_state` computed age from the
+>    token file's mtime and never opened it. Fixed in `c446793`. The broken
+>    file is preserved at
+>    `%LOCALAPPDATA%\trading\schwab_tokens.broken-20260814.json`.
+>
+> 2. **"Options data is DELAYED on this entitlement (`isDelayed: true`)."**
+>    Wrong. With a complete token, `/chains` returns **`delayed=False`** —
+>    real-time, carrying open interest, volume, implied volatility and delta
+>    together. The "resolve whether the delayed-data entitlement can be
+>    changed" item is therefore not open work; it was an artifact of the
+>    broken token.
+>
+> Everything else in this file — the SIP restore, the IEX degradation window,
+> the clock finding, the metric traps, the constraints — stands.
+
+
 # LLM Model — Session Resume Snapshot (2026-08-14)
 
 ## How to use this file
