@@ -225,8 +225,8 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
      `check_spot_consistency`.
   4. Alpaca's daily bar not rolling at the pre-market open, making gap and
      change span two sessions. Guarded by `day_bar_matches_last`.
-  5. **NEW 2026-08-17, UNGUARDED: the strike window silently changes the
-     answer.** `--strikes` truncates the chain symmetrically around ATM, so
+  5. **NEW 2026-08-17, PARTIALLY GUARDED since 63d01e8: the strike window
+     silently changes the answer.** `--strikes` truncates the chain symmetrically around ATM, so
      any statistic aggregated across the whole chain is a function of the
      fetch parameter rather than the market. Two live instances on SPCX,
      twenty minutes apart:
@@ -240,10 +240,39 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
        both wings bid, minimum near 143. Call skew is real but roughly 6 vol
        points, not the one-way slope first described.
 
-     `tests/test_option_walls.py:155` already names `strike_count=25` as too
-     narrow for the parity check. Same defect, two more surfaces. Until it is
-     guarded: never quote a chain-wide aggregate without the strike window
-     attached, and prefer `--strikes 40` or wider for anything but a glance.
+     **The real mechanism, found later the same day and worse than the
+     above.** Schwab applies `strikeCount` PER EXPIRATION, around each
+     expiration's own at-the-money — not once across the chain. So coverage
+     is a function of distance from spot. Measured on SNDK at spot 1808.82:
+
+         strike 1700 / 1800 / 1900   in 8 of 8 expirations
+         strike 2000                 in 3 of 8
+         strike 1600 / 1500          in 1 of 8
+
+     Only **11 of 79 strikes** had full coverage. Summing open interest
+     across expirations therefore ranks strikes partly by how many
+     expirations contain them. Worse, as spot drifts intraday a FIXED strike
+     gains or loses expirations and its total changes — on a T+1 figure that
+     cannot change intraday. Strike 1900 read 2,915 at spot 1770.86 and
+     3,318 at spot 1808.82 seventy-five minutes later. That was very nearly
+     reported as open interest building at 1900. It was the fetch moving.
+
+     `scripts/fetch_option_chain.py` now ranks only full-coverage strikes,
+     lists partial ones separately WITH their coverage count rather than
+     dropping them silently, and labels the put/call ratio with both its
+     coverage basis and the strike window. Still imperfect: the all-or-
+     nothing cut exiles strike 1750 at 7/8 coverage with 3,256 contracts
+     while ranking 1740 at 8/8 with 478. A single table with coverage as a
+     column would be better.
+
+     Nothing guards this outside that one script. `scripts/watch.py` records
+     `strike_window` in its JSON so a reader can at least see it.
+
+     `tests/test_option_walls.py:155` already named `strike_count=25` as too
+     narrow for the parity check. Same defect, three more surfaces. Standing
+     rule: **never quote a chain-wide aggregate without both the strike
+     window and the expiration-coverage basis attached**, and prefer
+     `--strikes 40` or wider for anything but a glance.
 
 ## Where the truth lives
 
