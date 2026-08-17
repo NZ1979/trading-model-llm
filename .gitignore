@@ -76,3 +76,4 @@ docs/sessions/*.log
 *.db-wal
 *.db-shm
 data/ticks/
+data/snapshots/
