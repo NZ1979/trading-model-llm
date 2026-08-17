@@ -40,8 +40,15 @@ not roll at the pre-market open, so between 04:00 ET and the roll its
 suppressed — while Schwab's ``totalVolume`` and ``netPercentChange`` are
 correct throughout, because Schwab carries ``closePrice`` as its own field.
 
-Verified 2026-08-17 06:51 ET: Schwab ``quoteType: NBBO``, ``realtime: true``,
-timestamps 48 seconds old.
+Verified 2026-08-17 04:51 MDT (06:51 ET): Schwab ``quoteType: NBBO``,
+``realtime: true``, timestamps 48 seconds old.
+
+Times printed for a human lead with GODZILLA LOCAL (Mountain), with ET in
+parentheses. A tool that stamps a time two hours off the reader's own clock
+invites the confusion it exists to remove. ET is kept because expirations,
+session boundaries and every options convention are quoted in it — and
+``_et_today()`` rather than ``date.today()`` drives DTE arithmetic, because
+between 22:00 MT and midnight the ET date is already tomorrow.
 
 Alpaca has no open-interest field anywhere in its market data API, so
 ``--chain`` reports IV and greeks but NOT walls. Open-interest walls come from
@@ -74,7 +81,24 @@ from analysis.option_walls import (  # noqa: E402
 )
 
 ET = ZoneInfo("America/New_York")
+# Godzilla's wall clock. Every timestamp printed for a human leads with this,
+# because a tool that stamps a time two hours off the reader's own clock
+# invites exactly the confusion it is meant to remove. ET is kept alongside:
+# expirations, session boundaries and every options convention are quoted in
+# it, and dropping it would trade one confusion for another.
+LOCAL = ZoneInfo("America/Denver")
 SNAPSHOT_DIR = REPO_ROOT / "data" / "snapshots"
+
+
+def _et_today() -> date:
+    """Today's date in ET, for days-to-expiration arithmetic.
+
+    NOT `date.today()`. Godzilla runs on Mountain time, so between 22:00 MT
+    and midnight the ET date is already tomorrow — and option expirations are
+    ET-anchored. Using the local date there would compute every DTE one day
+    long. Harmless during market hours, wrong at night, and silent either way.
+    """
+    return datetime.now(ET).date()
 
 
 def _wrap(text: str, width: int) -> list[str]:
@@ -245,7 +269,7 @@ def print_chain(quotes: list[OptionQuote], underlying_px: float | None,
         print("\n  No option contracts returned.")
         return
 
-    rows = _to_rows(quotes, today or date.today())
+    rows = _to_rows(quotes, today or _et_today())
     check = check_spot_consistency(rows, underlying_px)
 
     print(f"\n{'=' * 62}")
@@ -299,13 +323,17 @@ def print_chain(quotes: list[OptionQuote], underlying_px: float | None,
 async def run(args: argparse.Namespace) -> int:
     now_utc = datetime.now(timezone.utc)
     now_et = now_utc.astimezone(ET)
+    now_local = now_utc.astimezone(LOCAL)
 
-    print(f"\n  {now_et:%Y-%m-%d %H:%M:%S} ET   "
-          f"({now_utc:%H:%M:%S} UTC)   {_market_state(now_et)}")
+    # Godzilla local FIRST, ET in parentheses. Market state is computed from
+    # ET because that is what defines a session; it is only displayed here.
+    print(f"\n  {now_local:%Y-%m-%d %H:%M:%S} {now_local:%Z}   "
+          f"({now_et:%H:%M:%S} ET)   {_market_state(now_et)}")
 
     payload: dict = {
-        "fetched_at_utc": now_utc.isoformat(timespec="seconds"),
+        "fetched_at_local": now_local.isoformat(timespec="seconds"),
         "fetched_at_et": now_et.isoformat(timespec="seconds"),
+        "fetched_at_utc": now_utc.isoformat(timespec="seconds"),
         "market_state": _market_state(now_et),
         "symbols": {},
     }
@@ -344,7 +372,7 @@ async def run(args: argparse.Namespace) -> int:
             payload["symbols"][sym] = entry
 
             if args.chain:
-                lte = (date.today() + timedelta(days=args.dte)).isoformat()
+                lte = (_et_today() + timedelta(days=args.dte)).isoformat()
                 quotes = await client.option_chain(
                     sym, expiration_lte=lte)
                 print_chain(quotes, snap.last_price, top=args.strikes)
