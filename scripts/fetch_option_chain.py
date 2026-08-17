@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
 import sys
 from collections import defaultdict
@@ -27,17 +26,10 @@ from datetime import date, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from log_hygiene import setup_logging  # noqa: E402
 from data.schwab_auth import get_client, health  # noqa: E402
 from data.chain_store import ChainStore  # noqa: E402
 from data.schwab_chains import fetch_chain  # noqa: E402
-
-
-def setup_logging(level: str = "INFO") -> None:
-    logging.basicConfig(level=getattr(logging, level.upper()),
-                        format="%(levelname)-7s %(name)s: %(message)s")
-    for noisy in ("werkzeug", "flask", "authlib", "schwab", "httpx",
-                  "httpcore", "urllib3"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def main() -> int:

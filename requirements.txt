@@ -16,5 +16,13 @@ schwab-py>=1.5.1        # Schwab Trader API: option chains (/chains),
                         # audit note in main.py setup_logging before
                         # changing the logger suppression list.
 
+httpx>=0.28.1          # imported DIRECTLY by data/alpaca_rest.py, not only
+                       # transitively via schwab-py. Undeclared until 2026-08-17.
+                       # Rule 22: httpx logs full request URLs at INFO, which is
+                       # why log_hygiene.py pins it to WARNING.
+mcp>=2.0.0             # MCP SDK used by mcp_server/server.py. The local package
+                       # is named mcp_server precisely because a local mcp/
+                       # directory would shadow this one (verified 2026-08-16).
+
 # Standard library zoneinfo backport for Windows
 tzdata>=2024.1

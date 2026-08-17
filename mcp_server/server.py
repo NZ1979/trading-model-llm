@@ -62,11 +62,20 @@ if str(_REPO_ROOT) not in sys.path:
 
 from mcp.server import MCPServer  # noqa: E402
 
+from log_hygiene import setup_logging  # noqa: E402
+
 # stderr ONLY. See constraint 1 above.
-logging.basicConfig(
-    level=logging.INFO,
+#
+# Rule 22, 2026-08-17: this block previously called logging.basicConfig at INFO
+# with NO noisy-logger suppression, while data/alpaca_rest.py imports httpx
+# directly. httpx logs the full request URL at INFO, so every vendor call this
+# server made would have written its URL into the MCP client's log. Alpaca and
+# Schwab both authenticate by header, so no credential was in those URLs, but
+# the suppression belongs here regardless and must not be removed.
+setup_logging(
+    logging.INFO,
     stream=sys.stderr,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    fmt="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("mcp_server")
 
