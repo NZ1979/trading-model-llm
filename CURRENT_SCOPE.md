@@ -93,6 +93,53 @@ Both subscriptions are already paid for:
 `UNVERIFIED:` whether Schwab options stay real-time during regular hours —
 the only sample is a Sunday evening.
 
+## Sources evaluated and REJECTED
+
+Recorded so they are not re-investigated. Both were chased on 2026-08-17 and
+both are closed.
+
+**OCC daily open interest** — `marketdata.theocc.com/daily-open-interest`.
+The theory was that OCC is the clearing house, so its file is the ORIGIN of
+every vendor's open interest rather than a redistribution, and would verify
+Schwab's per-contract OI for free and permanently.
+
+`VERIFIED 2026-08-17:` it responds unauthenticated and returns a CSV, but the
+file is **market-wide aggregate only** — total open interest bucketed into
+Equity / Index / Debt / Futures, one row per date. No symbol, strike or
+expiration column anywhere. 1,449 bytes for a whole month. **It cannot verify
+per-contract open interest.** Closed.
+
+Not useless, just not for that. It is a free daily source for **market-wide
+options breadth**, which nothing else in this stack covers — on 2026-08-14
+total OI fell 14.7M contracts to 670,687,510, with equity calls down 8.8M.
+Noted as available; nothing is built on it.
+
+Consequence: Schwab's per-contract OI stays unverified against an independent
+source, and that is accepted. Schwab's OI originates from the same clearing
+house, so the risk was never a wrong number — it is a misread of the T+1
+semantics, which `data/chain_store.py` already encodes in `as_of_close` and
+`prior_close`.
+
+**Barchart** — `VERIFIED 2026-08-17:` their Terms of Service prohibit *"any
+data mining, robots, or similar data gathering and extraction tools to
+capture data or content from the Barchart Services"*, so scraping is out.
+Their OnDemand `getEquityOptions` API does return open interest, implied
+volatility, all four greeks and bid/ask with sizes — but it is contact-sales
+only, with no self-serve signup, no published pricing, no free tier, and
+documentation describing *"intraday or end-of-day options data"* without ever
+claiming real-time. Closed.
+
+**The general principle, which is worth more than either finding.** Barchart,
+Schwab and Alpaca all source options data from OPRA. A third vendor reading
+the same tape checks that vendor's PROCESSING, not the tape — three vendors
+agreeing tells you they agree, not that they are right.
+
+Prefer **structural** checks over second opinions. Put-call parity is
+arithmetic the data must satisfy regardless of who publishes it, costs
+nothing, needs no vendor, and caught a 4.97% spot error on 2026-08-17 that
+three agreeing vendors would have sailed past. See
+`analysis/option_walls.check_spot_consistency`.
+
 ## How it works today
 
     .\.venv\Scripts\python.exe -m scripts.market SNDK
