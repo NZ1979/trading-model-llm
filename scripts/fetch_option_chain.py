@@ -1,7 +1,8 @@
 """Fetch one Schwab option chain and summarise it. REAL NETWORK CALL.
 
 Requires a valid Schwab token (run `python -m scripts.schwab_login` first).
-Writes nothing to disk.
+Stores every fetched chain to data/chains/chains.db by default so that
+day-over-day open-interest change is available tomorrow. --no-store opts out.
 
 Run from C:\\trading\\LLM model with the venv active:
 
@@ -27,6 +28,7 @@ from datetime import date, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.schwab_auth import get_client, health  # noqa: E402
+from data.chain_store import ChainStore  # noqa: E402
 from data.schwab_chains import fetch_chain  # noqa: E402
 
 
@@ -54,6 +56,10 @@ def main() -> int:
                     help="minimum contracts traded today for the flow table")
     ap.add_argument("--raw", action="store_true",
                     help="dump one full contract dict and exit")
+    ap.add_argument("--no-store", action="store_true",
+                    help="do NOT persist this chain. Storing is the default "
+                         "because open interest is a once-daily figure and an "
+                         "uncaptured session is unrecoverable.")
     args = ap.parse_args()
 
     setup_logging()
@@ -75,6 +81,35 @@ def main() -> int:
         print(f"No contracts returned for {args.symbol}. Not optionable, or "
               f"the filters matched nothing.", file=sys.stderr)
         return 1
+
+    # ------------------- persist, so tomorrow can diff --------------------
+    #
+    # ON BY DEFAULT. Open interest is a T+1 figure: it does not move intraday,
+    # but it IS overwritten overnight, so a session that is not captured is
+    # gone permanently. Day-over-day OI change is the only measurement that
+    # separates opening flow from closing flow -- volume cannot, because
+    # volume carries no direction. A contract with volume 5x its open
+    # interest looks identical whether customers bought it or sold it.
+    #
+    # write_chain is idempotent per (session_date, symbol), so re-running this
+    # during the day updates in place instead of double-counting.
+    if not args.no_store:
+        db_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "chains")
+        try:
+            with ChainStore(db_dir) as store:
+                n = store.write_chain(chain)
+                latest = store.latest_session(chain.underlying)
+                prior = store.prior_session(chain.underlying, latest)
+            print(f"stored {n:,} contracts -> data/chains/chains.db  "
+                  + (f"prior session {prior} available for OI diff"
+                     if prior else
+                     "first session for this symbol; OI diff needs one more"))
+        except Exception as e:
+            # A storage failure must never cost the analysis you ran for.
+            print(f"WARNING: chain NOT stored: {type(e).__name__}: {e}",
+                  file=sys.stderr)
 
     if args.raw:
         c = chain.contracts[0]

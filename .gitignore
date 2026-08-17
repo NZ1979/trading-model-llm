@@ -77,3 +77,8 @@ docs/sessions/*.log
 *.db-shm
 data/ticks/
 data/snapshots/
+# Option-chain rolling store (data/chain_store.py). Same treatment as
+# data/ticks/: a local SQLite store, not source. Open interest is a daily
+# snapshot, so this file is NOT regenerable after the fact - back it up
+# outside git rather than committing a growing binary.
+data/chains/
