@@ -248,3 +248,64 @@ full-day average), back at VWAP after being 2.3% above it in the morning.
 - Tree clean except **`_r30_clause1_new.txt`**, still untracked
 - Tests **1176 passing**
 - Schwab token expires **2026-08-23**
+
+---
+
+# Evening session — 2026-08-17, after the close
+
+Written 18:21 MDT. Two commits, both pushed: `4a33304`, `f07a5a8`.
+Tests **1176 -> 1198**.
+
+## What shipped
+
+- `log_hygiene.py` — one HTTP-logger suppression list instead of one inline
+  copy. Rule 22. The audit found the standing assumption wrong:
+  `fetch_option_chain.py` already had the suppression, and `market.py` /
+  `watch.py` / `daily.py` never call `basicConfig` at all, so their gap is
+  LATENT not live. The one live gap was `mcp_server/server.py` at INFO with
+  no suppression while `data/alpaca_rest.py` imports httpx directly. No
+  credential was ever in those URLs (Alpaca and Schwab both authenticate by
+  header), so this is metadata exposure, not the 2026-05-04 Polygon class of
+  leak.
+- `httpx` and `mcp` declared in `requirements.txt`. Both were first-party
+  imports with no declaration.
+- Rule 30 clause 1 amendment spliced into `CLAUDE_PREFLIGHT.md`, 690 -> 692.
+- `StrikeCoverage` + `coverage_table` in `analysis/option_walls.py`, replacing
+  the full-coverage-only wall ranking. Coverage is a column; nothing is
+  exiled.
+
+## Corrections to the midday record
+
+- **`chains.db` does not keep intraday vintages.** `UNIQUE(session_date,
+  symbol)` + upsert means one row per contract per session. "Two fetch
+  vintages per symbol" meant only that non-overlapping contracts survived. A
+  16:05 fetch overwrote the mid-day readings for the 640 contracts it
+  covered, and a later wide fetch absorbed the 12:13 vintage entirely. Nothing
+  important was lost — volume within a session only increases, so the later
+  value is strictly more complete, and OI is static intraday — but the
+  mechanism was misdescribed.
+- **"4-day calls at/above 2,000 traded 34,249 against 20,749 OI"** is a
+  mixed-vintage aggregate. Re-measured across the union of 60 contracts: OI
+  **20,749 confirmed exactly**, volume **at least 38,512**, and even that is
+  low because 31 of the 60 are frozen at a 12:24 MDT reading.
+- **Schwab revises the chain after the close.** 16:05 -> 18:15 MDT with no
+  trading: CALL 1700 OI 6,231 -> 6,229, PUT 1850 OI 556 -> 511, CALL 1800
+  08-21 volume 13,902 -> 13,903, CALL 1950 08-21 volume 2,117 -> **2,112**.
+  Volume fell, which trading cannot do. "OI is static intraday" is true;
+  "OI cannot change" is not, and was asserted.
+- **The largest call wall is strike 2000, not 1800 or 1600.** 7,670 OI at 8/8
+  coverage, visible only at `--strikes 100` or wider. It was absent from every
+  ±40 fetch this session.
+
+## Errors this session
+
+- Predicted 960 contracts from `chain_fetches.contract_count` without
+  checking what parameters produced that row. Actual 640, which is exactly
+  `--strikes 40` x 8 expirations x 2 sides.
+- Recommended a write against `chain_store` without reading its write
+  semantics, on the strength of a sentence in a resume document. Rule 30
+  clause 3: the sentence was a proxy for the schema and was treated as the
+  schema.
+- Predicted 1197 tests, actual 1198. Counted a test batch by eye as 11 when
+  it was 12. `pytest --collect-only` was available and unused.
+- Asserted post-close OI would be identical. See the revision finding above.

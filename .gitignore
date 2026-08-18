@@ -86,3 +86,6 @@ data/chains/
 # Live watcher output (scripts/watch.py). Rewritten every few seconds while
 # the watcher runs; pure runtime state, never source.
 data/live/
+
+# Word/Excel lock files (~$FILENAME) created while a doc is open
+~$*

@@ -261,13 +261,32 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
      3,318 at spot 1808.82 seventy-five minutes later. That was very nearly
      reported as open interest building at 1900. It was the fetch moving.
 
-     `scripts/fetch_option_chain.py` now ranks only full-coverage strikes,
-     lists partial ones separately WITH their coverage count rather than
-     dropping them silently, and labels the put/call ratio with both its
-     coverage basis and the strike window. Still imperfect: the all-or-
-     nothing cut exiles strike 1750 at 7/8 coverage with 3,256 contracts
-     while ranking 1740 at 8/8 with 478. A single table with coverage as a
-     column would be better.
+     **SUPERSEDED 2026-08-17 evening, commit `f07a5a8`.** The all-or-nothing
+     cut was itself a distortion: it exiled strike 1750 at 7/8 coverage with
+     3,256 contracts while ranking 1740 at 8/8 with 478, and it hid the
+     largest concentration on BOTH sides of the SNDK chain. Replaced by
+     `analysis.option_walls.coverage_table`, which keeps EVERY strike, carries
+     `expirations_covered` / `expirations_total` as fields, and adds an
+     `oi_per_expiration` column that is comparable across coverage counts.
+     The put/call ratio prints on both the full-coverage and all-strike bases.
+     13 tests.
+
+     Two things the guard does NOT cover, both measured 2026-08-17 evening:
+
+     - **The trap also lives inside `chains.db`.** `chain_snapshots` is
+       `UNIQUE(session_date, symbol)` with an upsert, so one row per contract
+       per session, and a later narrow fetch overwrites rows from an earlier
+       wide one. Summing OI by strike ACROSS the table therefore mixes fetch
+       windows: strike 1600 read 7,423 calls over 8 expirations in the
+       database and 6,743 over 3 in the live fetch that wrote it. Aggregate
+       from a SINGLE fetch only. Per-contract joins, which is what
+       `oi_change()` does, are unaffected.
+     - **The window can change the top of the book, not just the order.** The
+       largest call wall was 1600 at `--strikes 40` and **2000 at
+       `--strikes 100`**, a strike entirely absent from the narrower fetch.
+       And 1900 read 2,915 at +/-40 and 3,318 at +/-100 with spot IDENTICAL
+       at 1786.85 — the same number pair attributed above to spot drift. The
+       variable is COVERAGE; spot drift is only one of two ways to move it.
 
      Nothing guards this outside that one script. `scripts/watch.py` records
      `strike_window` in its JSON so a reader can at least see it.
