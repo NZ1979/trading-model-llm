@@ -42,9 +42,24 @@ WHAT IT DOES, AND WHY EACH CADENCE
    column was uniformly zero and the day-over-day OI change could not be
    attributed to flow at all. Two fetches fixes that permanently.
 
-   Both use --strikes 200. A narrow fetch OVERWRITES rows written by a wider
+   Both use --strikes 400. A narrow fetch OVERWRITES rows written by a wider
    one (chain_snapshots is UNIQUE(session_date, symbol)), so a single stingy
    fetch silently truncates that session's stored chain forever.
+
+   Why 400 and not 200. Measured 2026-08-19 after SNDK fell 3.9%: a --strikes
+   200 fetch returned EXACTLY 400 rows (200 strikes x 2 sides) on all 8
+   expirations. Returning the cap on every expiration means the cap, not the
+   chain, set the boundary. Schwab applies strikeCount PER EXPIRATION around
+   each expiration's own ATM, so a falling spot drags every window down and
+   sheds the top strikes. The re-fetch at 400 returned 432-742 rows per
+   expiration -- under the 800 cap, so 400 is NOT binding -- and revealed
+   PUT 800 carrying 10,126 OI at 8/8 coverage, a strike that had 0/8 coverage
+   at 200 and was therefore the largest put concentration on the board while
+   being completely invisible. Same failure as strike 2000 at --strikes 40.
+
+   The saturation test is mechanical: the fetch was truncated if and only if
+   any expiration returns exactly 2 x --strikes rows. Check it before trusting
+   any chain-wide aggregate; 400 is today's answer, not a permanent one.
 
 3. DASHBOARD every --dash-every minutes. Pure re-render from stored data, no
    vendor call.
@@ -214,9 +229,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="ET time for the pre-market chain fetch")
     ap.add_argument("--pm-fetch", default="16:15",
                     help="ET time for the post-close chain fetch (volume final)")
-    ap.add_argument("--strikes", type=int, default=200,
+    ap.add_argument("--strikes", type=int, default=400,
                     help="NEVER lower this: a narrow fetch overwrites a wider "
-                         "one for the same session, permanently")
+                         "one for the same session, permanently. 200 was "
+                         "measured SATURATED on all 8 SNDK expirations "
+                         "2026-08-19; see module docstring.")
     ap.add_argument("--dte", type=int, default=60)
     ap.add_argument("--state", default="data/live/collector_state.json")
     ap.add_argument("--tick", type=int, default=30, help="loop seconds")
@@ -243,8 +260,8 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         print("--am-fetch / --pm-fetch must be HH:MM", file=sys.stderr)
         return 2
-    if args.strikes < 200:
-        logger.warning("--strikes %d is below 200. A narrow fetch OVERWRITES "
+    if args.strikes < 400:
+        logger.warning("--strikes %d is below 400. A narrow fetch OVERWRITES "
                        "wider rows for the same session and cannot be undone.",
                        args.strikes)
 
