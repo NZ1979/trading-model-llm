@@ -35,24 +35,19 @@ Godzilla has not. Measure Godzilla time in the same message you cite it.
 
 ---
 
-## THE FIRST TASK — commit and push. Nothing is durable.
+## Already committed — do NOT redo this
 
-**Eleven files are on disk with 33 new tests passing and ZERO git operations
-ran end to end.** This is the exact trap Rule 27 exists for. Until the push
-lands, the accurate framing is *"code on disk, tests passing, NOT YET
-committed."*
+The 2026-08-19 work is **committed and pushed**. Verified `working tree clean`
+and `up to date with 'origin/main'`.
 
-Per Rule 24, git runs from **PowerShell on Godzilla**, never the Cowork mount.
-Include the index-lock clear — the bash sandbox often leaves a 0-byte
-`.git/index.lock` that Windows-side git cannot work around.
+    f8a84f7   SNDK structure model: gamma exposure, persistent bars,
+              OI change, dashboard, collector    12 files, 3,924 insertions
+    b99dfc4   gitignore the persistent bar store
 
-```powershell
-# Godzilla, PowerShell, C:\trading\LLM model
-Remove-Item .git\index.lock -ErrorAction SilentlyContinue
-git status
-```
+Test count went **1198 -> 1231**. Remote is `origin` ->
+https://github.com/NZ1979/trading-model-llm.git.
 
-New files awaiting commit:
+Files now in the repo:
 
     analysis/gamma_exposure.py          gamma exposure + flip solver
     tests/test_gamma_exposure.py        33 tests
@@ -64,13 +59,15 @@ New files awaiting commit:
     scripts/collector.py                the unattended collector
     scripts/alert.py                    level + feed-health alerting
     scripts/selftest.py                 alert.py regression suite
+    CURRENT_SCOPE.md                    modified, 380 -> 425 lines
 
-Modified:
+`data/bars/`, `data/chains/` and `data/live/` are gitignored — generated
+stores, not source. **`chains.db` is NOT regenerable**: open interest has no
+history endpoint at any vendor, so back it up outside git. `bars.db` IS
+regenerable via `scripts/backfill_bars.py`.
 
-    CURRENT_SCOPE.md                    380 -> 425 lines
-
-Test count should go **1198 -> 1231**. Verify with `pytest --collect-only`
-rather than counting by eye.
+Start from "Next, in priority order" near the end of this file. Item 1 there
+is now done; begin at item 2, the peer universe backfill.
 
 ---
 
@@ -355,7 +352,7 @@ after would have skipped the catch-up chain fetch. Now writes to
 
 ## Next, in priority order
 
-1. **Commit and push.** Nothing above is durable.
+1. ~~Commit and push.~~ **DONE** — f8a84f7 and b99dfc4, working tree clean.
 2. **Peer universe backfill** — `--symbol MU,WDC,STX,NVDA,AMD,SMH` plus ~25
    liquid non-semis. Moves the pre-market buckets off n=7/n=9 toward n≈500 and
    lets the gamma mechanics be validated across names and both directions
