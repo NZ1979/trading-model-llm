@@ -17,6 +17,51 @@ That is the whole goal. Ask about a stock, get live data, discuss it.
 The model is turn-based and only executes when a message is sent. It cannot
 monitor a condition, and any design that assumes it can is wrong.
 
+## Authorised exception — unattended collection (2026-08-19)
+
+The prohibition above stands, with exactly one carve-out, granted by the user
+in conversation on 2026-08-19 and recorded here so a later session does not
+delete it as drift:
+
+    scripts/collector.py    runs unattended across pre, regular and post
+                            market. Collects and stores. Nothing else.
+
+**What the exception covers**
+
+- backfilling OHLCV bars into `data/bars/bars.db` on a timer
+- fetching option chains TWICE daily into `data/chains/chains.db`
+- re-rendering the static dashboard at `data/live/<SYM>_dashboard.html`
+
+**What it does NOT cover, and what a change would need a new decision for**
+
+- alerting, notifying, or reaching the user without them asking
+- deciding, scoring, or recommending anything
+- order entry of any kind, which remains prohibited without qualification
+
+The line is: the collector may write to disk. It may not write to the user.
+`scripts/alert.py` predates this exception and is run manually by the user;
+the collector does not start it and must never gain that ability.
+
+**Why two chain fetches and never one.** Open interest is T+1 and already
+final by pre-market, so the morning fetch supplies the day's levels. Volume
+only finishes accumulating after the close, so a pre-market fetch records 0
+for every contract — measured 2026-08-19, when the 08-18 chain had been
+fetched at 07:30 ET and its volume column was uniformly zero, making the
+day-over-day OI change impossible to attribute to flow. Both fetches use
+`--strikes 200`; `chain_snapshots` is `UNIQUE(session_date, symbol)`, so a
+narrower fetch OVERWRITES rows written by a wider one and truncates that
+session's stored chain permanently.
+
+**Where it runs.** As a process on Godzilla, in its own window, like
+`scripts.watch`. NOT as a scheduled Claude session — collection must not
+depend on a chat being awake, and a cron-fired session is a fragile and
+expensive way to call a REST endpoint every five minutes.
+
+**How to tell running-and-quiet from dead.** `data/live/collector_state.json`
+carries a heartbeat, the last success of each task, and per-task error
+counts. A silent collector and a stopped collector look identical from the
+console; they do not look identical in that file.
+
 ## What this project is NOT
 
 `C:\trading\LLM model` contains **two projects sharing one directory.**
