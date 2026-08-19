@@ -89,3 +89,9 @@ data/live/
 
 # Word/Excel lock files (~$FILENAME) created while a doc is open
 ~$*
+
+# Persistent bar store (data/price_store.py). Local SQLite, not source.
+# UNLIKE data/chains/, this one IS regenerable: scripts/backfill_bars.py
+# re-pulls it from Alpaca, and writes are UPSERTs so a re-run is idempotent.
+# Excluded because it grows without bound, not because it is precious.
+data/bars/
