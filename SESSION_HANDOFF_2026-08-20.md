@@ -414,3 +414,148 @@ The seven from the 08-18 handoff still hold. Three additions from 08-19:
 **And the habit that would have caught most of them:** ask what a number
 MEASURES before interpreting it, and name the baseline and window before
 calling anything high, low, or unusual.
+
+
+---
+
+# EVENING ADDENDUM — written 2026-08-19 16:18 MDT, after the close
+
+**Supersedes every line above that says `--strikes 200`.** Read this before
+acting on the body of the file.
+
+## 1. `--strikes 200` was SATURATED. The standing rule is now 400.
+
+The 16:15 ET pm fetch returned EXACTLY 400 rows -- 200 strikes x 2 sides -- on
+**all 8 expirations**. Returning the cap on every expiration means the cap set
+the boundary, not the chain. Re-fetched at `--strikes 400`: 432-742 rows per
+expiration, under the 800 cap, so 400 is NOT binding.
+
+What 200 was hiding:
+
+    PUT   800   10,126 OI    0/8 coverage at 200  ->  8/8 at 400
+    PUT  1000    6,969 OI    0/8                  ->  8/8
+
+The largest put concentration on the board was structurally invisible, exactly
+as strike 2000 was invisible at `--strikes 40`. Max strike per expiration moved
+2075 -> 2840 (08-28), 2250 -> 2630 (09-11), 2560 -> 3530 (08-21). Cause: spot
+fell 3.9% and `strikeCount` applies PER EXPIRATION around each expiration's own
+ATM, so every window slid down and shed its top strikes together.
+
+**Strike 800 is NOT support.** 49% below spot, no bid, tail/hedge structure. It
+belongs in an OI table and nowhere near a levels ladder.
+
+**The mechanical saturation test, worth more than the number 400:**
+
+    the fetch was TRUNCATED if and only if any expiration
+    returns exactly 2 x --strikes rows
+
+Not yet implemented. See Next.
+
+Committed `4215f85`: collector default 200 -> 400 and the floor guard with it.
+
+## 2. Volume at 16:15 ET was already final
+
+The body's "final volume" wording is correct and an earlier correction of it
+was wrong. Decomposed against the pre-refetch strike windows:
+
+    volume on strikes 16:15 already covered   190,137   (3,200 contracts)
+    volume on strikes only 18:01 reached        5,484   (1,628 contracts)
+
+190,137 at 18:01 ET against 190,137 at 16:15 ET. **Not one contract moved in
+1h46m.** The apparent +5,161 was entirely new coverage, not late accrual.
+
+Still open: the 08-17 revision evidence spanned 18:05 -> 20:15 ET, LATER than
+the window tested here. Not refuted, just untested.
+
+## 3. `bid`/`ask`/`last`/`mark` are 0.0 in EVERY stored row. UNVERIFIED why.
+
+All 4,828 rows of 20260819, all 1,960 of 20260817, all 3,176 of 20260818.
+
+**Do NOT conclude a parse bug.** The upsert overwrites price fields
+(`chain_store.py:147`), so every row carries its LAST write, and every last
+write happened outside regular hours:
+
+    20260817   20:15 ET   post-close
+    20260818   07:30 ET   pre-market
+    20260819   18:01 ET   post-close
+
+All-zero quotes are fully consistent with "options do not quote outside RTH."
+`watch.py`'s `SNDK_chain.json` shows the same zeros, but both paths share
+`data/schwab_chains.py`, so that is NOT an independent check.
+
+Test: one `--raw --no-store` fetch between 09:30 and 16:00 ET.
+
+**The structural consequence holds either way.** Both collector fetches fire at
+08:00 and 16:15 ET, both outside RTH, so `chains.db` will never carry option
+quotes on the current schedule. `check_spot_consistency` is put-call parity and
+needs prices, so the one structural guard in the repo cannot run against stored
+data -- only against a live fetch.
+
+Related, `data/schwab_chains.py:221`: `bid=_f(raw,"bidPrice") or 0.0` collapses
+absent and zero into one value. Rule 18 fail-quiet. It makes "no quote, or no
+field?" permanently unanswerable from the store.
+
+## 4. Vintage mixing inside one session_date, measured
+
+Before the re-fetch, `session_date=20260819` held THREE vintages:
+
+    spot 1568.87   3,200 rows   16:15 ET   <- the pm fetch
+    spot 1594.60      62 rows   12:12 ET
+    spot 1552.50      38 rows   14:11 ET
+
+100 rows survived from earlier narrower fetches, carrying mid-session volume
+under a session_date that reads as end-of-day. `underlying_price` and
+`fetched_at_ms` are stored PER ROW, so this is directly detectable: group by
+`ROUND(underlying_price,2)` and more than one group means the session is mixed.
+The 400 re-fetch collapsed it to a single vintage.
+
+`oi_change()` is unaffected -- it joins per contract and OI is T+1, so a row's
+OI is the prior close regardless of fetch time. Only the volume column mixes.
+
+## 5. The unexplained kill has a mechanism
+
+Every project python runs as a PAIR: the venv stub spawns the real interpreter
+as its child. Confirmed by the user 2026-08-19.
+
+    27160   C:\trading\LLM model\.venv\Scripts\python.exe    <- stub
+     2120   C:\Users\kings\...\Python314\python.exe           <- real, the tracked one
+
+`Stop-Process` on a parent silently takes its child. That is very likely why
+watch PID 23048 died alongside a batch that did not name it.
+
+**The real interpreter has no "LLM model" in its ExecutablePath.** Any cleanup
+filtering on `ExecutablePath -like '*LLM model*'` finds only stubs. Filter on
+`-m` in the CommandLine, which is what the existing inventory command does.
+
+"Four collector instances" on 08-19 may have been two logical collectors seen
+as four PIDs. UNVERIFIED -- that moment's parentage is unrecoverable.
+
+## 6. errors held at 0 through the close
+
+`collector_state.errors` was `{}` at 18:16 ET, 5h34m after the 12:42 MDT
+single-watcher restart. **The two-watcher collision diagnosis is CONFIRMED and
+the "benign reader race" explanation was wrong.**
+
+## 7. Git tip is not what the body says
+
+The body records `f8a84f7` / `b99dfc4` as the tip. Actual parent of tonight's
+commit was `2a5142b`, so something landed between 12:46 MDT and the evening.
+Tip is now **`4215f85`**.
+
+## Next, revised
+
+1. **Restart the collector after 18:00 MDT** to load `--strikes 400`. Stop the
+   STUB pid; the real interpreter goes with it. Verify with the inventory
+   command first -- expect exactly two logical processes, four PIDs.
+2. **Implement the saturation check** in `fetch_option_chain`, with tests.
+3. **RTH `--raw` probe** to settle whether Schwab populates bid/ask intraday.
+4. **Peer universe backfill.** `backfill_bars.py --symbol` accepts a comma list
+   (splits and uppercases), `--days` defaults to 30. Start with the six semis,
+   not all thirty -- six first gives the rate-limit and wall-clock behaviour
+   before committing, and avoids calling a 6-symbol run scale-tested when
+   production is 30.
+5. Scale the gamma drift threshold to realized volatility.
+6. `analysis/premarket_setup.py` as a real module with tests.
+7. Decide on the $29 OI history.
+8. **Re-auth Schwab before Friday 2026-08-21.** Token dies 08-23, a Sunday, and
+   08-21 is the expiry holding 53% of OI within 60 days. Do not let them meet.

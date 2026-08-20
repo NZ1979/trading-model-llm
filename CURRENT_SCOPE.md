@@ -1,6 +1,6 @@
 # CURRENT SCOPE — read this before anything else in this repository
 
-Last updated 2026-08-17.
+Last updated 2026-08-19 (evening: strike window raised to 400, see trap #5).
 
 ## What this project is
 
@@ -48,9 +48,20 @@ only finishes accumulating after the close, so a pre-market fetch records 0
 for every contract — measured 2026-08-19, when the 08-18 chain had been
 fetched at 07:30 ET and its volume column was uniformly zero, making the
 day-over-day OI change impossible to attribute to flow. Both fetches use
-`--strikes 200`; `chain_snapshots` is `UNIQUE(session_date, symbol)`, so a
+`--strikes 400`; `chain_snapshots` is `UNIQUE(session_date, symbol)`, so a
 narrower fetch OVERWRITES rows written by a wider one and truncates that
 session's stored chain permanently.
+
+**400, raised from 200 on 2026-08-19, and here is the measurement.** The 16:15
+ET fetch at `--strikes 200` returned EXACTLY 400 rows -- 200 strikes x 2 sides
+-- on all 8 expirations. Hitting the cap on every expiration means the cap set
+the boundary, not the chain. Re-fetched at 400: 432-742 rows per expiration,
+under the 800 cap, so 400 is not binding. What 200 was hiding was PUT 800 with
+10,126 OI, which went from 0/8 expiration coverage to 8/8 -- the largest put
+concentration on the board, structurally invisible, exactly as strike 2000 was
+invisible at `--strikes 40`. Spot fell 3.9% that day and `strikeCount` is
+applied PER EXPIRATION around each expiration's own ATM, so every window slid
+down and shed its top strikes at once.
 
 **Where it runs.** As a process on Godzilla, in its own window, like
 `scripts.watch`. NOT as a scheduled Claude session — collection must not
@@ -339,8 +350,21 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
      `tests/test_option_walls.py:155` already named `strike_count=25` as too
      narrow for the parity check. Same defect, three more surfaces. Standing
      rule: **never quote a chain-wide aggregate without both the strike
-     window and the expiration-coverage basis attached**, and prefer
-     `--strikes 40` or wider for anything but a glance.
+     window and the expiration-coverage basis attached.**
+
+     **On the window itself, UPDATED 2026-08-19: use `--strikes 400`, and do
+     not treat any fixed number as settled.** 40 was wrong, then 200 was
+     wrong. The failure is not the number, it is quoting one without checking
+     whether it bound. There is a mechanical test that settles it every time:
+
+         the fetch was TRUNCATED if and only if any expiration
+         returns exactly 2 x --strikes rows
+
+     Returning the cap is the signature of the cap choosing the boundary. On
+     2026-08-19 all 8 SNDK expirations returned exactly 400 rows at
+     `--strikes 200`, and the re-fetch at 400 returned 432-742 -- under its own
+     cap, therefore not binding. Run that check before trusting any chain-wide
+     aggregate. Not yet implemented in code.
 
   6. **NEW 2026-08-17, GUARDED: a field's NAME is not its definition.**
      Schwab's `htbQuantity` on SNDK fell 5,268,067 -> 372,188 across one
