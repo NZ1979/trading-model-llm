@@ -559,3 +559,96 @@ Tip is now **`4215f85`**.
 7. Decide on the $29 OI history.
 8. **Re-auth Schwab before Friday 2026-08-21.** Token dies 08-23, a Sunday, and
    08-21 is the expiry holding 53% of OI within 60 days. Do not let them meet.
+
+
+---
+
+# ADDENDUM 2 — pre-market model rebuilt on 10 symbols, 2026-08-20 09:50 MDT
+
+**Supersedes section 5 of the body ("The pre-market setup model").** The n=7 /
+n=9 table there is superseded in full. Two of its three headline numbers do not
+survive.
+
+## What was run
+
+`backfill_bars.py` extended SNDK from 23 to 379 sessions, then added
+MU, WDC, STX, NVDA, AMD (peers), SMH (sector) and SPY, QQQ, IWM (market).
+10 symbols, 379 sessions each, 2,774,312 bars, 473 MB.
+
+## Does the NEAR / FADING split exist outside SNDK? Yes.
+
+738 sessions with a pre-market advance >= +2%. Round-trip measured only on
+sessions that OPENED ABOVE the prior close -- opening below satisfies it by
+definition and the tautology inflated an earlier cut to 13/13.
+
+    sym     adv>=2% |  NEAR n  round-trip  new-high |  FADE n  round-trip  new-high
+    SNDK        157 |      68   38% +/-12   85% +/-8 |      89   63% +/-11   60% +/-10
+    MU          158 |      84   17% +/-8    89% +/-7 |      74   61% +/-12   49% +/-11
+    WDC         136 |      62   35% +/-12   84% +/-9 |      74   50% +/-13   53% +/-11
+    STX         102 |      51   43% +/-14   80% +/-11|      51   44% +/-15   53% +/-14
+    NVDA         68 |      44   20% +/-12   82% +/-11|      24   48% +/-21   42% +/-20
+    AMD         117 |      68   16% +/-9    88% +/-8 |      49   60% +/-14   39% +/-14
+    POOL        738 |     377   28% +/-5    85% +/-4 |     361   56% +/-6    51% +/-5
+
+Six of six agree on both metrics. On new-high the two sets do not overlap at
+all: NEAR spans 80-89, FADE spans 39-60. This is a market effect, not SNDK.
+
+## Corrections to the body
+
+1. **FADING round-trip is 56% +/-6, not 78%.** Overstated by 22 points.
+2. **NEAR round-trip 29% was right** -- pooled 28% +/-5. It also did NOT
+   survive at n=34 (10/34 = 29%) as a mid-session check suggested; that
+   agreement was coincidence, and the n=364 SNDK-only figure was 42%. The
+   pooled cross-symbol number is the one to trust.
+3. **Close-vs-open carries no signal.** Body says -0.30% vs +2.76%. Pooled:
+   **+0.29% vs +0.02%**. Every intraday forecast made on 2026-08-20 used the
+   +2.76% figure and it does not exist.
+4. **Median MAE from the open is -1.74% to -1.88%, not -3.53%.**
+5. **"69% made a new high above the PRE high" is two numbers, not one:**
+   85% +/-4 for NEAR, 51% +/-5 for FADE. Blending them destroyed the
+   discriminator. THIS IS THE MODEL'S REAL SIGNAL.
+
+## Conditioning on market and sector state known at 09:30
+
+    FADING bucket (n=361)              n    round-trip   new-high  med close-open
+    ALL                              361    56% +/-6     51% +/-5      +0.02%
+    QQQ gapped UP                    272    52% +/-6     50% +/-6      -0.40%
+    QQQ gapped DOWN                   89    73% +/-12    53% +/-10     +1.31%
+    stock LEADING SMH                246    54% +/-6     54% +/-6      -0.35%
+    stock LAGGING SMH                115    63% +/-12    44% +/-9      +0.58%
+
+**QQQ direction is the only conditioning variable that carries information**,
+and only for round-trip: 73% on a down gap against 52% on an up gap. Relative
+strength vs SMH adds little. In the NEAR bucket nothing conditions.
+
+**New-high is insensitive to market state** (50/53/54/44 across every cut).
+The strongest discriminator in the model is a property of the stock's own
+pre-market behaviour, not of the tape.
+
+## The limitation that survives
+
+**622 of 738 sessions had QQQ gapping UP.** The peer universe removed SNDK's
+single-stock regime problem and exposed the market's. Down-tape cells carry
+n=89 and n=27. Extending history past 2025-02-18, or adding longer-listed
+names, is the only fix. Nothing in the current store addresses it.
+
+## 2026-08-20 itself, for the record
+
+Open 1569.00 against a prior close of 1568.87. PRE high 1632.00 (+4.02%),
+giveback 4.80% -> FADING. At the open QQQ gapped -0.56%, SMH -0.28%, SNDK
++0.01%, so the cell is FADING + QQQ down + leading SMH, n=59: round-trip
+71% +/-13, new-high 53% +/-13.
+
+Round-trip resolved YES (low 1554.00 < 1568.87). New-high was still unresolved
+at 10:46 ET with the session high at 1631.40 against a 1632.00 pre-market high.
+
+## Next
+
+1. `analysis/premarket_setup.py` -- put these buckets in code with the
+   definitions FIXED IN ADVANCE, and tests. Deciding the bucket after seeing
+   the setup is how 2026-08-20 assigned a session to the wrong bucket six
+   minutes before the open.
+2. Hold out the last 30% of sessions; discard any bucket that does not survive.
+3. Log every stated forecast with its resolution criterion and outcome. Without
+   it, "was that call wrong or unlucky" is unanswerable, and on 2026-08-20 it
+   was unanswerable all day.

@@ -441,6 +441,42 @@ Dormant, do not extend: `data/feed_daemon.py`, `data/tick_store.py`,
      high, low, unusual or attracting, name the baseline and the window, and
      check that the window is at least as long as the claim.**
 
+## The bar store, and the rule about base rates (2026-08-20)
+
+`data/bars/bars.db` now holds **10 symbols x 379 sessions** -- 2,774,312
+one-minute bars, 2025-02-18 -> 2026-08-20, extended hours included:
+
+    SNDK  MU  WDC  STX  NVDA  AMD     memory / semi peer set
+    SMH                               sector control
+    SPY  QQQ  IWM                     market controls
+
+Cost, measured: **106-114 seconds per symbol at 550 days**; a 30-name universe
+is roughly 55 minutes. Regenerable via `scripts/backfill_bars.py` -- unlike
+`chains.db`, nothing here is lost permanently if it is deleted.
+
+**Standing rule: never quote a base rate computed from SNDK alone.** This is
+not a style preference. Measured 2026-08-20, expanding 23 sessions to 379, and
+then to 738 qualifying sessions across six names:
+
+    pre-market FADING bucket, round-trip     78% (n=9)   ->  56% +/-6 (n=361)
+    its close-vs-open contrast         -0.30% vs +2.76%  ->  +0.29% vs +0.02%
+    median MAE from the open              -3.53% (n=16)  ->  -1.74% to -1.88%
+
+The close-vs-open contrast does not exist at scale. It was the number most
+quoted during the 2026-08-20 session and every forecast built on it was built
+on noise. One figure survived: the NEAR-high bucket's 29% round-trip came in
+at **28% +/-5**.
+
+**What replaced them.** The reliable discriminator is whether a session exceeds
+its OWN pre-market high: **85% +/-4 in the NEAR bucket against 51% +/-5 in the
+FADING bucket**. All six symbols fall on the correct side individually, with no
+overlap between the two sets of six (NEAR 80-89, FADE 39-60). Build on this one.
+
+**The limitation that remains.** 622 of those 738 sessions had QQQ gapping UP.
+The peer universe removed SNDK's single-stock regime problem and exposed the
+market's underneath it. Down-tape conditioning rests on n=89 and n=27, with
+bands of +/-12 and +/-19. Never quote a down-tape base rate without saying so.
+
 ## Where the truth lives
 
 1. **This file** — what the project is.
