@@ -652,3 +652,179 @@ at 10:46 ET with the session high at 1631.40 against a 1632.00 pre-market high.
 3. Log every stated forecast with its resolution criterion and outcome. Without
    it, "was that call wrong or unlucky" is unanswerable, and on 2026-08-20 it
    was unanswerable all day.
+
+
+---
+
+# ADDENDUM 3 — option flow, vendor reconciliation, auth failure mode
+Written 2026-08-20 14:41 MDT, after the close.
+
+## 1. Alpaca option data — capability settled, do not re-litigate
+
+`VERIFIED 2026-08-20` by `scripts/probe_option_flow.py`:
+
+    /v1beta1/options/trades          200   HISTORICAL, paginated, sub-ms stamps
+    /v1beta1/options/quotes          404   HISTORICAL QUOTES DO NOT EXIST
+    /v1beta1/options/quotes/latest   200   full NBBO: ap as ax bp bs bx c t
+    /v1beta1/options/trades/latest   200
+    /v1beta1/options/snapshots       200
+
+Trade record fields: `t p s x c` (time, price, size, exchange, condition).
+
+**Consequence.** Quote-based trade signing cannot be done retrospectively. It
+is available only going FORWARD, by capturing the latest quote alongside
+trades. That is a new unattended process and therefore a SCOPE DECISION, not
+something to build without an explicit grant like the collector has.
+
+Two traps found while probing, both mine, both worth remembering:
+  - `OptionQuote` has NO `underlying_price` field. Ranking strikes by distance
+    from `getattr(c,'underlying_price',None)` silently ranks everything as
+    equidistant. Get spot from the EQUITY snapshot.
+  - Schwab stores the 21-char OCC symbol with the root padded to six
+    (`'SNDK  260821C01800000'`); Alpaca uses the 19-char unpadded form. Joining
+    the two on `symbol` silently returns nothing.
+
+## 2. Signing flow without quotes — the tick rule, and its real limit
+
+`scripts/option_flow.py` signs prints by the tick rule (uptick = buyer
+initiated, downtick = seller initiated, carry across zero ticks) and reads the
+result against `oi_change`. Unclassified share came in at 0.0-0.1%.
+
+**The error model matters and was initially stated wrong here.** For a
+classifier with symmetric accuracy `a`:
+
+    measured imbalance = (2a - 1) x true imbalance
+
+Symmetric error ATTENUATES toward zero. It does not flip the sign or create an
+imbalance from balanced flow. A measured imbalance is therefore a LOWER BOUND
+on the true one. The earlier claim in this repo that a reading "requires
+classifier accuracy above 99.4%" was wrong and has been removed from the code.
+
+**Results, session 2026-08-19, 08-21 expiry:**
+
+    strike  side   volume   net signed   imbalance   OI change   OI as % of vol
+    1600    CALL    8,817        +102       +1.2%       +566          6%
+    1600    PUT     3,925        +201       +5.1%       -274          7%
+    1800    CALL    9,564        -679       -7.1%     +1,121         12%
+    1820    CALL    1,476        -704      -47.7%     +1,021         69%
+
+**1600 is BALANCED — no directional read.** 12,740 contracts traded there and
+net OI moved 292. It is churn, and no signing method resolves it because the
+imbalance is genuinely near zero.
+
+**1820 is the one that resolves.** Sell prints averaged 7.6 contracts against
+3.5 for buys, both prints and volume agree in sign, and 69% of volume became
+new OI. Read: customers WROTE roughly a thousand calls 15% above spot with two
+days to expiry, leaving dealers LONG and therefore long gamma there.
+
+**Standing rule: only run this where OI change is a high share of volume.**
+Below roughly 10% the answer is churn and the method cannot help.
+
+**Known contamination, not yet handled.** Multi-leg legs (OPRA conditions
+f/g/j/n) print separately and are signed here as if independent, manufacturing
+flow nobody intended. Measured 4.5% of volume on the 1800 call. `option_flow`
+now REPORTS the multi-leg share per contract but does not exclude it.
+
+## 3. Schwab vs Alpaca volume — reconciled, and bounded
+
+Schwab's stored volume and Alpaca's summed trades disagreed. Investigated
+rather than guessed, with `scripts/diag_option_volume.py`:
+
+  - NOT the pull. Alpaca's own daily bar reads v=9564 n=3778, identical to the
+    trade sum on both counts.
+  - NOT window edges. Zero prints outside 09:00-16:30 ET.
+  - NOT pagination. Single page, flagged last.
+  - NOT excluded conditions. Every code present (I a f g S e j n b) is a normal
+    volume-counting trade; the OPRA exclusion set (A C E G, D F H, u v) is
+    entirely absent.
+  - NOT a one-sided exclusion rule, because the difference is BIDIRECTIONAL.
+
+**It is a vendor processing difference.** Across 172 contracts of the 08-21
+expiry on 2026-08-19 with volume >= 50:
+
+    exact match 92 (53.5%)   within 1: 42 (24.4%)   differ >1: 38 (22.1%)
+    NET   +202  (+0.137% of Schwab)
+    GROSS  412  ( 0.279% of Schwab)   [Schwab higher +307 / lower -105]
+
+**Operational rule: volume is reliable above roughly 500 contracts and
+unreliable below ~100.** Absolute differences are small (max +92) but the
+percentage error on thin strikes is large -- 1830 PUT read -19.6% on 51
+contracts, 2030 CALL +10.2% on 108. Any per-contract ratio on a thin strike
+carries double-digit uncertainty from vendor choice alone.
+
+The internal reason two OPRA consumers tally differently is not determinable
+from outside. It would need vendor documentation. Do not invent one.
+
+## 4. Schwab re-auth broke the watcher. This will happen again.
+
+Re-authed 2026-08-20 ~12:10 ET; token now runs to **2026-08-27**.
+`auth_state` OK, `has_refresh_token` true, `token_age_source`
+creation_timestamp.
+
+**The watcher then failed silently for four hours.** It went from 8 errors to
+**2,357 on 18,233 polls**, and its `schwab` block became `None`, so every
+Schwab field in `data/live/SNDK.json` was stale or absent from roughly 12:40 ET
+until it was restarted at 14:36 MDT.
+
+**Mechanism, confirmed in production.** `scripts/watch.py` is long-lived and
+holds an in-memory schwab-py client. When its access token expired it tried to
+renew with a refresh token the re-auth had superseded, and could not. The
+COLLECTOR was unaffected throughout because it spawns `fetch_option_chain` as a
+fresh subprocess that reads the token file at startup (`collector.py:171`).
+
+**This recurs on every weekly re-auth.** Two possible fixes, neither built:
+re-read the token file on refresh failure, or exit loudly rather than logging
+thousands of errors into a file nobody reads. Until then: **restart the watcher
+immediately after every re-auth.**
+
+Process handling, re-confirmed twice today: every project python runs as a
+stub/interpreter PAIR, and stopping the stub takes the child. Filter the
+inventory on `-m` in the CommandLine, never on ExecutablePath -- the real
+interpreter is the base Python install and has no "LLM model" in its path.
+
+Also noted: a python pair `14176/22272` appeared at exactly 06:30:00 MDT today
+with an unreadable command line. Not ours, left alone, but new.
+
+## 5. New scripts
+
+    scripts/probe_option_flow.py     capability probe, read-only
+    scripts/option_flow.py           tick-rule signing + OI change
+    scripts/diag_option_volume.py    single-contract diagnosis + --reconcile
+
+A habit worth keeping: `py_compile` checks syntax only. An AST pass comparing
+loaded names against imports caught a missing `timedelta` that would have
+thrown NameError at runtime, in a script that had already compiled clean.
+
+## 6. The session
+
+    PRE      04:00-09:29   O 1609.00  H 1632.00  L 1526.82  C 1568.94   vol  1,002,046
+    REGULAR  09:30-15:59   O 1569.00  H 1631.40  L 1554.00  C 1601.24   vol  9,655,035
+    close 1601.24  +2.06% vs 1568.87   MFE +3.98%  MAE -0.96%  full day 11,037,779
+
+**The pre-market high of 1632.00 was NOT exceeded — 1631.40, sixty cents
+short.** Today was a FADING-bucket session, where the measured base rate for
+exceeding the pre-market high is 51% +/-5.
+
+`chain_pm` fired 16:15:01 ET, single vintage at spot 1600.62, 4,914 contracts,
+volume 203,713. Saturation check passes: 480-744 rows per expiration against
+the 800 cap, so `--strikes 400` has margin. That margin is why today's AM and
+PM fetches covered the identical contract set despite a 32-point spot move --
+at 200 the window sat on the edge and shifted.
+
+**Setup into 2026-08-21 expiry**, stated without a read: SNDK closed 1601.24,
+$1.24 above strike 1600, which carries the largest combined OI on that expiry
+(4,242 calls / 4,025 puts as of the 08-19 close) and traded 18,273 calls and
+7,711 puts today. Tomorrow's 08:00 ET fetch gives OI as of the 08-20 close and
+shows whether that volume built or unwound.
+
+## 7. Next
+
+1. `analysis/premarket_setup.py` with bucket definitions FIXED IN ADVANCE.
+2. Forecast log: claim, probability, resolution criterion, outcome.
+3. Exclude multi-leg legs from `option_flow` signing.
+4. Decide the forward quote-capture scope question.
+5. Fix `watch.py` to survive a token rotation.
+6. Analyst-action data as a conditioning variable — announcement-day abnormal
+   returns run +3.2%/-3.5% on NASDAQ names, comparable to the effects the
+   pre-market model measures, and 738 sessions are unconditioned on it.
+   Alpaca's news endpoint is Benzinga-sourced; probe before buying a feed.
