@@ -828,3 +828,125 @@ shows whether that volume built or unwound.
    returns run +3.2%/-3.5% on NASDAQ names, comparable to the effects the
    pre-market model measures, and 738 sessions are unconditioned on it.
    Alpaca's news endpoint is Benzinga-sourced; probe before buying a feed.
+
+
+---
+
+# ADDENDUM 4 — an eleven-day outage, and what it cost permanently
+Written 2026-09-01 07:41 MDT.
+
+**This file is named 2026-08-20 and now documents work through 2026-09-01.
+Cut a fresh handoff next session.**
+
+## What happened
+
+Both processes stopped **mid-session on Friday 2026-08-21 at ~10:28 ET** and
+stayed down for eleven days. Discovered 2026-09-01 09:11 ET.
+
+    2026-08-21 PRE      313 bars   complete through 09:29 ET
+    2026-08-21 REGULAR   58 bars   09:30 -> 10:27 ET, then nothing (390 = full)
+    collector heartbeat            2026-08-21 10:28:55 ET
+    watcher last write             2026-08-21 10:29:03 ET
+
+Neither failed on an error. The collector's `errors` dict was empty and the
+watcher's error count was 0. **Two independent processes stopped within about
+one minute of each other**, which points at something machine-level rather than
+either process failing — a reboot, a session logoff, a power event. UNVERIFIED;
+nothing in the repo records the cause and there is no evidence either way.
+
+**Nothing alerted.** `collector_state.json` exists precisely to distinguish
+"running and quiet" from "dead", and nothing was reading it. That is the gap
+worth closing, not the crash itself.
+
+## What is permanently lost
+
+**Open interest as of the closes of 2026-08-21, 08-24, 08-25, 08-26, 08-27,
+08-28 and 08-31 — seven sessions — does not exist and cannot be recovered.**
+No vendor serves historical open interest. `chains.db` now reads:
+
+    20260817  20260818  20260819  20260820  20260821  [SEVEN-SESSION HOLE]  20260901
+
+The expensive one is **20260821**: that was the expiry carrying 53% of
+near-term open interest, and only its 08:00 ET pre-market fetch landed. Volume
+is **0 across all 4,914 rows**. That session's flow can never be attributed.
+This is exactly the failure the two-fetch design was built to prevent,
+occurring on the single session it mattered most for.
+
+Bars were fully recoverable and have been restored.
+
+## TRAP — `oi_report` across the gap reads as daily and is not
+
+The collector logs `prior session 20260821 available for OI diff`. True, and
+misleading:
+
+    OI in 20260901 rows = close of 2026-08-31
+    OI in 20260821 rows = close of 2026-08-20
+    the diff spans SEVEN trading sessions
+
+Worse, the earlier side has volume 0, so nothing across that boundary can be
+attributed to flow at all. The expiration sets also differ — 7 expirations on
+09-01 against 8 on 08-21, with 08-21 and 08-28 expired and 10-09 newly listed
+— so the per-contract join covers only the overlap.
+
+**Do not quote any OI change spanning 20260821 -> 20260901 as a daily figure.**
+The first clean day-over-day diff is 20260901 -> 20260902.
+
+## TRAP — the dashboard's spot comes from the WATCHER, not from the chain
+
+Found 2026-09-01 while the watcher was still down. The collector was rendering
+the dashboard every five minutes using `data/live/SNDK.json` for spot — a file
+frozen eleven days earlier:
+
+    SNDK.json last_price   1589.53   (2026-08-21 10:29 ET)
+    chain fetched against  1566.70
+    actual live price      1528.36
+    dashboard error        60.83 points = 3.98%
+
+It also printed `bases agree True`, because a stale spot cannot drift from
+itself. With the watcher restarted and a live spot, the same dashboard
+immediately reported `spot has drifted`. **The guard was never broken — it was
+being handed a wrong input.**
+
+Consequence: **the dashboard is only as current as the watcher.** A dead
+watcher does not produce a stale-looking dashboard; it produces a confident
+wrong one that reports its own cross-checks as passing.
+
+## Re-auth ordering — the 08-20 lesson, applied
+
+Addendum 3 records that re-authing while the watcher runs breaks it (stale
+in-memory client, 2,357 errors). On 2026-09-01 nothing was running, so the
+order came out correct by accident: **re-auth first, then start the processes,
+which read the fresh token at startup.**
+
+Make that deliberate. The correct weekly sequence is:
+
+    1. stop the watcher
+    2. re-auth
+    3. start the collector (if not running)
+    4. start the watcher
+
+## Restore performed 2026-09-01
+
+    Schwab re-authed          expires 2026-09-08
+    collector restarted       09:18:18 ET, --strikes 400, catch-up chain fetch
+                              fired immediately, stored 3,990 contracts
+                              (7 expirations now; 08-21 and 08-28 expired)
+    watcher restarted         pid 2780, 0 errors, real-time NBBO
+    bars backfilled           --days 15, all 10 symbols
+                              387 sessions each, 2025-02-18 -> 2026-09-01
+                              2,835,928 rows; SNDK 08-21 371 -> 877 bars
+
+Curiosity, unresolved and probably harmless: 12 bars carry phase `CLOSED`, all
+SPY, one bar each on twelve scattered 2025 dates.
+
+## Next, revised
+
+1. **Something must read `collector_state.json`.** Eleven days of silence went
+   unnoticed because nothing checks the heartbeat. This is now the highest
+   priority item — it is worth more than any analysis in this file.
+2. Fix `watch.py` to survive token rotation, or exit loudly.
+3. `analysis/premarket_setup.py`, buckets fixed in advance.
+4. Forecast log with resolution criteria.
+5. Exclude multi-leg legs from `option_flow` signing.
+6. Decide the forward quote-capture scope question.
+7. Analyst-action data as a conditioning variable.
